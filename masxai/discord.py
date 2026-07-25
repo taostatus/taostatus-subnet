@@ -17,8 +17,15 @@ from masxai.env import load_env
 def format_forecast_message(forecast: Dict[str, Any]) -> str:
     event = str(forecast.get("event_type", "unknown")).replace("_", " ").title()
     prediction = forecast.get("prediction")
-    outlook = "Upward / YES" if prediction is True else "Downward / NO"
+    probability = forecast.get("probability")
+    no_answer = prediction is None and probability is None
+    outlook = (
+        "No forecast"
+        if no_answer
+        else "Upward / YES" if prediction is True else "Downward / NO"
+    )
     confidence = float(forecast.get("confidence") or 0.0)
+    confidence_text = "N/A" if no_answer else f"{confidence:.0%}"
     window = str(forecast.get("forecast_window") or "unknown")
     model = str(forecast.get("model") or "Gemini")
     forecast_id = str(forecast.get("forecast_id", ""))[:8]
@@ -40,7 +47,7 @@ def format_forecast_message(forecast: Dict[str, Any]) -> str:
         f"`#{forecast_id}`\n\n"
         f"**Market/Event:** {event}\n"
         f"**Outlook:** {outlook}\n"
-        f"**Confidence:** {confidence:.0%}\n"
+        f"**Confidence:** {confidence_text}\n"
         f"**Forecast Window:** {window}\n"
         f"**Source:** {source}\n\n"
         f"**Why it matters:** {reasoning}"

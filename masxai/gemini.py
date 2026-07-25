@@ -3,7 +3,7 @@ Gemini integration for MASXAI miners.
 
 This module calls the Gemini REST API directly through httpx so miners do not
 need a heavyweight SDK. Missing API keys or invalid responses degrade to a
-deterministic baseline forecast instead of crashing the miner.
+structured no-answer fallback instead of crashing the miner.
 """
 
 from __future__ import annotations
@@ -30,15 +30,15 @@ def utc_now_iso() -> str:
 def baseline_forecast(
     synapse: ForecastSynapse,
     model: str = "baseline",
-    reasoning: str = "Neutral baseline forecast; Gemini is not configured.",
+    reasoning: str = "No forecast returned; Gemini is not configured.",
 ) -> Dict[str, Any]:
-    """Return a valid neutral forecast when Gemini is unavailable."""
+    """Return a valid no-answer payload when Gemini is unavailable."""
     return {
         "forecast_id": synapse.forecast_id,
         "event_type": synapse.event_type,
-        "prediction": True,
-        "confidence": 0.5,
-        "probability": 0.5,
+        "prediction": None,
+        "confidence": None,
+        "probability": None,
         "forecast_window": synapse.forecast_window,
         "reasoning": reasoning,
         "timestamp": utc_now_iso(),
@@ -167,7 +167,7 @@ async def generate_forecast(
         return baseline_forecast(
             synapse,
             model="baseline-gemini-disabled",
-            reasoning="Neutral baseline forecast; Gemini is disabled in .env.",
+            reasoning="No forecast returned; Gemini is disabled in .env.",
         )
 
     api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -175,7 +175,7 @@ async def generate_forecast(
     if not api_key:
         return baseline_forecast(
             synapse,
-            reasoning="Neutral baseline forecast; Gemini API key is not configured.",
+            reasoning="No forecast returned; Gemini API key is not configured.",
         )
 
     url = C.GEMINI_API_URL.format(model=model)
@@ -200,7 +200,7 @@ async def generate_forecast(
             synapse,
             model="baseline-after-gemini-error",
             reasoning=(
-                "Neutral baseline forecast because Gemini was configured but "
+                "No forecast returned because Gemini was configured but "
                 f"the request failed: {error}"
             ),
         )

@@ -60,7 +60,10 @@ EOF
 }
 
 # Activate the local venv if present and not already active.
-if [[ -z "${VIRTUAL_ENV:-}" && -f "$REPO_ROOT/venv/bin/activate" ]]; then
+if [[ -z "${VIRTUAL_ENV:-}" && -f "$REPO_ROOT/.venv/bin/activate" ]]; then
+  # shellcheck disable=SC1091
+  source "$REPO_ROOT/.venv/bin/activate"
+elif [[ -z "${VIRTUAL_ENV:-}" && -f "$REPO_ROOT/venv/bin/activate" ]]; then
   # shellcheck disable=SC1091
   source "$REPO_ROOT/venv/bin/activate"
 fi

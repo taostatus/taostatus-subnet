@@ -102,6 +102,19 @@ def test_structured_coinflip_gets_zero_with_baseline_gate():
     ) == 0.0
 
 
+def test_structured_no_answer_gets_zero():
+    assert score_structured_forecast(
+        prediction=None,
+        confidence=None,
+        probability=None,
+        outcome=True,
+        previous_score=0.9,
+        submitted_at=10.0,
+        issued_at=0.0,
+        resolve_at=100.0,
+    ) == 0.0
+
+
 def test_calibration_penalizes_confident_wrong():
     assert math.isclose(calibration_score(True, 0.9, True), 0.9, abs_tol=1e-9)
     assert math.isclose(calibration_score(True, 0.9, False), 0.1, abs_tol=1e-9)

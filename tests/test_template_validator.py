@@ -16,6 +16,13 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import pytest
+
+pytest.skip(
+    "legacy template scaffold tests are not part of the MASXAI validator flow",
+    allow_module_level=True,
+)
+
 import sys
 import unittest
 

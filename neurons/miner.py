@@ -2,8 +2,8 @@
 neurons/miner.py - MASXAI MVP miner.
 
 Miners use Gemini as the forecasting engine when GEMINI_API_KEY or GOOGLE_API_KEY
-is configured. Without a key, the miner still serves a neutral baseline forecast
-so local runs and testnet smoke tests do not require secrets.
+is configured. Without a usable Gemini response, the miner returns a structured
+no-answer payload so it stays online without earning forecast credit.
 """
 
 import os
@@ -32,7 +32,7 @@ except Exception:
 
 def predict(synapse: ForecastSynapse) -> dict:
     """
-    Baseline structured forecast. Kept as a simple override point for custom
+    Structured no-answer fallback. Kept as a simple override point for custom
     miners and for the local mock runner.
     """
     return baseline_forecast(synapse)
@@ -57,14 +57,14 @@ class Miner(BaseMinerNeuron):
             f"model={os.getenv('GEMINI_MODEL', C.GEMINI_MODEL)} "
             f"timeout={os.getenv('GEMINI_TIMEOUT', C.GEMINI_TIMEOUT)}"
         )
-        bt.logging.info("MASXAI v1 baseline miner initialized.")
+        bt.logging.info("MASXAI v1 Gemini miner initialized.")
 
     async def forward(self, synapse: ForecastSynapse) -> ForecastSynapse:
         """Answer a forecasting question with a structured Gemini forecast."""
         try:
             forecast = await generate_forecast(synapse)
         except Exception as e:  # noqa: BLE001 — never let forward crash
-            bt.logging.warning(f"miner predict failed, returning neutral: {e}")
+            bt.logging.warning(f"miner predict failed, returning no-answer: {e}")
             forecast = predict(synapse)
 
         synapse.forecast_id = str(forecast.get("forecast_id") or synapse.forecast_id)
@@ -87,9 +87,12 @@ class Miner(BaseMinerNeuron):
                 else 1.0 - float(synapse.confidence)
             )
 
-        asyncio.create_task(publish_forecast(forecast))
+        if synapse.probability is not None:
+            asyncio.create_task(publish_forecast(forecast))
+        status = "no-answer" if synapse.probability is None else "answered"
         bt.logging.debug(
-            f"answered: event={synapse.event_type} prediction={synapse.prediction} "
+            f"{status}: event={synapse.event_type} model={synapse.model} "
+            f"probability={synapse.probability} prediction={synapse.prediction} "
             f"confidence={synapse.confidence}"
         )
         return synapse

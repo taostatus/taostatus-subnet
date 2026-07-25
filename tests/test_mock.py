@@ -1,6 +1,7 @@
 import pytest
 import asyncio
 import bittensor as bt
+pytest.importorskip("prompting", reason="legacy prompting template dependency is not part of MASXAI")
 from prompting.mock import MockDendrite, MockMetagraph, MockSubtensor
 from prompting.protocol import PromptingSynapse
 

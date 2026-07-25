@@ -36,8 +36,7 @@ async def main() -> None:
         {
             "TASK_SOURCE": "bt_forecast",
             "BT_FORECAST_BASE_URL": "http://127.0.0.1:9",
-            "BT_FORECAST_API_KEY": "smoke-key",
-            "BT_FORECAST_API_SECRET": "smoke-secret",
+            "BT_FORECAST_BEARER_TOKEN": "smoke-token",
             "DB_PATH": str(db_path),
             "SIMULATE_MINERS": "true",
             "MINER_REGISTRY_PATH": str(ROOT / "miners.json"),

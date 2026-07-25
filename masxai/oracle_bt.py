@@ -9,11 +9,8 @@ never call this API and never receive service-only benchmark fields.
 
 import asyncio
 from datetime import datetime, timezone
-import hashlib
-import hmac
 import json
 import os
-import time
 from typing import Any, Optional
 from urllib.parse import quote, urlencode
 
@@ -27,6 +24,7 @@ from masxai.env import load_env
 class BtForecastRunStatus(BaseModel):
     run_id: str
     status: str
+    generation: Optional[str] = None
     created_at: Optional[str] = None
     ready_at: Optional[str] = None
     question_count: Optional[int] = None
@@ -59,11 +57,18 @@ class BtForecastQuestion(BaseModel):
 
 class BtForecastResolution(BaseModel):
     question_key: str
+    family: str = ""
+    scope: str = ""
+    netuid: Optional[int] = None
+    horizon_days: Optional[int] = None
     status: str
     outcome: Optional[bool] = None
     cutoff_date: Optional[str] = None
     resolved_at: Optional[str] = None
+    measurement: dict[str, Any] = Field(default_factory=dict)
     measurement_value: Any = None
+    observed_at: Optional[str] = None
+    explanation: Optional[str] = None
     engine_brier: Optional[float] = None
     deferral_reason: Optional[str] = None
 
@@ -95,17 +100,17 @@ class BtForecastClient:
         self,
         *,
         base_url: str,
-        api_key: str = "",
-        api_secret: str = "",
         bearer_token: str = "",
         timeout: float = C.BT_FORECAST_TIMEOUT,
         max_retries: int = C.BT_FORECAST_MAX_RETRIES,
     ) -> None:
         if not base_url:
             raise ValueError("BT-Forecast base_url is required")
+        if not bearer_token:
+            raise ValueError(
+                "BT-Forecast bearer_token is required; set BT_FORECAST_BEARER_TOKEN"
+            )
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.api_secret = api_secret
         self.bearer_token = bearer_token
         self.timeout = timeout
         self.max_retries = max(1, max_retries)
@@ -182,7 +187,7 @@ class BtForecastClient:
             body = json.dumps(json_body, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
         for attempt in range(1, self.max_retries + 1):
-            headers = self._auth_headers(method, path, body)
+            headers = self._auth_headers()
             if body:
                 headers["Content-Type"] = "application/json"
             try:
@@ -210,36 +215,22 @@ class BtForecastClient:
                 await _sleep_for_retry(response=None, attempt=attempt)
         return {}
 
-    def _auth_headers(self, method: str, path: str, body: bytes) -> dict[str, str]:
+    def _auth_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
         if self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
-        if self.api_secret:
-            timestamp = str(int(time.time()))
-            body_sha = hashlib.sha256(body).hexdigest()
-            canonical = f"{method.upper()}\n{path}\n{timestamp}\n{body_sha}"
-            signature = hmac.new(
-                self.api_secret.encode("utf-8"),
-                canonical.encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
-            headers["X-Timestamp"] = timestamp
-            headers["X-Signature"] = signature
         return headers
 
 
 def open_bt_forecast_client_from_env() -> Optional[BtForecastClient]:
     load_env()
-    base_url = os.getenv(C.BT_FORECAST_BASE_URL_ENV, "").strip()
-    if not base_url:
+    bearer_token = os.getenv(C.BT_FORECAST_BEARER_TOKEN_ENV, "").strip()
+    if not bearer_token:
         return None
+    base_url = os.getenv(C.BT_FORECAST_BASE_URL_ENV, "").strip()
     return BtForecastClient(
-        base_url=base_url,
-        api_key=os.getenv(C.BT_FORECAST_API_KEY_ENV, "").strip(),
-        api_secret=os.getenv(C.BT_FORECAST_API_SECRET_ENV, "").strip(),
-        bearer_token=os.getenv(C.BT_FORECAST_BEARER_TOKEN_ENV, "").strip(),
+        base_url=base_url or C.BT_FORECAST_DEFAULT_BASE_URL,
+        bearer_token=bearer_token,
         timeout=_env_float("BT_FORECAST_TIMEOUT", C.BT_FORECAST_TIMEOUT),
         max_retries=_env_int("BT_FORECAST_MAX_RETRIES", C.BT_FORECAST_MAX_RETRIES),
     )

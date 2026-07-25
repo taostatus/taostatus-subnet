@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Optional, Tuple
 
+from masxai import constants as C
+
 
 def _load_dotenv() -> None:
     try:
@@ -19,14 +21,6 @@ def _load_dotenv() -> None:
 
 def _str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
-
-
-def _first_str(*names: str, default: str = "") -> str:
-    for name in names:
-        value = _str(name)
-        if value:
-            return value
-    return default
 
 
 def _optional_str(name: str) -> Optional[str]:
@@ -50,24 +44,6 @@ def _float(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a float, got {raw!r}") from exc
 
 
-def _first_int(*names: str, default: int) -> int:
-    raw = _first_str(*names, default=str(default))
-    try:
-        return int(raw)
-    except ValueError as exc:
-        joined = " / ".join(names)
-        raise ValueError(f"{joined} must be an integer, got {raw!r}") from exc
-
-
-def _first_float(*names: str, default: float) -> float:
-    raw = _first_str(*names, default=str(default))
-    try:
-        return float(raw)
-    except ValueError as exc:
-        joined = " / ".join(names)
-        raise ValueError(f"{joined} must be a float, got {raw!r}") from exc
-
-
 def _bool(name: str, default: bool) -> bool:
     raw = _str(name, "true" if default else "false").lower()
     if raw in {"1", "true", "yes", "y", "on"}:
@@ -86,11 +62,7 @@ class Settings:
     task_source: str
 
     bt_forecast_base_url: str
-    bt_forecast_api_key: str
-    bt_forecast_api_secret: str
-    bt_forecast_page_size: int
-    bt_forecast_poll_interval_seconds: int
-    bt_forecast_max_concurrent_requests: int
+    bt_forecast_bearer_token: str
     bt_forecast_request_timeout_seconds: float
     bt_forecast_max_retries: int
 
@@ -142,30 +114,10 @@ def load_settings() -> Settings:
 
     settings = Settings(
         task_source=task_source,
-        bt_forecast_base_url=_first_str("BT_FORECAST_BASE_URL", "PRIVATEBT_BASE_URL"),
-        bt_forecast_api_key=_first_str("BT_FORECAST_API_KEY", "PRIVATEBT_API_KEY"),
-        bt_forecast_api_secret=_first_str("BT_FORECAST_API_SECRET", "PRIVATEBT_API_SECRET"),
-        bt_forecast_page_size=_first_int("BT_FORECAST_PAGE_SIZE", "PRIVATEBT_PAGE_SIZE", default=100),
-        bt_forecast_poll_interval_seconds=_first_int(
-            "BT_FORECAST_POLL_INTERVAL_SECONDS",
-            "PRIVATEBT_POLL_INTERVAL_SECONDS",
-            default=30,
-        ),
-        bt_forecast_max_concurrent_requests=_first_int(
-            "BT_FORECAST_MAX_CONCURRENT_REQUESTS",
-            "PRIVATEBT_MAX_CONCURRENT_REQUESTS",
-            default=4,
-        ),
-        bt_forecast_request_timeout_seconds=_first_float(
-            "BT_FORECAST_TIMEOUT",
-            "PRIVATEBT_REQUEST_TIMEOUT_SECONDS",
-            default=10,
-        ),
-        bt_forecast_max_retries=_first_int(
-            "BT_FORECAST_MAX_RETRIES",
-            "PRIVATEBT_MAX_RETRIES",
-            default=3,
-        ),
+        bt_forecast_base_url=_str("BT_FORECAST_BASE_URL", C.BT_FORECAST_DEFAULT_BASE_URL),
+        bt_forecast_bearer_token=_str("BT_FORECAST_BEARER_TOKEN"),
+        bt_forecast_request_timeout_seconds=_float("BT_FORECAST_TIMEOUT", C.BT_FORECAST_TIMEOUT),
+        bt_forecast_max_retries=_int("BT_FORECAST_MAX_RETRIES", C.BT_FORECAST_MAX_RETRIES),
         llm_provider=_str("LLM_PROVIDER", "gemini").lower(),
         gemini_api_key=_optional_str("GEMINI_API_KEY"),
         gemini_model=_str("GEMINI_MODEL", "gemini-2.5-pro"),
@@ -211,8 +163,7 @@ def validate_settings(settings: Settings) -> None:
             name
             for name, value in (
                 ("BT_FORECAST_BASE_URL", settings.bt_forecast_base_url),
-                ("BT_FORECAST_API_KEY", settings.bt_forecast_api_key),
-                ("BT_FORECAST_API_SECRET", settings.bt_forecast_api_secret),
+                ("BT_FORECAST_BEARER_TOKEN", settings.bt_forecast_bearer_token),
             )
             if not value
         ]
@@ -227,10 +178,6 @@ def validate_settings(settings: Settings) -> None:
         if not settings.gemini_api_key:
             raise ValueError("GEMINI_API_KEY is required for TASK_SOURCE=llm")
 
-    if settings.bt_forecast_page_size < 1 or settings.bt_forecast_page_size > 500:
-        raise ValueError("BT_FORECAST_PAGE_SIZE must be between 1 and 500")
-    if settings.bt_forecast_max_concurrent_requests < 1:
-        raise ValueError("BT_FORECAST_MAX_CONCURRENT_REQUESTS must be at least 1")
     if settings.miner_max_concurrent_queries < 1:
         raise ValueError("MINER_MAX_CONCURRENT_QUERIES must be at least 1")
     if not 0.0 < settings.ema_alpha <= 1.0:

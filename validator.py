@@ -37,7 +37,7 @@ async def run_validator(settings: Settings | None = None) -> None:
     refresh_miner_registry(settings, session_factory)
     transport = build_miner_transport(settings)
     stages = {
-        "tasks": Stage("tasks", settings.bt_forecast_poll_interval_seconds),
+        "tasks": Stage("tasks", 60),
         "miners": Stage("miners", settings.miner_query_interval_seconds),
         "period": Stage("period", settings.period_check_interval_seconds),
         "resolution": Stage("resolution", settings.resolution_interval_seconds),

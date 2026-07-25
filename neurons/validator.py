@@ -87,6 +87,7 @@ class Validator(BaseValidatorNeuron):
         self.pending: dict[str, dict] = {}
         self.issued_questions: dict[str, float] = {}
         self.feedback_queue: list[dict[str, Any]] = []
+        self.bt_forecast_runs: dict[str, dict[str, Any]] = {}
         self.bt_forecast_client = open_bt_forecast_client_from_env()
         self.bt_forecast_required = bt_forecast_required_from_env()
         self.resolved_count = 0
@@ -104,18 +105,27 @@ class Validator(BaseValidatorNeuron):
             self.issued_questions = {}
         if not hasattr(self, "feedback_queue"):
             self.feedback_queue = []
+        if not hasattr(self, "bt_forecast_runs"):
+            self.bt_forecast_runs = {}
         if not os.path.exists(C.STATE_FILE):
             return
         try:
             with open(C.STATE_FILE, "r") as f:
                 s = json.load(f)
             self.pending = s.get("pending", {})
+            sanitized = self._sanitize_fallback_pending()
             self.issued_questions = {
                 str(k): float(v) for k, v in s.get("issued_questions", {}).items()
             }
             self.feedback_queue = list(s.get("feedback_queue", []))
+            self.bt_forecast_runs = {
+                str(k): v
+                for k, v in s.get("bt_forecast_runs", {}).items()
+                if isinstance(v, dict)
+            }
             self.resolved_count = s.get("resolved_count", 0)
             self.last_issue_at = float(s.get("last_issue_at", 0.0))
+            pruned = self.prune_masxai_state()
             scores = s.get("scores")
             if scores is not None:
                 arr = np.array(scores, dtype=np.float32)
@@ -126,11 +136,36 @@ class Validator(BaseValidatorNeuron):
                 f"{self.resolved_count} resolved, "
                 f"{len(self.feedback_queue)} feedback payload(s) queued"
             )
+            if sanitized:
+                bt.logging.info(
+                    f"normalized {sanitized} fallback forecast(s) to no-answer"
+                )
+            if any(pruned.values()):
+                bt.logging.info(f"pruned validator state on load: {pruned}")
         except Exception as e:  # noqa: BLE001
             bt.logging.warning(f"could not load state, starting fresh: {e}")
 
+    def _sanitize_fallback_pending(self) -> int:
+        sanitized = 0
+        for forecast in self.pending.values():
+            if not self._is_no_answer_model(forecast.get("model")):
+                continue
+            if (
+                forecast.get("probability") is not None
+                or forecast.get("prediction") is not None
+                or forecast.get("confidence") is not None
+            ):
+                sanitized += 1
+            forecast["probability"] = None
+            forecast["prediction"] = None
+            forecast["confidence"] = None
+        return sanitized
+
     def save_masxai_state(self):
         try:
+            pruned = self.prune_masxai_state()
+            if any(pruned.values()):
+                bt.logging.info(f"pruned validator state before save: {pruned}")
             state_path = os.path.abspath(C.STATE_FILE)
             tmp_path = f"{state_path}.tmp"
             with open(tmp_path, "w") as f:
@@ -139,6 +174,7 @@ class Validator(BaseValidatorNeuron):
                         "pending": self.pending,
                         "issued_questions": self.issued_questions,
                         "feedback_queue": self.feedback_queue,
+                        "bt_forecast_runs": self.bt_forecast_runs,
                         "resolved_count": self.resolved_count,
                         "last_issue_at": self.last_issue_at,
                         "scores": self.scores.tolist(),
@@ -149,11 +185,161 @@ class Validator(BaseValidatorNeuron):
         except Exception as e:  # noqa: BLE001
             bt.logging.warning(f"could not save state: {e}")
 
+    def prune_masxai_state(self, *, now: Optional[float] = None) -> dict[str, int]:
+        """Keep persisted validator state bounded and safe to read after restarts."""
+        now = time.time() if now is None else now
+        stats = {
+            "malformed_pending": 0,
+            "stale_pending": 0,
+            "old_runs": 0,
+            "feedback": 0,
+        }
+
+        resolution_wait = _env_float(
+            C.BT_FORECAST_RESOLUTION_WAIT_SECONDS_ENV,
+            C.BT_FORECAST_RESOLUTION_WAIT_SECONDS,
+        )
+        for fid, forecast in list(getattr(self, "pending", {}).items()):
+            if not isinstance(forecast, dict):
+                self.pending.pop(fid, None)
+                stats["malformed_pending"] += 1
+                continue
+            try:
+                resolve_at = float(forecast.get("resolve_at") or 0.0)
+            except (TypeError, ValueError):
+                self.pending.pop(fid, None)
+                stats["malformed_pending"] += 1
+                continue
+            if resolve_at <= 0.0:
+                self.pending.pop(fid, None)
+                stats["malformed_pending"] += 1
+                continue
+            if (
+                forecast.get("source") == "bt_forecast"
+                and now - resolve_at > resolution_wait
+            ):
+                self.pending.pop(fid, None)
+                stats["stale_pending"] += 1
+
+        max_feedback = max(
+            0,
+            _env_int(
+                C.BT_FORECAST_FEEDBACK_QUEUE_MAX_ENV,
+                C.BT_FORECAST_FEEDBACK_QUEUE_MAX,
+            ),
+        )
+        if max_feedback and len(getattr(self, "feedback_queue", [])) > max_feedback:
+            overflow = len(self.feedback_queue) - max_feedback
+            self.feedback_queue = self.feedback_queue[-max_feedback:]
+            stats["feedback"] = overflow
+
+        retention_seconds = max(
+            0.0,
+            _env_float(
+                C.BT_FORECAST_RUN_STATE_RETENTION_SECONDS_ENV,
+                C.BT_FORECAST_RUN_STATE_RETENTION_SECONDS,
+            ),
+        )
+        pending_runs = {
+            str(forecast.get("run_id"))
+            for forecast in getattr(self, "pending", {}).values()
+            if isinstance(forecast, dict) and forecast.get("source") == "bt_forecast"
+        }
+        for run_id, run_state in list(getattr(self, "bt_forecast_runs", {}).items()):
+            if run_id in pending_runs:
+                continue
+            if not isinstance(run_state, dict):
+                self.bt_forecast_runs.pop(run_id, None)
+                stats["old_runs"] += 1
+                continue
+            last_seen = self._bt_run_last_seen_timestamp(str(run_id), run_state)
+            if (
+                retention_seconds > 0.0
+                and last_seen is not None
+                and now - last_seen > retention_seconds
+            ):
+                self.bt_forecast_runs.pop(run_id, None)
+                stats["old_runs"] += 1
+        return stats
+
+    # ------------------------------------------------------------- weights
+    def _has_scored_weights(self) -> bool:
+        """True only after real resolutions have produced positive miner scores."""
+        resolved_count = int(getattr(self, "resolved_count", 0) or 0)
+        if resolved_count < self._min_resolved_before_weights():
+            return False
+
+        scores = getattr(self, "scores", None)
+        if scores is None:
+            return False
+        score_array = np.nan_to_num(
+            np.asarray(scores, dtype=np.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        positive_scores = int(np.count_nonzero(score_array > 0.0))
+        return positive_scores >= self._min_allowed_weight_count()
+
+    def _min_resolved_before_weights(self) -> int:
+        return max(
+            1,
+            _env_int(
+                C.MIN_RESOLVED_BEFORE_WEIGHTS_ENV,
+                C.MIN_RESOLVED_BEFORE_WEIGHTS,
+            ),
+        )
+
+    def _min_allowed_weight_count(self) -> int:
+        try:
+            return max(
+                1,
+                int(self.subtensor.min_allowed_weights(netuid=self.config.netuid)),
+            )
+        except Exception:
+            return 1
+
+    def should_set_weights(self) -> bool:
+        if not self._has_scored_weights():
+            bt.logging.debug(
+                "skipping set_weights: waiting for resolved, scored miner forecasts "
+                f"(resolved={int(getattr(self, 'resolved_count', 0) or 0)}, "
+                f"required={self._min_resolved_before_weights()})"
+            )
+            return False
+        return super().should_set_weights()
+
+    def set_weights(self):
+        if not self._has_scored_weights():
+            bt.logging.warning(
+                "refusing to set validator weights before any miner has a "
+                "positive score from a resolved forecast"
+            )
+            return None
+        return super().set_weights()
+
     # ------------------------------------------------------------- resolve
     async def resolve_due(self):
         """Resolve every pending forecast whose horizon has passed."""
         now = time.time()
-        due = [fid for fid, f in self.pending.items() if f["resolve_at"] <= now]
+        due = []
+        malformed = []
+        for fid, forecast in list(self.pending.items()):
+            try:
+                resolve_at = float(forecast.get("resolve_at") or 0.0)
+            except (AttributeError, TypeError, ValueError):
+                malformed.append(fid)
+                continue
+            if resolve_at <= 0.0:
+                malformed.append(fid)
+                continue
+            if resolve_at <= now:
+                due.append(fid)
+        if malformed:
+            self._drop_pending(malformed)
+            bt.logging.warning(
+                f"dropped {len(malformed)} malformed pending forecast(s) before resolution"
+            )
         if not due:
             await self.flush_bt_feedback()
             return
@@ -391,18 +577,28 @@ class Validator(BaseValidatorNeuron):
     async def issue_round(self):
         """Fetch/issue forecast questions, query miners, and store responses."""
         now = time.time()
-        if not self._issue_interval_reached(now):
-            return
 
         client = self._bt_forecast_client()
         if client is not None:
-            await self.issue_bt_forecast_round(client=client, now=now)
-            self.last_issue_at = time.time()
+            current_run_id = bt_forecast_run_id_from_env()
+            await self.issue_bt_forecast_round(
+                client=client,
+                now=now,
+                run_id=current_run_id,
+            )
+            await self.retry_unanswered_bt_forecast_runs(
+                client=client,
+                now=now,
+                exclude_run_id=current_run_id,
+            )
+            return
+
+        if not self._issue_interval_reached(now):
             return
 
         if self._bt_forecast_required():
             bt.logging.warning(
-                "MASXAI_BT_FORECAST_REQUIRED=true but BT_FORECAST_BASE_URL is unset; "
+                "MASXAI_BT_FORECAST_REQUIRED=true but BT_FORECAST_BEARER_TOKEN is unset; "
                 "skipping legacy local issue"
             )
             self.last_issue_at = time.time()
@@ -437,6 +633,9 @@ class Validator(BaseValidatorNeuron):
         miner_uids = self.get_miner_uids()
         if len(miner_uids) == 0:
             bt.logging.info("no miners to query this epoch")
+            run_state["next_poll_at"] = now + self._bt_unanswered_retry_base_seconds()
+            if retry_unanswered:
+                run_state["last_unanswered_retry_at"] = datetime.now(timezone.utc).isoformat()
             return
 
         synapse = self.build_question(event_type, reference)
@@ -452,26 +651,24 @@ class Validator(BaseValidatorNeuron):
         issued = 0
         answered = 0
         submitted_at = time.time()
-        for uid, resp in zip(miner_uids, responses):
+        response_list = list(responses or [])
+        for index, uid in enumerate(miner_uids):
+            resp = response_list[index] if index < len(response_list) else None
             fid = uuid.uuid4().hex
-            prediction = resp.prediction
-            confidence = resp.confidence
-            if prediction is None and resp.probability is not None:
-                prediction = resp.probability >= C.NEUTRAL_PROB
-                confidence = max(resp.probability, 1.0 - resp.probability)
-            if prediction is not None and confidence is not None:
+            probability, prediction, confidence = self._normalize_miner_response(resp)
+            if probability is not None:
                 answered += 1
             self.pending[fid] = {
                 "uid": int(uid),
-                "forecast_id": resp.forecast_id or fid,
+                "forecast_id": getattr(resp, "forecast_id", "") or fid,
                 "event_type": event_type,
                 "prediction": prediction,
                 "confidence": confidence,
-                "probability": resp.probability,  # may be None if no answer
-                "reasoning": resp.reasoning,
-                "model": resp.model,
-                "timestamp": resp.timestamp,
-                "submitted_at": _parse_timestamp(resp.timestamp) or submitted_at,
+                "probability": probability,
+                "reasoning": getattr(resp, "reasoning", ""),
+                "model": getattr(resp, "model", "") or "no-response",
+                "timestamp": getattr(resp, "timestamp", ""),
+                "submitted_at": _parse_timestamp(getattr(resp, "timestamp", "")) or submitted_at,
                 "reference_value": reference.get("reference_value"),
                 "reference_metadata": reference.get("reference_metadata", {}),
                 "issued_at": synapse.issued_at,
@@ -486,28 +683,101 @@ class Validator(BaseValidatorNeuron):
             f"pending now={len(self.pending)}"
         )
 
-    async def issue_bt_forecast_round(self, *, client, now: float):
-        """Fetch ready BT-Forecast questions and relay miner-safe tasks to miners."""
-        run_id = bt_forecast_run_id_from_env()
+    async def issue_bt_forecast_round(
+        self,
+        *,
+        client,
+        now: float,
+        run_id: Optional[str] = None,
+    ):
+        """Poll the daily BT-Forecast run, then relay questions once complete."""
+        run_id = run_id or bt_forecast_run_id_from_env()
+        run_state = self._bt_run_state(run_id)
+        if run_state.get("questions_issued_at"):
+            retry_unanswered = self._bt_unanswered_retry_due(run_id, run_state, now)
+            if not retry_unanswered:
+                if self._bt_run_has_unanswered_pending(run_id, now=now):
+                    bt.logging.debug(
+                        f"BT-Forecast run {run_id} waiting before retrying "
+                        "unanswered miner forecasts"
+                    )
+                else:
+                    bt.logging.debug(f"BT-Forecast run {run_id} already issued")
+                return
+            bt.logging.info(
+                f"BT-Forecast run {run_id} has unanswered miner forecasts; "
+                "retrying unanswered entries"
+            )
+        else:
+            retry_unanswered = False
+
+        next_poll_at = float(run_state.get("next_poll_at") or 0.0)
+        if next_poll_at > now:
+            remaining = int(next_poll_at - now)
+            bt.logging.debug(
+                f"BT-Forecast run {run_id} waiting for next status poll in {remaining}s"
+            )
+            return
+
         try:
             run = await client.get_run(run_id)
         except Exception as e:  # noqa: BLE001
             bt.logging.warning(f"BT-Forecast run poll failed run_id={run_id}: {e}")
+            run_state["next_poll_at"] = now + C.BT_FORECAST_DEFAULT_POLL_AFTER_SECONDS
             return
 
-        if run.status not in C.BT_FORECAST_READY_STATUSES:
-            bt.logging.info(f"BT-Forecast run {run_id} not ready yet: status={run.status}")
+        run_state.update(
+            {
+                "run_id": run.run_id,
+                "status": run.status,
+                "generation": run.generation,
+                "question_count": run.question_count,
+                "ready_at": run.ready_at,
+                "template_version": run.template_version,
+                "measurement_version": run.measurement_version,
+                "poll_after_s": run.poll_after_s,
+                "last_polled_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+        if not self._bt_run_generation_complete(run.generation):
+            poll_after_s = self._bt_run_poll_after_seconds(run.poll_after_s)
+            run_state["poll_after_s"] = poll_after_s
+            run_state["next_poll_at"] = now + poll_after_s
+            bt.logging.info(
+                f"BT-Forecast run {run_id} generation={run.generation or 'unknown'} "
+                f"status={run.status}; polling again in {poll_after_s}s"
+            )
             return
 
         include_lineage = _env_flag(C.BT_FORECAST_INCLUDE_LINEAGE_ENV, False)
-        try:
-            questions = await client.get_questions(run_id, include_lineage=include_lineage)
-        except Exception as e:  # noqa: BLE001
-            bt.logging.warning(f"BT-Forecast question fetch failed run_id={run_id}: {e}")
-            return
+        questions = self._bt_cached_questions(run_state)
+        if questions is None:
+            try:
+                questions = await client.get_questions(run_id, include_lineage=include_lineage)
+            except Exception as e:  # noqa: BLE001
+                bt.logging.warning(f"BT-Forecast question fetch failed run_id={run_id}: {e}")
+                run_state["next_poll_at"] = now + C.BT_FORECAST_DEFAULT_POLL_AFTER_SECONDS
+                return
+            run_state["questions_fetched_at"] = datetime.now(timezone.utc).isoformat()
+            run_state["questions"] = [self._bt_serialize_question(q) for q in questions]
+
+        run_state["question_keys"] = [q.question_key for q in questions]
+        run_state["next_poll_at"] = None
 
         questions = [q for q in questions if not q.predetermined_at_creation]
-        questions = [q for q in questions if self._should_issue_bt_question(q, now=now)]
+        if retry_unanswered:
+            questions = [
+                q
+                for q in questions
+                if self._bt_question_has_unanswered_pending(
+                    run_id,
+                    q.question_key,
+                    now=now,
+                )
+            ]
+        else:
+            questions = [q for q in questions if self._should_issue_bt_question(q, now=now)]
         max_questions = _env_int(
             C.BT_FORECAST_MAX_QUESTIONS_ENV,
             C.BT_FORECAST_MAX_QUESTIONS_PER_ROUND,
@@ -515,7 +785,15 @@ class Validator(BaseValidatorNeuron):
         if max_questions > 0:
             questions = questions[:max_questions]
         if not questions:
-            bt.logging.info(f"BT-Forecast run {run_id}: no new miner-safe questions to issue")
+            if retry_unanswered:
+                run_state["last_unanswered_retry_at"] = datetime.now(timezone.utc).isoformat()
+                bt.logging.info(
+                    f"BT-Forecast run {run_id}: no unanswered open miner forecasts to retry"
+                )
+            else:
+                bt.logging.info(f"BT-Forecast run {run_id}: no new miner-safe questions to issue")
+                run_state["questions_issued_at"] = datetime.now(timezone.utc).isoformat()
+                run_state["issued_question_count"] = 0
             return
 
         miner_uids = self.get_miner_uids()
@@ -526,8 +804,18 @@ class Validator(BaseValidatorNeuron):
         issued = 0
         answered = 0
         for question in questions:
+            question_miner_uids = miner_uids
+            if retry_unanswered:
+                question_miner_uids = self._bt_unanswered_uids_for_question(
+                    run_id,
+                    question.question_key,
+                    miner_uids,
+                    now=now,
+                )
+                if not question_miner_uids:
+                    continue
             synapse = self.build_bt_forecast_synapse(question, run_id=run_id)
-            axons = [self.metagraph.axons[uid] for uid in miner_uids]
+            axons = [self.metagraph.axons[uid] for uid in question_miner_uids]
             responses = await self.dendrite(
                 axons=axons,
                 synapse=synapse,
@@ -538,18 +826,272 @@ class Validator(BaseValidatorNeuron):
                 run_id=run_id,
                 question=question,
                 synapse=synapse,
-                miner_uids=miner_uids,
+                miner_uids=question_miner_uids,
                 responses=responses,
             )
             issued += count
             answered += answered_count
-            self.issued_questions[question.question_key] = now
+            if answered_count > 0:
+                self.issued_questions[question.question_key] = now
 
+        if not run_state.get("questions_issued_at"):
+            run_state["questions_issued_at"] = datetime.now(timezone.utc).isoformat()
+        if retry_unanswered:
+            run_state["last_unanswered_retry_at"] = datetime.now(timezone.utc).isoformat()
+        run_state["issued_question_count"] = len(questions)
+        run_state["last_issue_call_count"] = issued
+        run_state["last_issue_answered_count"] = answered
+        self.last_issue_at = time.time()
         bt.logging.info(
             f"issued {issued} BT-Forecast miner calls from run={run_id} "
             f"questions={len(questions)} answered={answered}/{issued} "
             f"pending now={len(self.pending)}"
         )
+
+    async def retry_unanswered_bt_forecast_runs(
+        self,
+        *,
+        client,
+        now: float,
+        exclude_run_id: Optional[str] = None,
+    ) -> None:
+        """Retry unanswered forecasts from earlier still-open BT-Forecast runs."""
+        for run_id, run_state in list(getattr(self, "bt_forecast_runs", {}).items()):
+            if run_id == exclude_run_id or not isinstance(run_state, dict):
+                continue
+            if not run_state.get("questions_issued_at"):
+                continue
+            if not self._bt_unanswered_retry_due(run_id, run_state, now):
+                continue
+            await self.issue_bt_forecast_round(
+                client=client,
+                now=now,
+                run_id=run_id,
+            )
+
+    def _bt_run_state(self, run_id: str) -> dict[str, Any]:
+        if not hasattr(self, "bt_forecast_runs"):
+            self.bt_forecast_runs = {}
+        state = self.bt_forecast_runs.get(run_id)
+        if not isinstance(state, dict):
+            state = {}
+            self.bt_forecast_runs[run_id] = state
+        return state
+
+    @staticmethod
+    def _bt_run_last_seen_timestamp(
+        run_id: str,
+        run_state: dict[str, Any],
+    ) -> Optional[float]:
+        timestamps = []
+        for key in (
+            "last_unanswered_retry_at",
+            "questions_issued_at",
+            "questions_fetched_at",
+            "last_polled_at",
+        ):
+            parsed = _parse_timestamp(str(run_state.get(key) or ""))
+            if parsed is not None:
+                timestamps.append(parsed)
+        if run_id.startswith("bt-"):
+            try:
+                run_date = datetime.fromisoformat(run_id[3:]).replace(tzinfo=timezone.utc)
+                timestamps.append(run_date.timestamp())
+            except ValueError:
+                pass
+        return max(timestamps) if timestamps else None
+
+    def _bt_run_has_only_unanswered_pending(
+        self, run_id: str, *, now: Optional[float] = None
+    ) -> bool:
+        now = time.time() if now is None else now
+        pending = [
+            forecast
+            for forecast in self.pending.values()
+            if forecast.get("source") == "bt_forecast"
+            and str(forecast.get("run_id")) == run_id
+            and self._forecast_open(forecast, now)
+        ]
+        if not pending:
+            return False
+        return all(forecast.get("probability") is None for forecast in pending)
+
+    def _bt_run_has_unanswered_pending(
+        self, run_id: str, *, now: Optional[float] = None
+    ) -> bool:
+        now = time.time() if now is None else now
+        return any(
+            forecast.get("source") == "bt_forecast"
+            and str(forecast.get("run_id")) == run_id
+            and self._forecast_open(forecast, now)
+            and forecast.get("probability") is None
+            for forecast in self.pending.values()
+        )
+
+    def _bt_question_has_unanswered_pending(
+        self,
+        run_id: str,
+        question_key: str,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        now = time.time() if now is None else now
+        return any(
+            forecast.get("source") == "bt_forecast"
+            and str(forecast.get("run_id")) == run_id
+            and str(forecast.get("question_key")) == question_key
+            and self._forecast_open(forecast, now)
+            and forecast.get("probability") is None
+            for forecast in self.pending.values()
+        )
+
+    def _bt_unanswered_uids_for_question(
+        self,
+        run_id: str,
+        question_key: str,
+        miner_uids: list[int],
+        *,
+        now: Optional[float] = None,
+    ) -> list[int]:
+        now = time.time() if now is None else now
+        has_open_pending = any(
+            forecast.get("source") == "bt_forecast"
+            and str(forecast.get("run_id")) == run_id
+            and str(forecast.get("question_key")) == question_key
+            and self._forecast_open(forecast, now)
+            for forecast in self.pending.values()
+        )
+        if not has_open_pending:
+            return []
+
+        retry_uids: list[int] = []
+        for uid in miner_uids:
+            fid = self._bt_pending_key(run_id, question_key, int(uid))
+            forecast = self.pending.get(fid)
+            if forecast is None:
+                retry_uids.append(int(uid))
+                continue
+            if (
+                forecast.get("source") == "bt_forecast"
+                and self._forecast_open(forecast, now)
+                and forecast.get("probability") is None
+            ):
+                retry_uids.append(int(uid))
+        return retry_uids
+
+    @staticmethod
+    def _forecast_open(forecast: dict, now: float) -> bool:
+        try:
+            return float(forecast.get("resolve_at") or 0.0) > now
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def _bt_no_answer_retry_due(
+        self, run_id: str, run_state: dict[str, Any], now: float
+    ) -> bool:
+        if not self._bt_run_has_only_unanswered_pending(run_id, now=now):
+            return False
+        return self._bt_unanswered_retry_due(run_id, run_state, now)
+
+    def _bt_unanswered_retry_due(
+        self, run_id: str, run_state: dict[str, Any], now: float
+    ) -> bool:
+        if not self._bt_run_has_unanswered_pending(run_id, now=now):
+            return False
+        last_attempt = _parse_timestamp(
+            str(
+                run_state.get("last_unanswered_retry_at")
+                or run_state.get("questions_issued_at")
+                or ""
+            )
+        )
+        if last_attempt is None:
+            return True
+        retry_seconds = self._bt_unanswered_retry_delay_seconds(run_id, now=now)
+        return now - last_attempt >= retry_seconds
+
+    def _bt_unanswered_retry_base_seconds(self) -> float:
+        return max(
+            0.0,
+            _env_float(
+                C.BT_FORECAST_NO_ANSWER_RETRY_SECONDS_ENV,
+                C.BT_FORECAST_NO_ANSWER_RETRY_SECONDS,
+            ),
+        )
+
+    def _bt_unanswered_retry_delay_seconds(
+        self, run_id: str, *, now: Optional[float] = None
+    ) -> float:
+        """Back off retries while keeping them active until the question cutoff."""
+        now = time.time() if now is None else now
+        base_seconds = self._bt_unanswered_retry_base_seconds()
+        max_seconds = max(
+            base_seconds,
+            _env_float(
+                C.BT_FORECAST_NO_ANSWER_RETRY_MAX_SECONDS_ENV,
+                C.BT_FORECAST_NO_ANSWER_RETRY_MAX_SECONDS,
+            ),
+        )
+        multiplier = max(
+            1.0,
+            _env_float(
+                C.BT_FORECAST_NO_ANSWER_RETRY_BACKOFF_MULTIPLIER_ENV,
+                C.BT_FORECAST_NO_ANSWER_RETRY_BACKOFF_MULTIPLIER,
+            ),
+        )
+        attempts = []
+        for forecast in self.pending.values():
+            if (
+                forecast.get("source") != "bt_forecast"
+                or str(forecast.get("run_id")) != run_id
+                or forecast.get("probability") is not None
+            ):
+                continue
+            try:
+                resolve_at = float(forecast.get("resolve_at") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if resolve_at <= now:
+                continue
+            try:
+                attempts.append(int(forecast.get("attempt_count") or 1))
+            except (TypeError, ValueError):
+                attempts.append(1)
+        if not attempts or base_seconds <= 0.0:
+            return base_seconds
+        delay = base_seconds * (multiplier ** max(0, max(attempts) - 1))
+        return min(max_seconds, delay)
+
+    @staticmethod
+    def _bt_run_generation_complete(generation: Optional[str]) -> bool:
+        return (generation or "").strip().lower() == C.BT_FORECAST_COMPLETE_GENERATION
+
+    @staticmethod
+    def _bt_run_poll_after_seconds(value: Optional[int]) -> int:
+        try:
+            seconds = int(value) if value is not None else C.BT_FORECAST_DEFAULT_POLL_AFTER_SECONDS
+        except (TypeError, ValueError):
+            seconds = C.BT_FORECAST_DEFAULT_POLL_AFTER_SECONDS
+        return max(60, seconds)
+
+    @staticmethod
+    def _bt_serialize_question(question: BtForecastQuestion) -> dict[str, Any]:
+        return question.model_dump()
+
+    @staticmethod
+    def _bt_cached_questions(run_state: dict[str, Any]) -> Optional[list[BtForecastQuestion]]:
+        cached = run_state.get("questions")
+        if not isinstance(cached, list):
+            return None
+        questions = []
+        for item in cached:
+            if not isinstance(item, dict):
+                return None
+            try:
+                questions.append(BtForecastQuestion.model_validate(item))
+            except Exception:
+                return None
+        return questions
 
     def build_bt_forecast_synapse(self, question: BtForecastQuestion, *, run_id: str) -> ForecastSynapse:
         issued_at = time.time()
@@ -609,8 +1151,15 @@ class Validator(BaseValidatorNeuron):
         submitted_at = time.time()
         issued = 0
         answered = 0
-        for uid, resp in zip(miner_uids, responses):
+        response_list = list(responses or [])
+        for index, uid in enumerate(miner_uids):
+            resp = response_list[index] if index < len(response_list) else None
             fid = self._bt_pending_key(run_id, question.question_key, int(uid))
+            existing = self.pending.get(fid, {})
+            try:
+                first_issued_at = float(existing.get("issued_at", synapse.issued_at))
+            except (TypeError, ValueError):
+                first_issued_at = synapse.issued_at
             probability, prediction, confidence = self._normalize_miner_response(resp)
             if probability is not None:
                 answered += 1
@@ -632,11 +1181,13 @@ class Validator(BaseValidatorNeuron):
                 "confidence": confidence,
                 "probability": probability,
                 "reasoning": getattr(resp, "reasoning", ""),
-                "model": getattr(resp, "model", ""),
+                "model": getattr(resp, "model", "") or "no-response",
                 "features": dict(getattr(resp, "features", {}) or {}),
                 "timestamp": getattr(resp, "timestamp", ""),
                 "submitted_at": _parse_timestamp(getattr(resp, "timestamp", "")) or submitted_at,
-                "issued_at": synapse.issued_at,
+                "issued_at": first_issued_at,
+                "last_queried_at": synapse.issued_at,
+                "attempt_count": int(existing.get("attempt_count") or 0) + 1,
                 "resolve_at": synapse.resolve_at,
                 "cutoff_date": question.cutoff_date,
                 "run_id": run_id,
@@ -652,6 +1203,9 @@ class Validator(BaseValidatorNeuron):
         return f"bt_forecast:{digest}"
 
     def _normalize_miner_response(self, resp) -> tuple[Optional[float], Optional[bool], Optional[float]]:
+        if Validator._is_no_answer_model(getattr(resp, "model", "")):
+            return None, None, None
+
         probability = getattr(resp, "probability", None)
         prediction = getattr(resp, "prediction", None)
         confidence = getattr(resp, "confidence", None)
@@ -680,6 +1234,10 @@ class Validator(BaseValidatorNeuron):
         if confidence is not None:
             confidence = max(0.0, min(1.0, confidence))
         return probability, prediction if prediction is None else bool(prediction), confidence
+
+    @staticmethod
+    def _is_no_answer_model(model: Any) -> bool:
+        return str(model or "").startswith("baseline")
 
     def _build_miner_results_payload(
         self,
@@ -731,10 +1289,10 @@ class Validator(BaseValidatorNeuron):
         return {
             "run_id": run_id,
             "question_key": question_key,
-            "family": sample.get("family", ""),
-            "scope": sample.get("scope", ""),
-            "netuid": sample.get("netuid"),
-            "horizon_days": sample.get("horizon_days"),
+            "family": sample.get("family") or resolution.family,
+            "scope": sample.get("scope") or resolution.scope,
+            "netuid": sample.get("netuid", resolution.netuid),
+            "horizon_days": sample.get("horizon_days", resolution.horizon_days),
             "outcome": outcome,
             "measurement_value": resolution.measurement_value,
             "resolved_at": resolution.resolved_at or datetime.now(timezone.utc).isoformat(),
@@ -790,8 +1348,15 @@ class Validator(BaseValidatorNeuron):
 if __name__ == "__main__":
     with Validator() as validator:
         while True:
+            answered_pending = sum(
+                1
+                for forecast in validator.pending.values()
+                if forecast.get("probability") is not None
+            )
+            no_answer_pending = len(validator.pending) - answered_pending
             bt.logging.info(
                 f"MASXAI validator alive | pending={len(validator.pending)} "
+                f"answered={answered_pending} no_answer={no_answer_pending} "
                 f"resolved={validator.resolved_count} | "
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')}"
             )
