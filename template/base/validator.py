@@ -23,10 +23,10 @@ import numpy as np
 import asyncio
 import argparse
 import threading
+import traceback
 import bittensor as bt
 
 from typing import List, Union
-from traceback import print_exception
 
 from template.base.neuron import BaseNeuron
 from template.base.utils.weight_utils import (
@@ -133,6 +133,7 @@ class BaseValidatorNeuron(BaseNeuron):
         self.should_exit: bool = False
         self.is_running: bool = False
         self.thread: Union[threading.Thread, None] = None
+        self.run_exception: Union[BaseException, None] = None
         self.lock = asyncio.Lock()
 
     def serve_axon(self):
@@ -187,22 +188,18 @@ class BaseValidatorNeuron(BaseNeuron):
             Exception: For unforeseen errors during the miner's operation, which are logged for diagnosis.
         """
 
-        # Check that validator is registered on the network.
-        self.sync()
-
-        bt.logging.info(f"Validator starting at block: {self.block}")
-
-        # This loop maintains the validator's operations until intentionally stopped.
         try:
-            while True:
+            # Check that validator is registered on the network.
+            self.sync()
+
+            bt.logging.info(f"Validator starting at block: {self.block}")
+
+            # This loop maintains the validator's operations until intentionally stopped.
+            while not self.should_exit:
                 bt.logging.info(f"step({self.step}) block({self.block})")
 
                 # Run multiple forwards concurrently.
                 self.loop.run_until_complete(self.concurrent_forward())
-
-                # Check if we should exit.
-                if self.should_exit:
-                    break
 
                 # Sync metagraph and potentially set weights.
                 self.sync()
@@ -215,12 +212,15 @@ class BaseValidatorNeuron(BaseNeuron):
             bt.logging.success("Validator killed by keyboard interrupt.")
             exit()
 
-        # In case of unforeseen errors, the validator will log the error and continue operations.
+        # In case of unforeseen errors, record the failure so the parent can exit.
         except Exception as err:
-            bt.logging.error(f"Error during validation: {str(err)}")
-            bt.logging.debug(
-                str(print_exception(type(err), err, err.__traceback__))
-            )
+            self.run_exception = err
+            self.should_exit = True
+            bt.logging.error(f"Fatal error during validation: {str(err)}")
+            bt.logging.debug(traceback.format_exc())
+            raise
+        finally:
+            self.is_running = False
 
     def run_in_background_thread(self):
         """
@@ -230,6 +230,7 @@ class BaseValidatorNeuron(BaseNeuron):
         if not self.is_running:
             bt.logging.debug("Starting validator in background thread.")
             self.should_exit = False
+            self.run_exception = None
             self.thread = threading.Thread(target=self.run, daemon=True)
             self.thread.start()
             self.is_running = True
@@ -242,7 +243,8 @@ class BaseValidatorNeuron(BaseNeuron):
         if self.is_running:
             bt.logging.debug("Stopping validator in background thread.")
             self.should_exit = True
-            self.thread.join(5)
+            if self.thread is not None:
+                self.thread.join(5)
             self.is_running = False
             bt.logging.debug("Stopped")
 
@@ -266,7 +268,8 @@ class BaseValidatorNeuron(BaseNeuron):
         if self.is_running:
             bt.logging.debug("Stopping validator in background thread.")
             self.should_exit = True
-            self.thread.join(5)
+            if self.thread is not None:
+                self.thread.join(5)
             self.is_running = False
             bt.logging.debug("Stopped")
 

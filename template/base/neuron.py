@@ -32,6 +32,10 @@ from template.mock import MockSubtensor, MockMetagraph
 from bittensor_wallet.mock import get_mock_wallet
 
 
+class RegistrationError(RuntimeError):
+    """Raised when the configured hotkey is not registered on the subnet."""
+
+
 class BaseNeuron(ABC):
     """
     Base class for Bittensor miners. This class is abstract and should be inherited by a subclass. It contains the core logic for all neurons; validators and miners.
@@ -141,11 +145,12 @@ class BaseNeuron(ABC):
             netuid=self.config.netuid,
             hotkey_ss58=self.wallet.hotkey.ss58_address,
         ):
-            bt.logging.error(
+            message = (
                 f"Wallet: {self.wallet} is not registered on netuid {self.config.netuid}."
-                f" Please register the hotkey using `btcli subnets register` before trying again"
+                " Please register the hotkey using `btcli subnets register` before trying again"
             )
-            exit()
+            bt.logging.error(message)
+            raise RegistrationError(message)
 
     def should_sync_metagraph(self):
         """

@@ -72,6 +72,7 @@ class BaseMinerNeuron(BaseNeuron):
         self.should_exit: bool = False
         self.is_running: bool = False
         self.thread: Union[threading.Thread, None] = None
+        self.run_exception: Union[BaseException, None] = None
         self.lock = asyncio.Lock()
 
     def run(self):
@@ -97,23 +98,23 @@ class BaseMinerNeuron(BaseNeuron):
             Exception: For unforeseen errors during the miner's operation, which are logged for diagnosis.
         """
 
-        # Check that miner is registered on the network.
-        self.sync()
-
-        # Serve passes the axon information to the network + netuid we are hosting on.
-        # This will auto-update if the axon port of external ip have changed.
-        bt.logging.info(
-            f"Serving miner axon {self.axon} on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}"
-        )
-        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
-
-        # Start  starts the miner's axon, making it active on the network.
-        self.axon.start()
-
-        bt.logging.info(f"Miner starting at block: {self.block}")
-
-        # This loop maintains the miner's operations until intentionally stopped.
         try:
+            # Check that miner is registered on the network.
+            self.sync()
+
+            # Serve passes the axon information to the network + netuid we are hosting on.
+            # This will auto-update if the axon port of external ip have changed.
+            bt.logging.info(
+                f"Serving miner axon {self.axon} on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}"
+            )
+            self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
+
+            # Start  starts the miner's axon, making it active on the network.
+            self.axon.start()
+
+            bt.logging.info(f"Miner starting at block: {self.block}")
+
+            # This loop maintains the miner's operations until intentionally stopped.
             while not self.should_exit:
                 while (
                     self.block - self.metagraph.last_update[self.uid]
@@ -136,9 +137,14 @@ class BaseMinerNeuron(BaseNeuron):
             bt.logging.success("Miner killed by keyboard interrupt.")
             exit()
 
-        # In case of unforeseen errors, the miner will log the error and continue operations.
+        # In case of unforeseen errors, record the failure so the parent can exit.
         except Exception as e:
+            self.run_exception = e
+            self.should_exit = True
             bt.logging.error(traceback.format_exc())
+            raise
+        finally:
+            self.is_running = False
 
     def run_in_background_thread(self):
         """
@@ -148,6 +154,7 @@ class BaseMinerNeuron(BaseNeuron):
         if not self.is_running:
             bt.logging.debug("Starting miner in background thread.")
             self.should_exit = False
+            self.run_exception = None
             self.thread = threading.Thread(target=self.run, daemon=True)
             self.thread.start()
             self.is_running = True

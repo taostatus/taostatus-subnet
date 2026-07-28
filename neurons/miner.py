@@ -113,8 +113,37 @@ class Miner(BaseMinerNeuron):
         return float(self.metagraph.S[uid])
 
 
+def _exit_if_worker_stopped(miner: Miner) -> None:
+    thread = getattr(miner, "thread", None)
+    if thread is None:
+        bt.logging.error(
+            "miner worker was not started; exiting for supervisor restart"
+        )
+        raise SystemExit(1)
+    if thread.is_alive():
+        return
+
+    err = getattr(miner, "run_exception", None)
+    if err is not None:
+        bt.logging.error(
+            f"miner worker stopped after fatal error; exiting for supervisor restart: {err}"
+        )
+    else:
+        bt.logging.error(
+            "miner worker stopped unexpectedly; exiting for supervisor restart"
+        )
+    raise SystemExit(1)
+
+
 if __name__ == "__main__":
     with Miner() as miner:
+        next_heartbeat_at = 0.0
         while True:
-            bt.logging.info(f"MASXAI miner alive | {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            time.sleep(30)
+            _exit_if_worker_stopped(miner)
+            now = time.time()
+            if now >= next_heartbeat_at:
+                bt.logging.info(
+                    f"MASXAI miner alive | {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                next_heartbeat_at = now + 30
+            time.sleep(1)
