@@ -23,6 +23,8 @@ import numpy as np
 import asyncio
 import argparse
 import threading
+import time
+import traceback
 import bittensor as bt
 
 from typing import List, Union
@@ -189,23 +191,40 @@ class BaseValidatorNeuron(BaseNeuron):
 
         # Check that validator is registered on the network.
         self.sync()
+        last_sync_block = self.block
 
         bt.logging.info(f"Validator starting at block: {self.block}")
 
         # This loop maintains the validator's operations until intentionally stopped.
         try:
-            while True:
-                bt.logging.info(f"step({self.step}) block({self.block})")
+            while not self.should_exit:
+                current_block = self.block
+                bt.logging.info(f"step({self.step}) block({current_block})")
 
                 # Run multiple forwards concurrently.
-                self.loop.run_until_complete(self.concurrent_forward())
+                try:
+                    self.loop.run_until_complete(self.concurrent_forward())
+                except Exception:
+                    bt.logging.error(traceback.format_exc())
+                    time.sleep(12)
+                    continue
 
                 # Check if we should exit.
                 if self.should_exit:
                     break
 
                 # Sync metagraph and potentially set weights.
-                self.sync()
+                try:
+                    current_block = self.block
+                    if (
+                        current_block - last_sync_block
+                        >= self.config.neuron.epoch_length
+                    ):
+                        self.sync()
+                        last_sync_block = current_block
+                except Exception:
+                    bt.logging.error(traceback.format_exc())
+                    time.sleep(12)
 
                 self.step += 1
 

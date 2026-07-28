@@ -43,6 +43,12 @@ except Exception:
         def __init__(self, *_, **__):
             raise RuntimeError("BaseValidatorNeuron requires a working bittensor install")
 
+        def should_set_weights(self) -> bool:
+            return False
+
+        def set_weights(self):
+            return None
+
 
 def _parse_timestamp(value: str) -> Optional[float]:
     if not value:
@@ -633,9 +639,6 @@ class Validator(BaseValidatorNeuron):
         miner_uids = self.get_miner_uids()
         if len(miner_uids) == 0:
             bt.logging.info("no miners to query this epoch")
-            run_state["next_poll_at"] = now + self._bt_unanswered_retry_base_seconds()
-            if retry_unanswered:
-                run_state["last_unanswered_retry_at"] = datetime.now(timezone.utc).isoformat()
             return
 
         synapse = self.build_question(event_type, reference)
@@ -1163,6 +1166,12 @@ class Validator(BaseValidatorNeuron):
             probability, prediction, confidence = self._normalize_miner_response(resp)
             if probability is not None:
                 answered += 1
+            if existing.get("probability") is not None and probability is None:
+                existing["last_queried_at"] = synapse.issued_at
+                existing["attempt_count"] = int(existing.get("attempt_count") or 0) + 1
+                self.pending[fid] = existing
+                issued += 1
+                continue
             self.pending[fid] = {
                 "source": "bt_forecast",
                 "pending_key": fid,

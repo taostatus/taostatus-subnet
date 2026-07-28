@@ -580,6 +580,38 @@ def test_validator_stores_no_response_rows_for_retry(monkeypatch):
     assert validator.bt_forecast_runs["bt-test"]["last_issue_answered_count"] == 0
 
 
+def test_validator_preserves_existing_answer_when_reissue_gets_no_response(monkeypatch):
+    class NoResponseDendrite:
+        async def __call__(self, axons, synapse, deserialize=False, timeout=0):
+            return []
+
+    monkeypatch.setenv("BT_FORECAST_RUN_ID", "bt-test")
+    fake_client = _FakeBtForecastClient()
+    validator = _validator(fake_client)
+    validator.dendrite = NoResponseDendrite()
+    question = asyncio.run(fake_client.get_questions("bt-test"))[0]
+    answered_key = validator._bt_pending_key("bt-test", question.question_key, 1)
+    unanswered_key = validator._bt_pending_key("bt-test", question.question_key, 2)
+    validator.pending[answered_key] = {
+        "source": "bt_forecast",
+        "run_id": "bt-test",
+        "uid": 1,
+        "question_key": question.question_key,
+        "probability": 0.77,
+        "prediction": True,
+        "confidence": 0.77,
+        "resolve_at": 2_000.0,
+        "issued_at": 100.0,
+        "attempt_count": 1,
+    }
+
+    asyncio.run(validator.issue_bt_forecast_round(client=fake_client, now=1_000.0))
+
+    assert validator.pending[answered_key]["probability"] == 0.77
+    assert validator.pending[answered_key]["attempt_count"] == 2
+    assert validator.pending[unanswered_key]["probability"] is None
+
+
 def test_validator_retry_backoff_uses_attempt_count(monkeypatch):
     monkeypatch.setenv("MASXAI_BT_FORECAST_NO_ANSWER_RETRY_SECONDS", "100")
     monkeypatch.setenv("MASXAI_BT_FORECAST_NO_ANSWER_RETRY_MAX_SECONDS", "1000")
