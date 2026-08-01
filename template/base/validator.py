@@ -36,7 +36,7 @@ from template.base.utils.weight_utils import (
 from template.mock import MockDendrite
 from template.utils.config import add_validator_args
 
-BURN_UID = 36
+BURN_UID = 25
 BURN_PERCENTAGE = 0.95
 
 
