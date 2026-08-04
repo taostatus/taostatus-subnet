@@ -15,6 +15,7 @@ import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -84,6 +85,21 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _state_file_path() -> Path:
+    load_env()
+    configured = os.getenv(C.VALIDATOR_STATE_FILE_ENV, "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        return path if path.is_absolute() else Path.cwd() / path
+
+    path = Path(C.STATE_FILE).expanduser()
+    return path if path.is_absolute() else _repo_root() / path
+
+
 class Validator(BaseValidatorNeuron):
     def __init__(self, config=None):
         load_env()
@@ -102,7 +118,8 @@ class Validator(BaseValidatorNeuron):
         bt.logging.info(
             "MASXAI validator initialized | "
             f"bt_forecast_enabled={self.bt_forecast_client is not None} "
-            f"bt_forecast_required={self.bt_forecast_required}"
+            f"bt_forecast_required={self.bt_forecast_required} "
+            f"state_file={_state_file_path()}"
         )
 
     # ---------------------------------------------------------------- state
@@ -113,10 +130,12 @@ class Validator(BaseValidatorNeuron):
             self.feedback_queue = []
         if not hasattr(self, "bt_forecast_runs"):
             self.bt_forecast_runs = {}
-        if not os.path.exists(C.STATE_FILE):
+        state_path = _state_file_path()
+        if not state_path.exists():
+            bt.logging.info(f"validator state file not found: {state_path}")
             return
         try:
-            with open(C.STATE_FILE, "r") as f:
+            with state_path.open("r") as f:
                 s = json.load(f)
             self.pending = s.get("pending", {})
             sanitized = self._sanitize_fallback_pending()
@@ -138,7 +157,7 @@ class Validator(BaseValidatorNeuron):
                 if arr.shape == self.scores.shape:
                     self.scores = arr
             bt.logging.info(
-                f"loaded state: {len(self.pending)} pending, "
+                f"loaded state from {state_path}: {len(self.pending)} pending, "
                 f"{self.resolved_count} resolved, "
                 f"{len(self.feedback_queue)} feedback payload(s) queued"
             )
@@ -172,9 +191,10 @@ class Validator(BaseValidatorNeuron):
             pruned = self.prune_masxai_state()
             if any(pruned.values()):
                 bt.logging.info(f"pruned validator state before save: {pruned}")
-            state_path = os.path.abspath(C.STATE_FILE)
-            tmp_path = f"{state_path}.tmp"
-            with open(tmp_path, "w") as f:
+            state_path = _state_file_path()
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = state_path.with_name(f"{state_path.name}.tmp")
+            with tmp_path.open("w") as f:
                 json.dump(
                     {
                         "pending": self.pending,
@@ -350,6 +370,8 @@ class Validator(BaseValidatorNeuron):
             await self.flush_bt_feedback()
             return
 
+        self._log_resolution_due(due, now=now)
+
         bt_due = [fid for fid in due if self.pending[fid].get("source") == "bt_forecast"]
         bt_due_set = set(bt_due)
         local_due = [fid for fid in due if fid not in bt_due_set]
@@ -414,19 +436,60 @@ class Validator(BaseValidatorNeuron):
                 continue
             by_run[str(f.get("run_id") or bt_forecast_run_id_from_env())].append(fid)
 
+        fetch_plan: list[tuple[str, list[str]]] = []
+        skipped_runs = 0
+        for run_id, fids in by_run.items():
+            run_state = self._bt_run_state(run_id)
+            next_poll_at = self._bt_next_resolution_poll_at(run_state)
+            if next_poll_at is not None and next_poll_at > now:
+                skipped_runs += 1
+                remaining = int(next_poll_at - now)
+                bt.logging.debug(
+                    f"BT-Forecast run {run_id} resolution retry not due for {remaining}s"
+                )
+                continue
+            fetch_plan.append((run_id, fids))
+
+        if not fetch_plan:
+            if skipped_runs:
+                bt.logging.debug(
+                    f"BT-Forecast resolution pass deferred by retry schedule | "
+                    f"runs_waiting={skipped_runs}"
+                )
+            return
+
         resolution_wait = _env_float(
             C.BT_FORECAST_RESOLUTION_WAIT_SECONDS_ENV,
             C.BT_FORECAST_RESOLUTION_WAIT_SECONDS,
         )
         resolved_questions = 0
         dropped_questions = 0
+        unresolved_questions = 0
+        stale_forecasts = 0
+        runs_polled = 0
 
-        for run_id, fids in by_run.items():
-            try:
-                resolutions = await client.get_resolutions(run_id=run_id)
-            except Exception as e:  # noqa: BLE001
-                bt.logging.warning(f"BT-Forecast resolutions fetch failed run_id={run_id}: {e}")
+        fetches = [
+            client.get_resolutions(run_id=run_id)
+            for run_id, _fids in fetch_plan
+        ]
+        fetch_results = await asyncio.gather(*fetches, return_exceptions=True)
+
+        for (run_id, fids), fetch_result in zip(fetch_plan, fetch_results):
+            run_state = self._bt_run_state(run_id)
+            polled_at = datetime.now(timezone.utc).isoformat()
+            runs_polled += 1
+            run_state["last_resolution_polled_at"] = polled_at
+
+            if isinstance(fetch_result, Exception):
+                run_state["last_resolution_error_at"] = polled_at
+                self._schedule_next_bt_resolution_poll(run_state, now=now)
+                bt.logging.warning(
+                    f"BT-Forecast resolutions fetch failed run_id={run_id}: "
+                    f"{fetch_result}"
+                )
                 continue
+            resolutions = list(fetch_result or [])
+            run_state["last_resolution_count"] = len(resolutions)
 
             resolution_by_key = {r.question_key: r for r in resolutions}
             by_question: dict[str, list[str]] = defaultdict(list)
@@ -435,31 +498,46 @@ class Validator(BaseValidatorNeuron):
                 if f:
                     by_question[str(f.get("question_key") or fid)].append(fid)
 
+            run_unresolved_questions = 0
             for question_key, question_fids in by_question.items():
                 sample = self.pending.get(question_fids[0])
                 if not sample:
                     continue
                 resolution = resolution_by_key.get(question_key)
-                if resolution is None or resolution.status in C.BT_FORECAST_OPEN_STATUSES:
-                    if now - float(sample.get("resolve_at", now)) > resolution_wait:
+                try:
+                    sample_resolve_at = float(sample.get("resolve_at", now))
+                except (TypeError, ValueError):
+                    sample_resolve_at = now
+                status = str(getattr(resolution, "status", "") or "").strip().lower()
+                if resolution is None or status in C.BT_FORECAST_OPEN_STATUSES:
+                    if now - sample_resolve_at > resolution_wait:
                         self._drop_pending(question_fids)
                         dropped_questions += 1
                         bt.logging.info(
                             f"dropped unscored BT-Forecast question after wait window: {question_key}"
                         )
+                    else:
+                        unresolved_questions += 1
+                        run_unresolved_questions += 1
                     continue
 
-                if resolution.status in C.BT_FORECAST_UNSCORED_TERMINAL_STATUSES:
+                if status in C.BT_FORECAST_UNSCORED_TERMINAL_STATUSES:
                     self._drop_pending(question_fids)
                     dropped_questions += 1
                     bt.logging.info(
-                        f"dropped unscored BT-Forecast question status={resolution.status}: "
+                        f"dropped unscored BT-Forecast question status={status}: "
                         f"{question_key}"
                     )
                     continue
 
                 outcome = resolution.bool_outcome()
                 if outcome is None:
+                    unresolved_questions += 1
+                    run_unresolved_questions += 1
+                    bt.logging.warning(
+                        f"BT-Forecast resolution has no boolean outcome "
+                        f"status={status or 'unknown'} question_key={question_key}"
+                    )
                     continue
 
                 forecasts = [self.pending[fid] for fid in question_fids if fid in self.pending]
@@ -474,7 +552,10 @@ class Validator(BaseValidatorNeuron):
                     if fid not in self.pending:
                         continue
                     f = self.pending.pop(fid)
-                    uid = int(f["uid"])
+                    uid = self._forecast_uid(f)
+                    if uid is None or not self._scoreable_uid(uid, f):
+                        stale_forecasts += 1
+                        continue
                     prev_score = float(self.scores[uid])
                     reward = self._score_resolved_forecast(f, outcome)
                     self.scores[uid] = ema_update(float(self.scores[uid]), reward)
@@ -490,10 +571,114 @@ class Validator(BaseValidatorNeuron):
                     self.feedback_queue.append(feedback_payload)
                 resolved_questions += 1
 
+            if run_unresolved_questions:
+                self._schedule_next_bt_resolution_poll(run_state, now=now)
+            else:
+                run_state.pop("next_resolution_poll_at", None)
+
         bt.logging.info(
-            f"BT-Forecast resolution pass | questions_resolved={resolved_questions} "
-            f"questions_dropped={dropped_questions} total_resolved={self.resolved_count}"
+            f"BT-Forecast resolution pass | runs_polled={runs_polled} "
+            f"runs_waiting={skipped_runs} questions_resolved={resolved_questions} "
+            f"questions_unresolved={unresolved_questions} "
+            f"questions_dropped={dropped_questions} stale_forecasts={stale_forecasts} "
+            f"total_resolved={self.resolved_count}"
         )
+
+    def _log_resolution_due(self, due: list[str], *, now: float) -> None:
+        last_logged = float(getattr(self, "_last_resolution_due_log_at", 0.0) or 0.0)
+        if now - last_logged < 60.0:
+            return
+        self._last_resolution_due_log_at = now
+        bt_due = 0
+        runs = set()
+        questions = set()
+        oldest_resolve_at = now
+        for fid in due:
+            forecast = self.pending.get(fid)
+            if not forecast:
+                continue
+            try:
+                resolve_at = float(forecast.get("resolve_at") or now)
+            except (TypeError, ValueError):
+                resolve_at = now
+            oldest_resolve_at = min(oldest_resolve_at, resolve_at)
+            if forecast.get("source") == "bt_forecast":
+                bt_due += 1
+                runs.add(str(forecast.get("run_id") or "unknown"))
+                questions.add(str(forecast.get("question_key") or fid))
+        bt.logging.info(
+            f"resolution due | total={len(due)} bt={bt_due} "
+            f"local={len(due) - bt_due} bt_runs={len(runs)} "
+            f"bt_questions={len(questions)} oldest_lag_s={int(max(0.0, now - oldest_resolve_at))}"
+        )
+
+    def _bt_resolution_retry_seconds(self) -> float:
+        return max(
+            0.0,
+            _env_float(
+                C.BT_FORECAST_RESOLUTION_RETRY_SECONDS_ENV,
+                C.BT_FORECAST_RESOLUTION_RETRY_SECONDS,
+            ),
+        )
+
+    @staticmethod
+    def _bt_next_resolution_poll_at(run_state: dict[str, Any]) -> Optional[float]:
+        try:
+            next_poll_at = run_state.get("next_resolution_poll_at")
+            if next_poll_at is None:
+                return None
+            return float(next_poll_at)
+        except (TypeError, ValueError):
+            return None
+
+    def _schedule_next_bt_resolution_poll(
+        self,
+        run_state: dict[str, Any],
+        *,
+        now: float,
+    ) -> None:
+        retry_seconds = self._bt_resolution_retry_seconds()
+        if retry_seconds <= 0.0:
+            run_state.pop("next_resolution_poll_at", None)
+            return
+        run_state["next_resolution_poll_at"] = now + retry_seconds
+
+    @staticmethod
+    def _forecast_uid(forecast: dict) -> Optional[int]:
+        try:
+            return int(forecast["uid"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _scoreable_uid(self, uid: int, forecast: dict) -> bool:
+        scores = getattr(self, "scores", None)
+        if scores is None or uid < 0 or uid >= len(scores):
+            bt.logging.warning(
+                f"dropping resolved forecast for unscoreable uid={uid}: "
+                "uid is outside the current score array"
+            )
+            return False
+
+        try:
+            metagraph_size = self._metagraph_size()
+        except Exception:
+            metagraph_size = len(scores)
+        if metagraph_size > 0 and uid >= metagraph_size:
+            bt.logging.warning(
+                f"dropping resolved forecast for stale uid={uid}: "
+                "uid is outside the current metagraph"
+            )
+            return False
+
+        hotkey = forecast.get("hotkey")
+        hotkeys = getattr(getattr(self, "metagraph", None), "hotkeys", [])
+        if hotkey and uid < len(hotkeys) and hotkeys[uid] != hotkey:
+            bt.logging.warning(
+                f"dropping resolved forecast for stale uid={uid}: "
+                "hotkey changed since forecast submission"
+            )
+            return False
+        return True
 
     def _score_resolved_forecast(self, forecast: dict, outcome: bool) -> float:
         uid = int(forecast["uid"])
@@ -1347,9 +1532,15 @@ class Validator(BaseValidatorNeuron):
     # ------------------------------------------------------------- forward
     async def forward(self):
         """One validator step: resolve due → issue new → persist."""
-        await self.resolve_due()
-        await self.issue_round()
-        self.save_masxai_state()
+        lock = getattr(self, "lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.lock = lock
+        async with lock:
+            await self.resolve_due()
+            self.save_masxai_state()
+            await self.issue_round()
+            self.save_masxai_state()
         # brief pause so we don't hot-loop; the base class also paces by epoch
         await asyncio.sleep(5)
 
@@ -1357,6 +1548,13 @@ class Validator(BaseValidatorNeuron):
 if __name__ == "__main__":
     with Validator() as validator:
         while True:
+            thread = getattr(validator, "thread", None)
+            if thread is not None and not thread.is_alive():
+                bt.logging.error(
+                    "MASXAI validator background loop stopped; exiting instead of "
+                    "continuing stale alive logs"
+                )
+                raise SystemExit(1)
             answered_pending = sum(
                 1
                 for forecast in validator.pending.values()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,7 +14,7 @@ from masxai.oracle_bt import (
     BtForecastRunStatus,
 )
 from masxai import constants as C
-from neurons.validator import BaseValidatorNeuron, Validator
+from neurons.validator import BaseValidatorNeuron, Validator, _state_file_path
 from providers.bt_forecast_provider import BTForecastTaskProvider
 
 
@@ -62,6 +63,7 @@ class _FakeBtForecastClient:
         self.poll_after_s = poll_after_s
         self.run_polls = 0
         self.question_fetches = 0
+        self.resolution_fetches = 0
         self.posts = []
         self.include_lineage_calls = []
 
@@ -96,6 +98,7 @@ class _FakeBtForecastClient:
         ]
 
     async def get_resolutions(self, run_id: str):
+        self.resolution_fetches += 1
         return [
             BtForecastResolution(
                 question_key="Will SN12 active miner count fall below by daily snapshot|SN12|2099-01-01",
@@ -126,6 +129,14 @@ def _validator(fake_client: _FakeBtForecastClient) -> Validator:
     validator.dendrite = _FakeDendrite()
     validator.scores = np.zeros(3, dtype=np.float32)
     return validator
+
+
+def test_validator_state_file_defaults_to_repo_root(monkeypatch, tmp_path):
+    monkeypatch.delenv("MASXAI_VALIDATOR_STATE_FILE", raising=False)
+    monkeypatch.setattr(C, "STATE_FILE", "validator_state.json")
+    monkeypatch.chdir(tmp_path)
+
+    assert _state_file_path() == Path(__file__).resolve().parents[1] / "validator_state.json"
 
 
 def test_validator_issues_bt_forecast_question_without_engine_answer(monkeypatch):
@@ -492,6 +503,140 @@ def test_validator_resolves_bt_forecast_and_posts_accurate_miners(monkeypatch):
     assert len(fake_client.posts) == 1
     assert [row["uid"] for row in fake_client.posts[0]["results"]] == [1]
     assert fake_client.posts[0]["engine_probability"] == 0.31
+
+
+def test_validator_defers_resolution_fetch_until_retry_due(monkeypatch):
+    monkeypatch.setenv("BT_FORECAST_RUN_ID", "bt-test")
+    fake_client = _FakeBtForecastClient()
+    validator = _validator(fake_client)
+    question = asyncio.run(fake_client.get_questions("bt-test"))[0]
+    pending_key = validator._bt_pending_key("bt-test", question.question_key, 1)
+    validator.bt_forecast_runs["bt-test"] = {
+        "next_resolution_poll_at": 2_000.0,
+    }
+    validator.pending[pending_key] = {
+        "source": "bt_forecast",
+        "run_id": "bt-test",
+        "uid": 1,
+        "hotkey": "miner-hotkey-1",
+        "question_key": question.question_key,
+        "probability": 0.93,
+        "prediction": True,
+        "confidence": 0.93,
+        "resolve_at": 1.0,
+    }
+
+    asyncio.run(
+        validator.resolve_bt_forecast_due(
+            [pending_key],
+            now=1_000.0,
+        )
+    )
+
+    assert fake_client.resolution_fetches == 0
+    assert pending_key in validator.pending
+
+
+def test_validator_schedules_resolution_retry_for_open_status(monkeypatch):
+    monkeypatch.setenv("MASXAI_BT_FORECAST_RESOLUTION_RETRY_SECONDS", "120")
+
+    class OpenResolutionClient(_FakeBtForecastClient):
+        async def get_resolutions(self, run_id: str):
+            self.resolution_fetches += 1
+            return [
+                BtForecastResolution(
+                    question_key="open-question",
+                    status="open",
+                    outcome=None,
+                )
+            ]
+
+    fake_client = OpenResolutionClient()
+    validator = _validator(fake_client)
+    pending_key = validator._bt_pending_key("bt-test", "open-question", 1)
+    validator.pending[pending_key] = {
+        "source": "bt_forecast",
+        "run_id": "bt-test",
+        "uid": 1,
+        "hotkey": "miner-hotkey-1",
+        "question_key": "open-question",
+        "probability": 0.93,
+        "prediction": True,
+        "confidence": 0.93,
+        "resolve_at": 1.0,
+    }
+
+    asyncio.run(
+        validator.resolve_bt_forecast_due(
+            [pending_key],
+            now=1_000.0,
+        )
+    )
+
+    assert fake_client.resolution_fetches == 1
+    assert validator.bt_forecast_runs["bt-test"]["next_resolution_poll_at"] == 1_120.0
+    assert pending_key in validator.pending
+
+
+def test_validator_saves_resolved_state_before_issue_failure(monkeypatch):
+    monkeypatch.setenv("BT_FORECAST_RUN_ID", "bt-test")
+    fake_client = _FakeBtForecastClient()
+    validator = _validator(fake_client)
+    asyncio.run(validator.issue_round())
+    for forecast in validator.pending.values():
+        forecast["resolve_at"] = 1.0
+    saved = []
+
+    def save_snapshot():
+        saved.append(
+            {
+                "pending": len(validator.pending),
+                "resolved_count": validator.resolved_count,
+            }
+        )
+
+    async def fail_issue_round():
+        raise RuntimeError("issue failed")
+
+    validator.save_masxai_state = save_snapshot
+    validator.issue_round = fail_issue_round
+
+    with pytest.raises(RuntimeError, match="issue failed"):
+        asyncio.run(validator.forward())
+
+    assert saved[0] == {"pending": 0, "resolved_count": 2}
+
+
+def test_validator_drops_stale_uid_without_aborting_resolution():
+    fake_client = _FakeBtForecastClient()
+    validator = _validator(fake_client)
+    pending_key = validator._bt_pending_key(
+        "bt-test",
+        "Will SN12 active miner count fall below by daily snapshot|SN12|2099-01-01",
+        99,
+    )
+    validator.pending[pending_key] = {
+        "source": "bt_forecast",
+        "run_id": "bt-test",
+        "uid": 99,
+        "hotkey": "old-miner-hotkey",
+        "question_key": "Will SN12 active miner count fall below by daily snapshot|SN12|2099-01-01",
+        "family": "active_miners",
+        "probability": 0.93,
+        "prediction": True,
+        "confidence": 0.93,
+        "resolve_at": 1.0,
+    }
+
+    asyncio.run(
+        validator.resolve_bt_forecast_due(
+            [pending_key],
+            now=1_000.0,
+        )
+    )
+
+    assert validator.pending == {}
+    assert validator.resolved_count == 0
 
 
 def test_validator_refuses_weights_before_resolved_scores(monkeypatch):

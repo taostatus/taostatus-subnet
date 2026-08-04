@@ -78,9 +78,10 @@ class BtForecastResolution(BaseModel):
     def bool_outcome(self) -> Optional[bool]:
         if self.outcome is not None:
             return bool(self.outcome)
-        if self.status == C.BT_FORECAST_RESOLVED_TRUE:
+        status = str(self.status or "").strip().lower()
+        if status == C.BT_FORECAST_RESOLVED_TRUE:
             return True
-        if self.status == C.BT_FORECAST_RESOLVED_FALSE:
+        if status == C.BT_FORECAST_RESOLVED_FALSE:
             return False
         return None
 
