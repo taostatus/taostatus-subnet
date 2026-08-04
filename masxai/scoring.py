@@ -1,14 +1,16 @@
 """
 masxai/scoring.py - forecast scoring utilities.
 
-The MVP validator scores structured forecasts with the weighted formula from
-the product spec:
+The validator scores structured forecasts with the weighted formula from the
+Phase 1 product spec:
 
-Final Score = 50% Accuracy + 20% Confidence Calibration
+Final Score = 50% Brier Skill + 20% Confidence Calibration
             + 20% Consistency + 10% Timeliness
 
 The original Brier helpers stay available for probability-only tests and legacy
-miners.
+miners. Phase 1 uses probability as the primary score input for structured
+forecasts, with a baseline gate so neutral 0.5 answers do not earn composite
+reward.
 """
 
 from masxai import constants as C
@@ -33,6 +35,15 @@ def brier_score(probability: float, outcome: bool) -> float:
 def reward_from_brier(brier: float) -> float:
     """Convert a Brier score [0,1] into a reward [0,1] (higher = better)."""
     return max(0.0, 1.0 - brier)
+
+
+def brier_skill(probability: float, outcome: bool, baseline_probability: float = C.NEUTRAL_PROB) -> float:
+    """Brier skill versus a neutral/climatology baseline, clamped to [0, 1]."""
+    baseline = brier_score(baseline_probability, outcome)
+    if baseline <= 0.0:
+        return 0.0
+    skill = 1.0 - (brier_score(probability, outcome) / baseline)
+    return max(0.0, min(1.0, skill))
 
 
 def score_response(probability, outcome: bool) -> float:
@@ -74,17 +85,23 @@ def score_structured_forecast(
     prediction,
     confidence,
     outcome: bool,
+    probability=None,
     previous_score: float = 0.5,
     submitted_at: float = 0.0,
     issued_at: float = 0.0,
     resolve_at: float = 1.0,
+    baseline_gate: bool = C.BASELINE_COMPOSITE_GATE,
 ) -> float:
-    """Return the MVP weighted reward for one resolved structured forecast."""
-    if prediction is None or confidence is None:
+    """Return the Phase-1 weighted reward for one resolved structured forecast."""
+    if probability is None and prediction is not None and confidence is not None:
+        probability = float(confidence) if bool(prediction) else 1.0 - float(confidence)
+    if probability is None or prediction is None or confidence is None:
         return 0.0
 
     pred = bool(prediction)
-    acc = 1.0 if pred is outcome else 0.0
+    acc = brier_skill(float(probability), outcome)
+    if baseline_gate and acc <= 0.0:
+        return 0.0
     cal = calibration_score(pred, float(confidence), outcome)
     consistency = clamp_confidence(float(previous_score))
     timely = timeliness_score(float(submitted_at), float(issued_at), float(resolve_at))

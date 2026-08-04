@@ -22,6 +22,21 @@ import bittensor as bt
 
 from abc import ABC, abstractmethod
 
+try:
+    from async_substrate_interface.errors import SubstrateRequestException
+except ImportError:
+    SubstrateRequestException = None
+
+TRANSIENT_REGISTRATION_EXCEPTIONS = tuple(
+    exc
+    for exc in (
+        SubstrateRequestException,
+        ConnectionError,
+        TimeoutError,
+    )
+    if exc is not None
+)
+
 # Sync calls set weights and also resyncs the metagraph.
 from template.utils.config import check_config, add_args, config
 from template.utils.misc import ttl_get_block
@@ -110,6 +125,7 @@ class BaseNeuron(ABC):
             f"Running neuron on subnet: {self.config.netuid} with uid {self.uid} using network: {self.subtensor.chain_endpoint}"
         )
         self.step = 0
+        self._last_metagraph_sync_block = self._metagraph_block()
 
     @abstractmethod
     async def forward(self, synapse: bt.Synapse) -> bt.Synapse:
@@ -126,8 +142,13 @@ class BaseNeuron(ABC):
         # Ensure miner or validator hotkey is still registered on the network.
         self.check_registered()
 
-        if self.should_sync_metagraph():
+        current_block = self.block
+        if self.should_sync_metagraph(current_block=current_block):
             self.resync_metagraph()
+            self._last_metagraph_sync_block = max(
+                current_block,
+                self._metagraph_block(),
+            )
 
         if self.should_set_weights():
             self.set_weights()
@@ -137,23 +158,50 @@ class BaseNeuron(ABC):
 
     def check_registered(self):
         # --- Check for registration.
-        if not self.subtensor.is_hotkey_registered(
-            netuid=self.config.netuid,
-            hotkey_ss58=self.wallet.hotkey.ss58_address,
-        ):
+        hotkey_ss58 = self.wallet.hotkey.ss58_address
+        try:
+            is_registered = self.subtensor.is_hotkey_registered(
+                netuid=self.config.netuid,
+                hotkey_ss58=hotkey_ss58,
+            )
+        except Exception as exc:
+            if not (
+                isinstance(exc, TRANSIENT_REGISTRATION_EXCEPTIONS)
+                and hotkey_ss58 in getattr(self.metagraph, "hotkeys", [])
+            ):
+                raise
+
+            bt.logging.warning(
+                "Subtensor registration check failed, but hotkey is present in "
+                f"the local metagraph; continuing. error={exc}"
+            )
+            return
+
+        if not is_registered:
             bt.logging.error(
                 f"Wallet: {self.wallet} is not registered on netuid {self.config.netuid}."
                 f" Please register the hotkey using `btcli subnets register` before trying again"
             )
             exit()
 
-    def should_sync_metagraph(self):
+    def should_sync_metagraph(self, current_block: typing.Optional[int] = None):
         """
         Check if enough epoch blocks have elapsed since the last checkpoint to sync.
         """
-        return (
-            self.block - self.metagraph.last_update[self.uid]
-        ) > self.config.neuron.epoch_length
+        current_block = self.block if current_block is None else current_block
+        last_sync_block = getattr(
+            self,
+            "_last_metagraph_sync_block",
+            self._metagraph_block(),
+        )
+        return (current_block - last_sync_block) > self.config.neuron.epoch_length
+
+    def _metagraph_block(self) -> int:
+        block = getattr(self.metagraph, "block", 0)
+        try:
+            return int(block.item()) if hasattr(block, "item") else int(block)
+        except (TypeError, ValueError):
+            return 0
 
     def should_set_weights(self) -> bool:
         # Don't set weights on initialization.

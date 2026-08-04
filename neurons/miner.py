@@ -2,8 +2,8 @@
 neurons/miner.py - MASXAI MVP miner.
 
 Miners use Gemini as the forecasting engine when GEMINI_API_KEY or GOOGLE_API_KEY
-is configured. Without a key, the miner still serves a neutral baseline forecast
-so local runs and testnet smoke tests do not require secrets.
+is configured. Without a usable Gemini response, the miner returns a structured
+no-answer payload so it stays online without earning forecast credit.
 """
 
 import os
@@ -32,7 +32,7 @@ except Exception:
 
 def predict(synapse: ForecastSynapse) -> dict:
     """
-    Baseline structured forecast. Kept as a simple override point for custom
+    Structured no-answer fallback. Kept as a simple override point for custom
     miners and for the local mock runner.
     """
     return baseline_forecast(synapse)
@@ -57,33 +57,42 @@ class Miner(BaseMinerNeuron):
             f"model={os.getenv('GEMINI_MODEL', C.GEMINI_MODEL)} "
             f"timeout={os.getenv('GEMINI_TIMEOUT', C.GEMINI_TIMEOUT)}"
         )
-        bt.logging.info("MASXAI v1 baseline miner initialized.")
+        bt.logging.info("MASXAI v1 Gemini miner initialized.")
 
     async def forward(self, synapse: ForecastSynapse) -> ForecastSynapse:
         """Answer a forecasting question with a structured Gemini forecast."""
         try:
             forecast = await generate_forecast(synapse)
         except Exception as e:  # noqa: BLE001 — never let forward crash
-            bt.logging.warning(f"miner predict failed, returning neutral: {e}")
+            bt.logging.warning(f"miner predict failed, returning no-answer: {e}")
             forecast = predict(synapse)
 
         synapse.forecast_id = str(forecast.get("forecast_id") or synapse.forecast_id)
         synapse.prediction = forecast.get("prediction")
         synapse.confidence = forecast.get("confidence")
+        synapse.probability = forecast.get("probability")
         synapse.reasoning = str(forecast.get("reasoning") or "")
         synapse.timestamp = str(forecast.get("timestamp") or "")
         synapse.model = str(forecast.get("model") or C.GEMINI_MODEL)
+        synapse.features = dict(forecast.get("features") or {})
 
-        if synapse.prediction is not None and synapse.confidence is not None:
+        if (
+            synapse.probability is None
+            and synapse.prediction is not None
+            and synapse.confidence is not None
+        ):
             synapse.probability = (
                 float(synapse.confidence)
                 if synapse.prediction
                 else 1.0 - float(synapse.confidence)
             )
 
-        asyncio.create_task(publish_forecast(forecast))
+        if synapse.probability is not None:
+            asyncio.create_task(publish_forecast(forecast))
+        status = "no-answer" if synapse.probability is None else "answered"
         bt.logging.debug(
-            f"answered: event={synapse.event_type} prediction={synapse.prediction} "
+            f"{status}: event={synapse.event_type} model={synapse.model} "
+            f"probability={synapse.probability} prediction={synapse.prediction} "
             f"confidence={synapse.confidence}"
         )
         return synapse
@@ -101,15 +110,22 @@ class Miner(BaseMinerNeuron):
             return True, f"unregistered hotkey {hotkey}"
 
         uid = self.metagraph.hotkeys.index(hotkey)
-        # In v1 we only require registration. To restrict to validators, also check:
-        #   if not self.metagraph.validator_permit[uid]: return True, "no validator permit"
+        if _env_flag(C.MINER_REQUIRE_VALIDATOR_PERMIT_ENV, False):
+            permits = getattr(self.metagraph, "validator_permit", None)
+            if permits is None:
+                return True, "validator permit unavailable"
+            if not bool(permits[uid]):
+                return True, "no validator permit"
         return False, f"accepted from uid {uid}"
 
     async def priority(self, synapse: ForecastSynapse) -> float:
         """Prioritize higher-stake callers. Standard template pattern."""
         if synapse.dendrite is None or synapse.dendrite.hotkey is None:
             return 0.0
-        uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        try:
+            uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        except ValueError:
+            return 0.0
         return float(self.metagraph.S[uid])
 
 

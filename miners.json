@@ -1,0 +1,32 @@
+{
+  "miners": [
+    {
+      "uid": 0,
+      "hotkey": "simulated-hotkey-0",
+      "axon": "simulated://miner/0",
+      "is_active": true,
+      "simulation_skill": 0.92
+    },
+    {
+      "uid": 1,
+      "hotkey": "simulated-hotkey-1",
+      "axon": "simulated://miner/1",
+      "is_active": true,
+      "simulation_skill": 0.78
+    },
+    {
+      "uid": 2,
+      "hotkey": "simulated-hotkey-2",
+      "axon": "simulated://miner/2",
+      "is_active": true,
+      "simulation_skill": 0.55
+    },
+    {
+      "uid": 3,
+      "hotkey": "simulated-hotkey-3",
+      "axon": "simulated://miner/3",
+      "is_active": true,
+      "simulation_skill": 0.25
+    }
+  ]
+}

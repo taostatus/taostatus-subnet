@@ -23,6 +23,8 @@ import numpy as np
 import asyncio
 import argparse
 import threading
+import time
+import traceback
 import bittensor as bt
 
 from typing import List, Union
@@ -35,6 +37,52 @@ from template.base.utils.weight_utils import (
 )  # TODO: Replace when bittensor switches to numpy
 from template.mock import MockDendrite
 from template.utils.config import add_validator_args
+from masxai import constants as C
+
+BURN_UID = C.BURN_UID
+BURN_PERCENTAGE = C.BURN_PERCENTAGE
+
+
+def _apply_burn_allocation(
+    current_uids: np.ndarray,
+    weight_uids: np.ndarray,
+    weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reserve burn percentage for BURN_UID and scale miner weights down."""
+    current_uids = np.asarray(current_uids)
+    if BURN_UID not in current_uids.tolist():
+        raise ValueError(
+            f"BURN_UID {BURN_UID} is not present in current metagraph uids: "
+            f"{current_uids.tolist()}"
+        )
+
+    if not 0.0 <= BURN_PERCENTAGE <= 1.0:
+        raise ValueError(
+            f"BURN_PERCENTAGE must be between 0.0 and 1.0, got {BURN_PERCENTAGE}"
+        )
+
+    weight_uids = np.asarray(weight_uids)
+    weights = np.asarray(weights, dtype=np.float64)
+    miner_percentage = 1.0 - BURN_PERCENTAGE
+
+    miner_mask = weight_uids != BURN_UID
+    miner_uids = weight_uids[miner_mask]
+    miner_weights = weights[miner_mask]
+
+    miner_sum = miner_weights.sum()
+    if miner_uids.size > 0 and miner_sum > 0.0 and miner_percentage > 0.0:
+        miner_weights = (miner_weights / miner_sum) * miner_percentage
+        final_uids = np.append(miner_uids, BURN_UID)
+        final_weights = np.append(miner_weights, BURN_PERCENTAGE)
+    else:
+        final_uids = np.asarray([BURN_UID])
+        final_weights = np.asarray([1.0], dtype=np.float64)
+
+    final_sum = final_weights.sum()
+    if final_sum <= 0.0 or np.isnan(final_sum):
+        raise ValueError(f"Final weights must sum to a positive value, got {final_sum}")
+    final_weights = final_weights / final_sum
+    return final_uids.astype(np.int64), final_weights.astype(np.float32)
 
 BURN_UID = 25
 BURN_PERCENTAGE = 0.95
@@ -189,23 +237,40 @@ class BaseValidatorNeuron(BaseNeuron):
 
         # Check that validator is registered on the network.
         self.sync()
+        last_sync_block = self.block
 
         bt.logging.info(f"Validator starting at block: {self.block}")
 
         # This loop maintains the validator's operations until intentionally stopped.
         try:
-            while True:
-                bt.logging.info(f"step({self.step}) block({self.block})")
+            while not self.should_exit:
+                current_block = self.block
+                bt.logging.info(f"step({self.step}) block({current_block})")
 
                 # Run multiple forwards concurrently.
-                self.loop.run_until_complete(self.concurrent_forward())
+                try:
+                    self.loop.run_until_complete(self.concurrent_forward())
+                except Exception:
+                    bt.logging.error(traceback.format_exc())
+                    time.sleep(12)
+                    continue
 
                 # Check if we should exit.
                 if self.should_exit:
                     break
 
                 # Sync metagraph and potentially set weights.
-                self.sync()
+                try:
+                    current_block = self.block
+                    if (
+                        current_block - last_sync_block
+                        >= self.config.neuron.epoch_length
+                    ):
+                        self.sync()
+                        last_sync_block = current_block
+                except Exception:
+                    bt.logging.error(traceback.format_exc())
+                    time.sleep(12)
 
                 self.step += 1
 
@@ -309,14 +374,18 @@ class BaseValidatorNeuron(BaseNeuron):
         bt.logging.debug("processed_weights", processed_weights)
         bt.logging.debug("processed_weight_uids", processed_weight_uids)
 
-        (
-            processed_weight_uids,
-            processed_weights,
-        ) = _apply_burn_allocation(
-            current_uids=self.metagraph.uids,
-            weight_uids=processed_weight_uids,
-            weights=processed_weights,
-        )
+        try:
+            (
+                processed_weight_uids,
+                processed_weights,
+            ) = _apply_burn_allocation(
+                current_uids=self.metagraph.uids,
+                weight_uids=processed_weight_uids,
+                weights=processed_weights,
+            )
+        except ValueError as e:
+            bt.logging.error(f"burn allocation failed; skipping set_weights: {e}")
+            return
         bt.logging.debug("burn_allocated_weights", processed_weights)
         bt.logging.debug("burn_allocated_weight_uids", processed_weight_uids)
 

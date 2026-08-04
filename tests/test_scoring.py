@@ -10,6 +10,7 @@ from masxai.scoring import (
     clamp_prob,
     clamp_confidence,
     brier_score,
+    brier_skill,
     calibration_score,
     reward_from_brier,
     score_response,
@@ -56,6 +57,11 @@ def test_proper_scoring_rewards_honesty():
     assert confident_right > coinflip
 
 
+def test_brier_skill_zeroes_coinflip_baseline():
+    assert math.isclose(brier_skill(0.5, True), 0.0, abs_tol=1e-9)
+    assert brier_skill(0.9, True) > 0.9
+
+
 def test_ema_moves_toward_reward():
     s = 0.0
     for _ in range(50):
@@ -67,6 +73,7 @@ def test_structured_score_matches_mvp_weights():
     reward = score_structured_forecast(
         prediction=True,
         confidence=0.9,
+        probability=0.9,
         outcome=True,
         previous_score=0.5,
         submitted_at=10.0,
@@ -74,12 +81,38 @@ def test_structured_score_matches_mvp_weights():
         resolve_at=100.0,
     )
     expected = (
-        C.ACCURACY_WEIGHT * 1.0
+        C.ACCURACY_WEIGHT * brier_skill(0.9, True)
         + C.CALIBRATION_WEIGHT * 0.9
         + C.CONSISTENCY_WEIGHT * 0.5
         + C.TIMELINESS_WEIGHT * 0.9
     )
     assert math.isclose(reward, expected, abs_tol=1e-9)
+
+
+def test_structured_coinflip_gets_zero_with_baseline_gate():
+    assert score_structured_forecast(
+        prediction=True,
+        confidence=0.5,
+        probability=0.5,
+        outcome=True,
+        previous_score=0.9,
+        submitted_at=10.0,
+        issued_at=0.0,
+        resolve_at=100.0,
+    ) == 0.0
+
+
+def test_structured_no_answer_gets_zero():
+    assert score_structured_forecast(
+        prediction=None,
+        confidence=None,
+        probability=None,
+        outcome=True,
+        previous_score=0.9,
+        submitted_at=10.0,
+        issued_at=0.0,
+        resolve_at=100.0,
+    ) == 0.0
 
 
 def test_calibration_penalizes_confident_wrong():

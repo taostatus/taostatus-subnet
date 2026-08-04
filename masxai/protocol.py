@@ -14,7 +14,7 @@ import pydantic
 
 from masxai.bt_compat import bt
 
-SYNAPSE_VERSION = 2
+SYNAPSE_VERSION = 3
 
 
 class ForecastEventType(str, Enum):
@@ -31,9 +31,15 @@ class ForecastSynapse(bt.Synapse):
     A single binary forecasting task.
 
     Request (set by validator):
-        forecast_id     task id issued by the validator
+        forecast_id     per-issue task id issued by the validator
+        question_id     upstream BT-Forecast prediction id, when applicable
+        question_key    canonical BT-Forecast question match key
         question        human-readable binary question
         event_type      one of ForecastEventType
+        family          BT-Forecast family/category, e.g. active_miners
+        scope           subnet | network | market
+        netuid          target subnet uid, when applicable
+        horizon_days    BT-Forecast horizon in days
         asset           oracle id of the asset, when applicable
         reference_value objective value at issue time, when applicable
         reference_metadata additional issue-time state
@@ -44,17 +50,25 @@ class ForecastSynapse(bt.Synapse):
         version         protocol version
 
     Response (set by miner):
+        probability     P(YES) in [0, 1], primary Phase-1 score input
         prediction      binary YES/NO forecast
         confidence      confidence in [0, 1]
         reasoning       concise AI reasoning summary
         timestamp       ISO8601 generation timestamp
         model           forecasting model label, e.g. gemini-2.5-pro
+        features        optional miner-reported signals/features
     """
 
     # ---- request ----
     forecast_id: str = ""
+    question_id: str = ""
+    question_key: str = ""
     question: str = ""
     event_type: str = ForecastEventType.TAO_PRICE_MOVEMENT.value
+    family: str = ""
+    scope: str = ""
+    netuid: Optional[int] = None
+    horizon_days: Optional[int] = None
     asset: str = "bittensor"
     reference_value: Optional[float] = None
     reference_metadata: dict[str, Any] = pydantic.Field(default_factory=dict)
@@ -70,20 +84,26 @@ class ForecastSynapse(bt.Synapse):
     reasoning: str = ""
     timestamp: str = ""
     model: str = ""
-
-    # Kept as a compatibility bridge for older local mocks and probability-only
-    # miners. New miners should fill prediction/confidence directly.
     probability: Optional[float] = pydantic.Field(default=None)
+    features: dict[str, Any] = pydantic.Field(default_factory=dict)
 
     def deserialize(self) -> dict[str, Any]:
         """Validators call this to read the miner's answer."""
         return {
             "forecast_id": self.forecast_id,
+            "question_id": self.question_id,
+            "question_key": self.question_key,
             "event_type": self.event_type,
+            "family": self.family,
+            "scope": self.scope,
+            "netuid": self.netuid,
+            "horizon_days": self.horizon_days,
+            "probability": self.probability,
             "prediction": self.prediction,
             "confidence": self.confidence,
             "forecast_window": self.forecast_window,
             "reasoning": self.reasoning,
             "timestamp": self.timestamp,
             "model": self.model,
+            "features": self.features,
         }

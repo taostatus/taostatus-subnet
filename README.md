@@ -86,28 +86,63 @@ baseline mode until outbound connectivity is fixed.
 
 ## Validator Workflow
 
-1. Snapshot objective reference data.
-2. Query miner axons with a `ForecastSynapse`.
-3. Store miner forecasts in the pending queue.
-4. Wait for `resolve_at`.
-5. Fetch actual outcome from the oracle.
-6. Score each forecast.
-7. EMA the score into `self.scores` so the template weight machinery can submit
+Default local/dev mode still snapshots objective reference data and resolves the
+one-hour TAO price question locally. Phase 1 centralized mode is enabled by
+setting `BT_FORECAST_BEARER_TOKEN`; the production BT-Forecast base URL is the
+default and can be overridden with `BT_FORECAST_BASE_URL`:
+
+1. Poll the BT-Forecast FastAPI service for today's deterministic run id
+   (`bt-YYYY-MM-DD`), e.g. `/v1/forecast-runs/bt-2026-07-22`.
+2. If the run's `generation` is not `complete`, wait for the API's
+   `poll_after_s` value before polling the same run again.
+3. When `generation` is `complete`, fetch miner-safe questions from
+   `/v1/forecast-runs/{run_id}/questions`.
+   Private service-only benchmark fields are not copied into the synapse.
+4. Query miner axons with `ForecastSynapse` v3.
+5. Store miner forecasts in the pending queue, keyed by run id, question key,
+   and miner uid.
+6. Wait until each question's `cutoff_date`.
+7. Fetch actual outcomes from `/v1/resolutions`.
+8. Score each miner against the real outcome, never against the engine answer.
+9. Queue accurate miner forecasts for `/v1/miner-results` feedback.
+10. EMA the score into `self.scores` so the template weight machinery can submit
    weights on chain.
 
-Pending forecasts and scores are persisted to `validator_state.json`.
+Pending forecasts and scores are persisted to `validator_state.json`. In
+centralized mode, each active pending row uses a deterministic
+`(run_id, question_key, uid)` key so a re-issued question updates that miner's
+latest active answer instead of creating duplicate unresolved rows.
+
+Unanswered miner calls are retried until the question cutoff. Retry cadence starts
+at `MASXAI_BT_FORECAST_NO_ANSWER_RETRY_SECONDS` and backs off up to
+`MASXAI_BT_FORECAST_NO_ANSWER_RETRY_MAX_SECONDS`, so a validator can recover when
+miners come online later without hammering the network. Stale pending rows,
+old run metadata, and queued BT-Forecast feedback are bounded by environment
+settings in `.env.example`.
 
 ## Scoring
 
-Structured forecasts use the MVP weighted score:
+Structured forecasts use the Phase 1 weighted score:
 
 ```text
 Final Score =
-50% Accuracy +
+50% Brier skill vs baseline +
 20% Confidence Calibration +
 20% Historical Consistency +
 10% Timeliness
 ```
+
+`probability` is the primary accuracy input. With the default composite baseline
+gate, a flat 0.5 forecast earns zero composite reward.
+
+The validator waits for at least `MASXAI_MIN_RESOLVED_BEFORE_WEIGHTS` resolved
+miner forecasts, plus the chain's minimum allowed weight count, before submitting
+weights. This keeps emissions gated on real resolved performance instead of mere
+participation.
+
+Lineage defaults off for open-source deployments. Enable
+`BT_FORECAST_INCLUDE_LINEAGE` only when a private validator operator explicitly
+needs benchmark telemetry. Miner rewards do not depend on that telemetry.
 
 Legacy Brier helpers remain in `masxai/scoring.py` for probability-only tests and
 older local mocks.
@@ -125,14 +160,15 @@ cp .env.example .env
 
 Run `python scripts/patch_btcli_compat.py` again after installing or upgrading
 `bittensor-cli`. It only patches the CLI package in the active environment and
-does not change MASXAI subnet core code. It fixes two known testnet CLI issues:
-missing `Swap.AlphaSqrtPrice` in `wallet overview`, and negative transaction era
+does not change MASXAI subnet core code. It fixes known testnet CLI issues:
+missing `Swap.AlphaSqrtPrice` in `wallet overview`, public RPC storage-work
+limits during netuid-filtered `wallet overview`, and negative transaction era
 during `subnet register`.
 
 Run tests:
 
 ```bash
-python -m pytest tests/test_scoring.py -v
+python -m pytest -q
 ```
 
 Run the local loop without chain access:
@@ -171,7 +207,7 @@ one hour by default (`FORECAST_HORIZON_SECONDS=3600`).
 
 ## MVP Economics
 
-The product target is to burn 95% of miner emissions and distribute 5% according
+The product target is to burn 96% of miner emissions and distribute 4% according
 to validator weights. This repo currently computes and submits weights; emission
 burn mechanics must be enforced in subnet economics/runtime configuration, not
 inside miner forecast code.

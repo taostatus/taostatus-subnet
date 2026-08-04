@@ -10,3 +10,5 @@ setuptools>=68
 # MASXAI v1 — free price oracle (CoinGecko) for deferred resolution
 httpx>=0.27.0
 python-dotenv>=1.0.0
+SQLAlchemy>=2.0.0
+google-genai>=0.8.0
