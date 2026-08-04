@@ -398,21 +398,27 @@ class Validator(BaseValidatorNeuron):
 
     async def resolve_local_due(self, due: list[str]):
         """Resolve legacy local-oracle forecasts."""
+        tasks = []
+        valid_due = []
         for fid in due:
             if fid not in self.pending:
                 continue
             f = self.pending[fid]
+            valid_due.append(fid)
             tasks.append(
                 oracle.resolve_forecast_outcome(
                     f,
                     subtensor=getattr(self, "subtensor", None),
                 )
             )
-        
+
+        if not tasks:
+            return
+
         outcomes = await asyncio.gather(*tasks)
 
         resolved_this_round = 0
-        for fid, outcome in zip(due, outcomes):
+        for fid, outcome in zip(valid_due, outcomes):
             if outcome is None:
                 bt.logging.info(f"oracle unavailable for {fid}; deferring resolution")
                 continue
