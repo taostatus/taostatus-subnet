@@ -196,6 +196,15 @@ python neurons/validator.py --netuid 501 --subtensor.network test \
   --wallet.name masxai-validator --wallet.hotkey default --logging.debug
 ```
 
+Prefer `scripts/run_testnet.sh miner` and `scripts/run_testnet.sh validator` for
+testnet runs; the script exports `BT_NO_PARSE_CLI_ARGS=false` so Bittensor CLI
+flags are honored by recent SDK versions.
+
+`--subtensor.network test` connects to the test network, not mainnet `finney`.
+Weights and emissions from testnet will not appear on mainnet explorers. The
+validator only submits weights after at least one forecast has resolved, which is
+one hour by default (`FORECAST_HORIZON_SECONDS=3600`).
+
 ## MVP Economics
 
 The product target is to burn 96% of miner emissions and distribute 4% according

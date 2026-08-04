@@ -34,6 +34,7 @@ VALIDATOR_WALLET="${VALIDATOR_WALLET:-masxai-validator}"
 HOTKEY="${HOTKEY:-default}"
 MINER_AXON_PORT="${MINER_AXON_PORT:-8901}"
 STAKE_AMOUNT="${STAKE_AMOUNT:-1}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # repo root = parent of this script's dir, so the script works from anywhere
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,6 +57,7 @@ Effective config (override with env vars):
   NETUID=${NETUID}  NETWORK=${NETWORK}  HOTKEY=${HOTKEY}
   MINER_WALLET=${MINER_WALLET}  VALIDATOR_WALLET=${VALIDATOR_WALLET}
   MINER_AXON_PORT=${MINER_AXON_PORT}  STAKE_AMOUNT=${STAKE_AMOUNT}
+  PYTHON_BIN=${PYTHON_BIN}
 EOF
 }
 
@@ -94,14 +96,14 @@ case "$cmd" in
     ;;
 
   miner)
-    exec python neurons/miner.py \
+    exec "$PYTHON_BIN" neurons/miner.py \
       --netuid "$NETUID" --subtensor.network "$NETWORK" \
       --wallet.name "$MINER_WALLET" --wallet.hotkey "$HOTKEY" \
       --axon.port "$MINER_AXON_PORT" --logging.debug
     ;;
 
   validator)
-    exec python neurons/validator.py \
+    exec "$PYTHON_BIN" neurons/validator.py \
       --netuid "$NETUID" --subtensor.network "$NETWORK" \
       --wallet.name "$VALIDATOR_WALLET" --wallet.hotkey "$HOTKEY" \
       --logging.debug

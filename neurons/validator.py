@@ -114,6 +114,10 @@ class Validator(BaseValidatorNeuron):
         self.bt_forecast_required = bt_forecast_required_from_env()
         self.resolved_count = 0
         self.last_issue_at = 0.0
+        # Gate scoring/weight emission to one cadence per forecast horizon.
+        self.last_resolution_at = 0.0
+        self.last_weights_set_at = 0.0
+        self.last_weights_resolved_count = 0
         self.load_masxai_state()
         bt.logging.info(
             "MASXAI validator initialized | "
@@ -156,6 +160,13 @@ class Validator(BaseValidatorNeuron):
                 arr = np.array(scores, dtype=np.float32)
                 if arr.shape == self.scores.shape:
                     self.scores = arr
+                else:
+                    bt.logging.warning(
+                        f"Saved scores shape {arr.shape} does not match metagraph shape {self.scores.shape}. "
+                        "Performing overlapping copy."
+                    )
+                    copy_len = min(len(arr), len(self.scores))
+                    self.scores[:copy_len] = arr[:copy_len]
             bt.logging.info(
                 f"loaded state from {state_path}: {len(self.pending)} pending, "
                 f"{self.resolved_count} resolved, "
@@ -203,6 +214,9 @@ class Validator(BaseValidatorNeuron):
                         "bt_forecast_runs": self.bt_forecast_runs,
                         "resolved_count": self.resolved_count,
                         "last_issue_at": self.last_issue_at,
+                        "last_resolution_at": self.last_resolution_at,
+                        "last_weights_set_at": self.last_weights_set_at,
+                        "last_weights_resolved_count": self.last_weights_resolved_count,
                         "scores": self.scores.tolist(),
                     },
                     f,
@@ -388,10 +402,17 @@ class Validator(BaseValidatorNeuron):
             if fid not in self.pending:
                 continue
             f = self.pending[fid]
-            outcome = await oracle.resolve_forecast_outcome(
-                f,
-                subtensor=getattr(self, "subtensor", None),
+            tasks.append(
+                oracle.resolve_forecast_outcome(
+                    f,
+                    subtensor=getattr(self, "subtensor", None),
+                )
             )
+        
+        outcomes = await asyncio.gather(*tasks)
+
+        resolved_this_round = 0
+        for fid, outcome in zip(due, outcomes):
             if outcome is None:
                 bt.logging.info(f"oracle unavailable for {fid}; deferring resolution")
                 continue
@@ -411,12 +432,15 @@ class Validator(BaseValidatorNeuron):
             )
             self.scores[uid] = ema_update(float(self.scores[uid]), reward)
             self.resolved_count += 1
+            resolved_this_round += 1
             bt.logging.debug(
                 f"resolved uid={uid} event={f.get('event_type')} "
                 f"prediction={f.get('prediction')} confidence={f.get('confidence')} "
                 f"outcome={outcome} "
                 f"reward={reward:.3f} -> score={self.scores[uid]:.3f}"
             )
+        if resolved_this_round > 0:
+            self.last_resolution_at = time.time()
         bt.logging.info(
             f"resolved due forecasts | "
             f"total resolved={self.resolved_count}"
