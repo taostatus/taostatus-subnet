@@ -823,3 +823,38 @@ def test_validator_weight_gate_is_configurable(monkeypatch):
     validator.resolved_count = 5
 
     assert validator._has_scored_weights() is True
+
+
+def test_validator_resolve_local_due(monkeypatch):
+    validator = _validator(_FakeBtForecastClient())
+    validator.pending = {
+        "loc-1": {
+            "uid": 1,
+            "prediction": True,
+            "confidence": 0.8,
+            "probability": 0.8,
+            "submitted_at": 100.0,
+            "issued_at": 100.0,
+            "resolve_at": 200.0,
+        },
+        "loc-2": {
+            "uid": 2,
+            "prediction": False,
+            "confidence": 0.6,
+            "probability": 0.4,
+            "submitted_at": 100.0,
+            "issued_at": 100.0,
+            "resolve_at": 200.0,
+        },
+    }
+
+    async def fake_resolve_outcome(forecast, subtensor=None):
+        return True if forecast["uid"] == 1 else False
+
+    monkeypatch.setattr("masxai.oracle.resolve_forecast_outcome", fake_resolve_outcome)
+
+    asyncio.run(validator.resolve_local_due(["loc-1", "loc-2", "loc-nonexistent"]))
+
+    assert validator.pending == {}
+    assert validator.resolved_count == 2
+
