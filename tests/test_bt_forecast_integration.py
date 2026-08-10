@@ -134,6 +134,11 @@ def _validator(fake_client: _FakeBtForecastClient) -> Validator:
 
 
 def test_validator_state_file_defaults_to_repo_root(monkeypatch, tmp_path):
+    # load_env() is process-wide @lru_cache'd, so whichever test happens to
+    # trigger the first real .env load "locks in" its values for the rest of
+    # the pytest run - this test must not depend on that ordering, nor on
+    # whatever MASXAI_VALIDATOR_STATE_FILE the developer's real .env sets.
+    monkeypatch.setattr("neurons.validator.load_env", lambda: None)
     monkeypatch.delenv("MASXAI_VALIDATOR_STATE_FILE", raising=False)
     monkeypatch.setattr(C, "STATE_FILE", "validator_state.json")
     monkeypatch.chdir(tmp_path)
