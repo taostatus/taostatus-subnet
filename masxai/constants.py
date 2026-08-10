@@ -50,10 +50,24 @@ BT_FORECAST_RESOLUTION_RETRY_SECONDS_ENV = "MASXAI_BT_FORECAST_RESOLUTION_RETRY_
 BT_FORECAST_FEEDBACK_THRESHOLD_ENV = "MASXAI_BT_FORECAST_FEEDBACK_THRESHOLD"
 BT_FORECAST_FEEDBACK_QUEUE_MAX_ENV = "MASXAI_BT_FORECAST_FEEDBACK_QUEUE_MAX"
 BT_FORECAST_RUN_STATE_RETENTION_SECONDS_ENV = "MASXAI_BT_FORECAST_RUN_STATE_RETENTION_SECONDS"
+BT_FORECAST_POLL_AFTER_MAX_SECONDS_ENV = "MASXAI_BT_FORECAST_POLL_AFTER_MAX_SECONDS"
+BT_FORECAST_STUCK_RUN_WARN_SECONDS_ENV = "MASXAI_BT_FORECAST_STUCK_RUN_WARN_SECONDS"
+BT_FORECAST_STUCK_RUN_ERROR_SECONDS_ENV = "MASXAI_BT_FORECAST_STUCK_RUN_ERROR_SECONDS"
+BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS_ENV = "MASXAI_BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS"
 
 BT_FORECAST_TIMEOUT = 10
 BT_FORECAST_MAX_RETRIES = 3
 BT_FORECAST_DEFAULT_POLL_AFTER_SECONDS = 3600
+# Ceiling on the server-supplied poll_after_s so a misbehaving/misconfigured
+# BT-Forecast response can't push the validator's run-status poll arbitrarily far out.
+BT_FORECAST_POLL_AFTER_MAX_SECONDS = 900          # 15 minutes
+# Escalating alert thresholds for a run stuck at generation != "complete".
+BT_FORECAST_STUCK_RUN_WARN_SECONDS = 2 * 60 * 60    # 2 hours
+BT_FORECAST_STUCK_RUN_ERROR_SECONDS = 6 * 60 * 60   # 6 hours
+# Opt-in only: 0 disables falling back to the legacy local-oracle issue path
+# while a run is stuck. Operators can set this explicitly to keep the subnet
+# issuing *something* during an extended BT-Forecast outage.
+BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS = 0
 BT_FORECAST_MAX_QUESTIONS_PER_ROUND = 12
 BT_FORECAST_REISSUE_SECONDS = 0       # 0 means issue each question once.
 BT_FORECAST_NO_ANSWER_RETRY_SECONDS = 300
@@ -98,9 +112,19 @@ BASELINE_COMPOSITE_GATE = True
 
 # --- weights ---
 MIN_RESOLVED_BEFORE_WEIGHTS_ENV = "MASXAI_MIN_RESOLVED_BEFORE_WEIGHTS"
-MIN_RESOLVED_BEFORE_WEIGHTS = 3       # require real evidence before weights
+MIN_RESOLVED_BEFORE_WEIGHTS = 3       # require real evidence before weights dominate
 BURN_UID = 25                         # receives reserved burn allocation
 BURN_PERCENTAGE = 0.95                # burn 95%, distribute 5% to scored miners
+
+# Interim participation weighting: keeps the validator submitting weights every
+# epoch (so Yuma consensus never marks it inactive) and gives miners partial
+# credit for actively answering before their forecasts resolve. This is a
+# liveness signal only, never a correctness signal.
+PARTICIPATION_WEIGHT_ENV = "MASXAI_PARTICIPATION_WEIGHT"
+PARTICIPATION_WEIGHT = 0.10           # blended-weight share once accuracy scores exist
+PARTICIPATION_EMA_ALPHA_ENV = "MASXAI_PARTICIPATION_EMA_ALPHA"
+PARTICIPATION_EMA_ALPHA = 0.2         # moves faster than the accuracy EMA (EMA_ALPHA)
+PARTICIPATION_REWARD = 1.0            # reward fed to the EMA for each valid forecast
 
 # --- persistence ---
 VALIDATOR_STATE_FILE_ENV = "MASXAI_VALIDATOR_STATE_FILE"
@@ -116,4 +140,10 @@ ORACLE_TIMEOUT = 10                   # seconds
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GEMINI_TIMEOUT = 8
+# Minimum headroom GEMINI_TIMEOUT must leave under the validator's QUERY_TIMEOUT
+# (see above) so a slow-but-successful Gemini call still has time to serialize
+# and reach the validator before its dendrite call gives up. Without this
+# margin a slow Gemini response is scored as a no-answer even though the miner
+# technically responded.
+GEMINI_TIMEOUT_MARGIN_SECONDS = 5.0
 DISCORD_TIMEOUT = 5

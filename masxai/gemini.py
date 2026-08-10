@@ -149,11 +149,28 @@ def _env_flag(name: str, default: bool = True) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _gemini_timeout() -> float:
-    try:
-        return float(os.getenv("GEMINI_TIMEOUT", C.GEMINI_TIMEOUT))
-    except ValueError:
+def gemini_timeout() -> float:
+    """Resolve GEMINI_TIMEOUT, validating it's a positive number.
+
+    Falls back to C.GEMINI_TIMEOUT (with a warning) for a missing, malformed,
+    or non-positive value instead of letting a bad env var pass through silently.
+    """
+    raw = os.getenv("GEMINI_TIMEOUT")
+    if raw is None:
         return float(C.GEMINI_TIMEOUT)
+    try:
+        value = float(raw)
+    except ValueError:
+        bt.logging.warning(
+            f"GEMINI_TIMEOUT={raw!r} is not a valid number; using default {C.GEMINI_TIMEOUT}s"
+        )
+        return float(C.GEMINI_TIMEOUT)
+    if value <= 0:
+        bt.logging.warning(
+            f"GEMINI_TIMEOUT={value} must be positive; using default {C.GEMINI_TIMEOUT}s"
+        )
+        return float(C.GEMINI_TIMEOUT)
+    return value
 
 
 async def generate_forecast(
@@ -187,7 +204,7 @@ async def generate_forecast(
         },
     }
     try:
-        async with httpx.AsyncClient(timeout=_gemini_timeout()) as client:
+        async with httpx.AsyncClient(timeout=gemini_timeout()) as client:
             resp = await client.post(url, params={"key": api_key}, json=payload)
             resp.raise_for_status()
             data = resp.json()

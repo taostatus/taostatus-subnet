@@ -1,5 +1,5 @@
 starlette>=0.30.0
-bittensor>=9
+bittensor>=9,<11
 pydantic>=2
 rich>=13
 pytest>=8

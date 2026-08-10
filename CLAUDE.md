@@ -51,11 +51,34 @@ available in the protocol but should not be issued by default.
 
 ## Validator Rules
 
-- Never score a forecast without objective ground truth.
+- Never score a forecast's *accuracy* without objective ground truth.
 - If an oracle fails, keep the forecast pending and retry next epoch.
 - Persist pending forecasts and scores so restarts do not lose in-flight work.
 - Keep scoring deterministic and local to validator code.
 - Weights come from `self.scores` through the template validator machinery.
+- The validator submits weights every eligible epoch, never skipping the
+  chain call — going silent on-chain makes Yuma consensus treat it as
+  inactive (`vtrust` collapses), which is worse than submitting a
+  conservative weight set. See "Weight Setting" below.
+
+## Weight Setting
+
+Submitted weights blend two signals, computed in `Validator._blended_weight_array()`
+(`neurons/validator.py`):
+
+- **Interim participation** — a liveness-only EMA (`participation_scores`,
+  `PARTICIPATION_EMA_ALPHA`) bumped whenever a miner returns a valid,
+  well-formed forecast, tracked separately from `self.scores`. This is not an
+  accuracy signal and never requires ground truth.
+- **Resolved accuracy** — `self.scores`, the existing resolution-driven EMA
+  described under Scoring below.
+
+Before `MIN_RESOLVED_BEFORE_WEIGHTS` resolutions with enough positive scores
+exist (`Validator._has_scored_weights()`), submitted weights are
+participation-only. Once that bar is met, accuracy dominates and
+participation is blended in at a small share (`PARTICIPATION_WEIGHT`,
+default 10%). `self.scores` itself is never overwritten by this blend — only
+the array submitted on-chain is.
 
 ## Scoring
 
