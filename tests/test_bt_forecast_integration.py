@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from masxai.bt_compat import bt
 from masxai.oracle_bt import (
     BtForecastClient,
     BtForecastQuestion,
@@ -124,6 +125,7 @@ def _validator(fake_client: _FakeBtForecastClient) -> Validator:
     validator.bt_forecast_required = True
     validator.resolved_count = 0
     validator.last_issue_at = 0.0
+    validator.participation_scores = {}
     validator.metagraph = _FakeMetagraph()
     validator.wallet = _FakeWallet()
     validator.dendrite = _FakeDendrite()
@@ -199,6 +201,9 @@ def test_bt_forecast_task_provider_normalizes_run_question_for_db():
 
 def test_validator_waits_for_generation_complete_before_fetching_questions(monkeypatch):
     monkeypatch.setenv("BT_FORECAST_RUN_ID", "bt-test")
+    # Server-requested poll_after_s (3600s) exceeds the default 900s ceiling
+    # (masxai/constants.py: BT_FORECAST_POLL_AFTER_MAX_SECONDS), so the stored
+    # value should be clamped down rather than trusted verbatim.
     fake_client = _FakeBtForecastClient(generation="running", poll_after_s=3600)
     validator = _validator(fake_client)
 
@@ -209,7 +214,130 @@ def test_validator_waits_for_generation_complete_before_fetching_questions(monke
     assert fake_client.question_fetches == 0
     assert validator.pending == {}
     assert validator.bt_forecast_runs["bt-test"]["generation"] == "running"
-    assert validator.bt_forecast_runs["bt-test"]["poll_after_s"] == 3600
+    assert validator.bt_forecast_runs["bt-test"]["poll_after_s"] == C.BT_FORECAST_POLL_AFTER_MAX_SECONDS
+
+
+def test_bt_run_poll_after_seconds_has_a_ceiling(monkeypatch):
+    monkeypatch.setenv("MASXAI_BT_FORECAST_POLL_AFTER_MAX_SECONDS", "900")
+
+    assert Validator._bt_run_poll_after_seconds(999_999) == 900
+    assert Validator._bt_run_poll_after_seconds(30) == 60  # floor still applies
+    assert Validator._bt_run_poll_after_seconds(500) == 500
+
+
+def test_should_fallback_to_local_issue_is_opt_in_by_default(monkeypatch):
+    monkeypatch.delenv("MASXAI_BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS", raising=False)
+
+    assert Validator._should_fallback_to_local_issue(999_999.0) is False
+
+    monkeypatch.setenv("MASXAI_BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS", "500")
+
+    assert Validator._should_fallback_to_local_issue(499.0) is False
+    assert Validator._should_fallback_to_local_issue(500.0) is True
+
+
+def test_check_stuck_bt_forecast_run_escalates_from_warning_to_error(monkeypatch):
+    monkeypatch.setenv("MASXAI_BT_FORECAST_STUCK_RUN_WARN_SECONDS", "100")
+    monkeypatch.setenv("MASXAI_BT_FORECAST_STUCK_RUN_ERROR_SECONDS", "200")
+    fake_client = _FakeBtForecastClient()
+    validator = _validator(fake_client)
+    warnings = []
+    errors = []
+    monkeypatch.setattr(bt.logging, "warning", lambda msg: warnings.append(msg))
+    monkeypatch.setattr(bt.logging, "error", lambda msg: errors.append(msg))
+
+    validator._check_stuck_bt_forecast_run("bt-test", 50.0)
+    assert warnings == [] and errors == []
+
+    validator._check_stuck_bt_forecast_run("bt-test", 150.0)
+    assert len(warnings) == 1 and errors == []
+
+    validator._check_stuck_bt_forecast_run("bt-test", 250.0)
+    assert len(warnings) == 1 and len(errors) == 1
+
+
+def test_issue_bt_forecast_round_tracks_pending_since_and_escalates(monkeypatch):
+    monkeypatch.setenv("MASXAI_BT_FORECAST_STUCK_RUN_WARN_SECONDS", "100")
+    monkeypatch.setenv("MASXAI_BT_FORECAST_STUCK_RUN_ERROR_SECONDS", "200")
+    fake_client = _FakeBtForecastClient(generation="running", poll_after_s=10)
+    validator = _validator(fake_client)
+    warnings = []
+    errors = []
+    monkeypatch.setattr(bt.logging, "warning", lambda msg: warnings.append(msg))
+    monkeypatch.setattr(bt.logging, "error", lambda msg: errors.append(msg))
+
+    asyncio.run(
+        validator.issue_bt_forecast_round(client=fake_client, now=1_000.0, run_id="bt-test")
+    )
+    assert validator.bt_forecast_runs["bt-test"]["pending_since"] == 1_000.0
+    assert warnings == [] and errors == []
+
+    # Still pending 150s later: pending_since must not reset, and the warning
+    # threshold (100s) should have fired exactly once.
+    asyncio.run(
+        validator.issue_bt_forecast_round(client=fake_client, now=1_150.0, run_id="bt-test")
+    )
+    assert validator.bt_forecast_runs["bt-test"]["pending_since"] == 1_000.0
+    assert len(warnings) == 1 and errors == []
+
+    # 250s stuck now crosses the error threshold (200s).
+    asyncio.run(
+        validator.issue_bt_forecast_round(client=fake_client, now=1_250.0, run_id="bt-test")
+    )
+    assert len(warnings) == 1 and len(errors) == 1
+
+
+def test_issue_bt_forecast_round_clears_pending_since_once_complete():
+    fake_client = _FakeBtForecastClient(generation="running", poll_after_s=10)
+    validator = _validator(fake_client)
+
+    asyncio.run(
+        validator.issue_bt_forecast_round(client=fake_client, now=1_000.0, run_id="bt-test")
+    )
+    assert "pending_since" in validator.bt_forecast_runs["bt-test"]
+
+    fake_client.generation = "complete"
+    asyncio.run(
+        validator.issue_bt_forecast_round(client=fake_client, now=1_500.0, run_id="bt-test")
+    )
+    assert "pending_since" not in validator.bt_forecast_runs["bt-test"]
+
+
+def test_stuck_bt_forecast_run_falls_back_to_local_issue_when_configured(monkeypatch):
+    monkeypatch.setenv("MASXAI_BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS", "50")
+    fake_client = _FakeBtForecastClient(generation="running", poll_after_s=10)
+    validator = _validator(fake_client)
+    validator.bt_forecast_runs["bt-test"] = {"pending_since": 1_000.0, "next_poll_at": 0.0}
+    called = []
+
+    async def fake_local_round(*, now):
+        called.append(now)
+
+    validator.issue_local_round = fake_local_round
+
+    asyncio.run(
+        validator.issue_bt_forecast_round(client=fake_client, now=1_100.0, run_id="bt-test")
+    )
+
+    assert called == [1_100.0]
+
+
+def test_stuck_bt_forecast_run_does_not_fall_back_by_default():
+    fake_client = _FakeBtForecastClient(generation="running", poll_after_s=10)
+    validator = _validator(fake_client)
+    validator.bt_forecast_runs["bt-test"] = {"pending_since": 1_000.0, "next_poll_at": 0.0}
+    called = []
+
+    async def fake_local_round(*, now):
+        called.append(now)
+
+    validator.issue_local_round = fake_local_round
+
+    asyncio.run(
+        validator.issue_bt_forecast_round(client=fake_client, now=50_000.0, run_id="bt-test")
+    )
+
+    assert called == []
 
 
 def test_validator_retries_bt_run_when_previous_issue_had_no_answers(monkeypatch):
@@ -639,61 +767,76 @@ def test_validator_drops_stale_uid_without_aborting_resolution():
     assert validator.resolved_count == 0
 
 
-def test_validator_refuses_weights_before_resolved_scores(monkeypatch):
+def test_validator_should_set_weights_defers_to_base_class():
+    # No local override should gate weight-setting cadence: Yuma consensus
+    # staleness is decided entirely by the base class's block/last_update
+    # check, so the validator keeps submitting every eligible epoch instead
+    # of going silent (and stale) while waiting on resolved forecasts.
+    assert Validator.should_set_weights is BaseValidatorNeuron.should_set_weights
+
+
+def test_validator_set_weights_submits_participation_only_before_resolution(monkeypatch):
     fake_client = _FakeBtForecastClient()
     validator = _validator(fake_client)
-    validator.scores[1] = 1.0
-    called = []
+    validator.scores[1] = 1.0  # not yet backed by enough resolved forecasts
+    validator.participation_scores = {2: 0.4}
+    seen = []
     monkeypatch.setattr(
         BaseValidatorNeuron,
         "set_weights",
-        lambda self: called.append("set"),
+        lambda self: seen.append(np.array(self.scores)),
     )
 
-    assert validator.should_set_weights() is False
-    assert validator.set_weights() is None
-    assert called == []
+    assert validator._has_scored_weights() is False
+    validator.set_weights()
+
+    assert len(seen) == 1
+    np.testing.assert_allclose(seen[0], [0.0, 0.0, 0.4])
+    # self.scores (the persisted, resolution-driven accuracy EMA) must be
+    # left untouched after submission.
+    np.testing.assert_allclose(validator.scores, [0.0, 1.0, 0.0])
 
 
-def test_validator_refuses_weights_when_scored_miners_below_chain_minimum(monkeypatch):
+def test_validator_set_weights_participation_only_when_scored_miners_below_chain_minimum(monkeypatch):
     fake_client = _FakeBtForecastClient()
     validator = _validator(fake_client)
     validator.resolved_count = C.MIN_RESOLVED_BEFORE_WEIGHTS
     validator.scores[1] = 0.75
+    validator.participation_scores = {2: 0.5}
     validator.config = SimpleNamespace(netuid=501)
     validator.subtensor = SimpleNamespace(min_allowed_weights=lambda netuid: 2)
-    called = []
+    seen = []
     monkeypatch.setattr(
         BaseValidatorNeuron,
         "set_weights",
-        lambda self: called.append("set"),
+        lambda self: seen.append(np.array(self.scores)),
     )
 
-    assert validator.should_set_weights() is False
-    assert validator.set_weights() is None
-    assert called == []
+    assert validator._has_scored_weights() is False
+    validator.set_weights()
+
+    np.testing.assert_allclose(seen[0], [0.0, 0.0, 0.5])
 
 
-def test_validator_allows_weights_after_resolved_positive_score(monkeypatch):
+def test_validator_set_weights_blends_accuracy_and_participation_once_scored(monkeypatch):
     fake_client = _FakeBtForecastClient()
     validator = _validator(fake_client)
     validator.resolved_count = C.MIN_RESOLVED_BEFORE_WEIGHTS
     validator.scores[1] = 0.75
-    called = []
-    monkeypatch.setattr(
-        BaseValidatorNeuron,
-        "should_set_weights",
-        lambda self: called.append("should") or True,
-    )
+    validator.participation_scores = {1: 0.2, 2: 0.5}
+    seen = []
     monkeypatch.setattr(
         BaseValidatorNeuron,
         "set_weights",
-        lambda self: called.append("set"),
+        lambda self: seen.append(np.array(self.scores)),
     )
 
-    assert validator.should_set_weights() is True
-    assert validator.set_weights() is None
-    assert called == ["should", "set"]
+    assert validator._has_scored_weights() is True
+    validator.set_weights()
+
+    share = C.PARTICIPATION_WEIGHT
+    expected = [0.0, (1 - share) * 0.75 + share * 0.2, share * 0.5]
+    np.testing.assert_allclose(seen[0], expected, atol=1e-6)
 
 
 def test_validator_skips_validator_permit_uids_by_default(monkeypatch):
@@ -723,6 +866,21 @@ def test_validator_stores_no_response_rows_for_retry(monkeypatch):
     assert all(item["model"] == "no-response" for item in validator.pending.values())
     assert all(item["attempt_count"] == 1 for item in validator.pending.values())
     assert validator.bt_forecast_runs["bt-test"]["last_issue_answered_count"] == 0
+    assert validator.participation_scores == {}
+
+
+def test_validator_records_participation_for_valid_bt_forecast_responses(monkeypatch):
+    monkeypatch.setenv("MASXAI_FORECAST_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("BT_FORECAST_RUN_ID", "bt-test")
+    fake_client = _FakeBtForecastClient()
+    validator = _validator(fake_client)
+
+    asyncio.run(validator.issue_round())
+
+    # _FakeDendrite always answers both miners, so both should have earned an
+    # interim participation score even though nothing has resolved yet.
+    assert set(validator.participation_scores) == {1, 2}
+    assert all(score > 0.0 for score in validator.participation_scores.values())
 
 
 def test_validator_preserves_existing_answer_when_reissue_gets_no_response(monkeypatch):

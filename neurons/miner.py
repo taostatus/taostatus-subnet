@@ -19,7 +19,7 @@ from masxai import constants as C
 from masxai.bt_compat import bt
 from masxai.discord import publish_forecast
 from masxai.env import load_env
-from masxai.gemini import baseline_forecast, generate_forecast
+from masxai.gemini import baseline_forecast, generate_forecast, gemini_timeout
 
 # Provided by the bittensor-subnet-template fork:
 try:
@@ -45,18 +45,41 @@ def _env_flag(name: str, default: bool = True) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _timeout_margin_warning(resolved_timeout: float) -> typing.Optional[str]:
+    """Warn when GEMINI_TIMEOUT leaves too little room under QUERY_TIMEOUT.
+
+    A slow-but-successful Gemini call needs time to serialize and cross the
+    wire before the validator's dendrite call gives up; without margin that
+    looks identical to "the miner never answered."
+    """
+    margin = C.QUERY_TIMEOUT - resolved_timeout
+    if margin >= C.GEMINI_TIMEOUT_MARGIN_SECONDS:
+        return None
+    safe_max = C.QUERY_TIMEOUT - C.GEMINI_TIMEOUT_MARGIN_SECONDS
+    return (
+        f"GEMINI_TIMEOUT={resolved_timeout}s leaves only {margin:.1f}s of margin "
+        f"under the validator's QUERY_TIMEOUT={C.QUERY_TIMEOUT}s; a slow Gemini "
+        "call may never make it back to the validator in time and will be "
+        f"scored as a no-answer. Recommend GEMINI_TIMEOUT <= {safe_max}s."
+    )
+
+
 class Miner(BaseMinerNeuron):
     def __init__(self, config=None):
         load_env()
         super().__init__(config=config)
         gemini_key_set = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+        resolved_gemini_timeout = gemini_timeout()
         bt.logging.info(
             "Gemini config | "
             f"enabled={_env_flag('GEMINI_ENABLED', True)} "
             f"key_set={gemini_key_set} "
             f"model={os.getenv('GEMINI_MODEL', C.GEMINI_MODEL)} "
-            f"timeout={os.getenv('GEMINI_TIMEOUT', C.GEMINI_TIMEOUT)}"
+            f"timeout={resolved_gemini_timeout}"
         )
+        margin_warning = _timeout_margin_warning(resolved_gemini_timeout)
+        if margin_warning:
+            bt.logging.warning(margin_warning)
         bt.logging.info("MASXAI v1 Gemini miner initialized.")
 
     async def forward(self, synapse: ForecastSynapse) -> ForecastSynapse:
@@ -110,7 +133,15 @@ class Miner(BaseMinerNeuron):
             return True, f"unregistered hotkey {hotkey}"
 
         uid = self.metagraph.hotkeys.index(hotkey)
-        if _env_flag(C.MINER_REQUIRE_VALIDATOR_PERMIT_ENV, False):
+        # Two ways to require a validator permit: the standard bittensor-template
+        # CLI flag (--blacklist.force_validator_permit) and this project's own
+        # MASXAI_REQUIRE_VALIDATOR_PERMIT env var. Previously only the env var
+        # was honored here, so the CLI flag silenced the base class's security
+        # warning without actually enforcing anything - honor either.
+        require_permit = bool(
+            getattr(getattr(self.config, "blacklist", None), "force_validator_permit", False)
+        ) or _env_flag(C.MINER_REQUIRE_VALIDATOR_PERMIT_ENV, False)
+        if require_permit:
             permits = getattr(self.metagraph, "validator_permit", None)
             if permits is None:
                 return True, "validator permit unavailable"

@@ -110,6 +110,9 @@ class Validator(BaseValidatorNeuron):
         self.issued_questions: dict[str, float] = {}
         self.feedback_queue: list[dict[str, Any]] = []
         self.bt_forecast_runs: dict[str, dict[str, Any]] = {}
+        # Interim liveness signal: uid -> EMA of valid-response participation,
+        # separate from self.scores (the resolved-accuracy EMA).
+        self.participation_scores: dict[int, float] = {}
         self.bt_forecast_client = open_bt_forecast_client_from_env()
         self.bt_forecast_required = bt_forecast_required_from_env()
         self.resolved_count = 0
@@ -134,6 +137,8 @@ class Validator(BaseValidatorNeuron):
             self.feedback_queue = []
         if not hasattr(self, "bt_forecast_runs"):
             self.bt_forecast_runs = {}
+        if not hasattr(self, "participation_scores"):
+            self.participation_scores = {}
         state_path = _state_file_path()
         if not state_path.exists():
             bt.logging.info(f"validator state file not found: {state_path}")
@@ -154,6 +159,9 @@ class Validator(BaseValidatorNeuron):
             }
             self.resolved_count = s.get("resolved_count", 0)
             self.last_issue_at = float(s.get("last_issue_at", 0.0))
+            self.participation_scores = {
+                int(k): float(v) for k, v in s.get("participation_scores", {}).items()
+            }
             pruned = self.prune_masxai_state()
             scores = s.get("scores")
             if scores is not None:
@@ -214,6 +222,9 @@ class Validator(BaseValidatorNeuron):
                         "bt_forecast_runs": self.bt_forecast_runs,
                         "resolved_count": self.resolved_count,
                         "last_issue_at": self.last_issue_at,
+                        "participation_scores": {
+                            str(uid): score for uid, score in self.participation_scores.items()
+                        },
                         "last_resolution_at": self.last_resolution_at,
                         "last_weights_set_at": self.last_weights_set_at,
                         "last_weights_resolved_count": self.last_weights_resolved_count,
@@ -339,24 +350,59 @@ class Validator(BaseValidatorNeuron):
         except Exception:
             return 1
 
-    def should_set_weights(self) -> bool:
+    def _record_participation(self, uid: int) -> None:
+        """Bump a miner's interim liveness score for a valid, well-formed response.
+
+        This is never a correctness signal (no ground truth exists yet) - it only
+        keeps miners who are actively answering from earning zero weight while
+        their forecasts are pending resolution.
+        """
+        alpha = _env_float(C.PARTICIPATION_EMA_ALPHA_ENV, C.PARTICIPATION_EMA_ALPHA)
+        prev = self.participation_scores.get(int(uid), 0.0)
+        self.participation_scores[int(uid)] = ema_update(prev, C.PARTICIPATION_REWARD, alpha=alpha)
+
+    def _blended_weight_array(self) -> np.ndarray:
+        """Combine interim participation with resolved accuracy for submission.
+
+        Before enough forecasts have resolved, weights are participation-only so
+        the validator still submits every epoch (keeping it "active" for Yuma
+        consensus) without rewarding unresolved accuracy. Once real resolutions
+        exist, accuracy dominates and participation is a small blended share.
+        """
+        n = int(self.metagraph.n)
+        participation = np.zeros(n, dtype=np.float32)
+        for uid, score in self.participation_scores.items():
+            if 0 <= int(uid) < n:
+                participation[int(uid)] = float(score)
+
         if not self._has_scored_weights():
-            bt.logging.debug(
-                "skipping set_weights: waiting for resolved, scored miner forecasts "
-                f"(resolved={int(getattr(self, 'resolved_count', 0) or 0)}, "
-                f"required={self._min_resolved_before_weights()})"
-            )
-            return False
-        return super().should_set_weights()
+            return participation
+
+        accuracy = np.nan_to_num(
+            np.asarray(self.scores, dtype=np.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        share = min(
+            max(_env_float(C.PARTICIPATION_WEIGHT_ENV, C.PARTICIPATION_WEIGHT), 0.0),
+            1.0,
+        )
+        return (1.0 - share) * accuracy + share * participation
 
     def set_weights(self):
-        if not self._has_scored_weights():
-            bt.logging.warning(
-                "refusing to set validator weights before any miner has a "
-                "positive score from a resolved forecast"
-            )
-            return None
-        return super().set_weights()
+        """Always submit weights so the validator stays active on-chain.
+
+        The submitted array blends interim participation with resolved accuracy
+        (see _blended_weight_array); self.scores itself - the persisted,
+        resolution-driven accuracy EMA - is left untouched.
+        """
+        original_scores = self.scores
+        self.scores = self._blended_weight_array()
+        try:
+            return super().set_weights()
+        finally:
+            self.scores = original_scores
 
     # ------------------------------------------------------------- resolve
     async def resolve_due(self):
@@ -876,6 +922,7 @@ class Validator(BaseValidatorNeuron):
             probability, prediction, confidence = self._normalize_miner_response(resp)
             if probability is not None:
                 answered += 1
+                self._record_participation(uid)
             self.pending[fid] = {
                 "uid": int(uid),
                 "forecast_id": getattr(resp, "forecast_id", "") or fid,
@@ -962,11 +1009,24 @@ class Validator(BaseValidatorNeuron):
             poll_after_s = self._bt_run_poll_after_seconds(run.poll_after_s)
             run_state["poll_after_s"] = poll_after_s
             run_state["next_poll_at"] = now + poll_after_s
+            pending_since = float(run_state.get("pending_since") or 0.0)
+            if pending_since <= 0.0:
+                pending_since = now
+                run_state["pending_since"] = pending_since
+            stuck_seconds = now - pending_since
             bt.logging.info(
                 f"BT-Forecast run {run_id} generation={run.generation or 'unknown'} "
                 f"status={run.status}; polling again in {poll_after_s}s"
             )
+            self._check_stuck_bt_forecast_run(run_id, stuck_seconds)
+            if self._should_fallback_to_local_issue(stuck_seconds):
+                bt.logging.error(
+                    f"BT-Forecast run {run_id} has been stuck for {int(stuck_seconds)}s; "
+                    "falling back to the legacy local-oracle issue path for this cycle"
+                )
+                await self.issue_local_round(now=now)
             return
+        run_state.pop("pending_since", None)
 
         include_lineage = _env_flag(C.BT_FORECAST_INCLUDE_LINEAGE_ENV, False)
         questions = self._bt_cached_questions(run_state)
@@ -1290,7 +1350,42 @@ class Validator(BaseValidatorNeuron):
             seconds = int(value) if value is not None else C.BT_FORECAST_DEFAULT_POLL_AFTER_SECONDS
         except (TypeError, ValueError):
             seconds = C.BT_FORECAST_DEFAULT_POLL_AFTER_SECONDS
-        return max(60, seconds)
+        max_seconds = _env_int(
+            C.BT_FORECAST_POLL_AFTER_MAX_SECONDS_ENV,
+            C.BT_FORECAST_POLL_AFTER_MAX_SECONDS,
+        )
+        return max(60, min(seconds, max_seconds))
+
+    def _check_stuck_bt_forecast_run(self, run_id: str, stuck_seconds: float) -> None:
+        """Escalating alert for a run that hasn't reached generation=complete."""
+        error_threshold = _env_float(
+            C.BT_FORECAST_STUCK_RUN_ERROR_SECONDS_ENV,
+            C.BT_FORECAST_STUCK_RUN_ERROR_SECONDS,
+        )
+        warn_threshold = _env_float(
+            C.BT_FORECAST_STUCK_RUN_WARN_SECONDS_ENV,
+            C.BT_FORECAST_STUCK_RUN_WARN_SECONDS,
+        )
+        if error_threshold > 0.0 and stuck_seconds >= error_threshold:
+            bt.logging.error(
+                f"BT-Forecast run {run_id} has not reached generation=complete for "
+                f"{int(stuck_seconds)}s (>= {int(error_threshold)}s); the subnet is "
+                "not issuing new questions. Check the BT-Forecast service."
+            )
+        elif warn_threshold > 0.0 and stuck_seconds >= warn_threshold:
+            bt.logging.warning(
+                f"BT-Forecast run {run_id} has not reached generation=complete for "
+                f"{int(stuck_seconds)}s (>= {int(warn_threshold)}s)."
+            )
+
+    @staticmethod
+    def _should_fallback_to_local_issue(stuck_seconds: float) -> bool:
+        """Opt-in only: disabled unless MASXAI_BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS > 0."""
+        threshold = _env_float(
+            C.BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS_ENV,
+            C.BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS,
+        )
+        return threshold > 0.0 and stuck_seconds >= threshold
 
     @staticmethod
     def _bt_serialize_question(question: BtForecastQuestion) -> dict[str, Any]:
@@ -1381,6 +1476,7 @@ class Validator(BaseValidatorNeuron):
             probability, prediction, confidence = self._normalize_miner_response(resp)
             if probability is not None:
                 answered += 1
+                self._record_participation(uid)
             if existing.get("probability") is not None and probability is None:
                 existing["last_queried_at"] = synapse.issued_at
                 existing["attempt_count"] = int(existing.get("attempt_count") or 0) + 1
