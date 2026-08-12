@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import httpx
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,6 +28,7 @@ from masxai import constants as C
 from masxai import oracle
 from masxai.bt_compat import bt
 from masxai.env import load_env
+from masxai.ingest import open_ingest_client_from_env
 from masxai.oracle_bt import (
     BtForecastQuestion,
     BtForecastResolution,
@@ -115,6 +117,13 @@ class Validator(BaseValidatorNeuron):
         self.participation_scores: dict[int, float] = {}
         self.bt_forecast_client = open_bt_forecast_client_from_env()
         self.bt_forecast_required = bt_forecast_required_from_env()
+        # Miner Forecast Ingestion API: optional, independent of BT-Forecast.
+        # ingest_client stays None (every hook below becomes a no-op) unless
+        # both INGEST_API_KEY and MASXAI_INGEST_BASE_URL are configured.
+        self.ingest_client = open_ingest_client_from_env()
+        self.ingest_submit_queue: list[dict[str, Any]] = []
+        self.ingest_resolve_queue: list[dict[str, Any]] = []
+        self.last_miner_registry_sync_at = 0.0
         self.resolved_count = 0
         self.last_issue_at = 0.0
         # Gate scoring/weight emission to one cadence per forecast horizon.
@@ -126,6 +135,7 @@ class Validator(BaseValidatorNeuron):
             "MASXAI validator initialized | "
             f"bt_forecast_enabled={self.bt_forecast_client is not None} "
             f"bt_forecast_required={self.bt_forecast_required} "
+            f"ingest_enabled={self.ingest_client is not None} "
             f"state_file={_state_file_path()}"
         )
 
@@ -139,6 +149,10 @@ class Validator(BaseValidatorNeuron):
             self.bt_forecast_runs = {}
         if not hasattr(self, "participation_scores"):
             self.participation_scores = {}
+        if not hasattr(self, "ingest_submit_queue"):
+            self.ingest_submit_queue = []
+        if not hasattr(self, "ingest_resolve_queue"):
+            self.ingest_resolve_queue = []
         state_path = _state_file_path()
         if not state_path.exists():
             bt.logging.info(f"validator state file not found: {state_path}")
@@ -162,6 +176,9 @@ class Validator(BaseValidatorNeuron):
             self.participation_scores = {
                 int(k): float(v) for k, v in s.get("participation_scores", {}).items()
             }
+            self.ingest_submit_queue = list(s.get("ingest_submit_queue", []))
+            self.ingest_resolve_queue = list(s.get("ingest_resolve_queue", []))
+            self.last_miner_registry_sync_at = float(s.get("last_miner_registry_sync_at", 0.0))
             pruned = self.prune_masxai_state()
             scores = s.get("scores")
             if scores is not None:
@@ -228,6 +245,9 @@ class Validator(BaseValidatorNeuron):
                         "last_resolution_at": self.last_resolution_at,
                         "last_weights_set_at": self.last_weights_set_at,
                         "last_weights_resolved_count": self.last_weights_resolved_count,
+                        "ingest_submit_queue": self.ingest_submit_queue,
+                        "ingest_resolve_queue": self.ingest_resolve_queue,
+                        "last_miner_registry_sync_at": self.last_miner_registry_sync_at,
                         "scores": self.scores.tolist(),
                     },
                     f,
@@ -244,6 +264,8 @@ class Validator(BaseValidatorNeuron):
             "stale_pending": 0,
             "old_runs": 0,
             "feedback": 0,
+            "ingest_submit": 0,
+            "ingest_resolve": 0,
         }
 
         resolution_wait = _env_float(
@@ -283,6 +305,14 @@ class Validator(BaseValidatorNeuron):
             overflow = len(self.feedback_queue) - max_feedback
             self.feedback_queue = self.feedback_queue[-max_feedback:]
             stats["feedback"] = overflow
+
+        max_ingest = max(0, _env_int(C.INGEST_QUEUE_MAX_ENV, C.INGEST_QUEUE_MAX))
+        if max_ingest and len(getattr(self, "ingest_submit_queue", [])) > max_ingest:
+            stats["ingest_submit"] = len(self.ingest_submit_queue) - max_ingest
+            self.ingest_submit_queue = self.ingest_submit_queue[-max_ingest:]
+        if max_ingest and len(getattr(self, "ingest_resolve_queue", [])) > max_ingest:
+            stats["ingest_resolve"] = len(self.ingest_resolve_queue) - max_ingest
+            self.ingest_resolve_queue = self.ingest_resolve_queue[-max_ingest:]
 
         retention_seconds = max(
             0.0,
@@ -428,6 +458,8 @@ class Validator(BaseValidatorNeuron):
             )
         if not due:
             await self.flush_bt_feedback()
+            await self.flush_ingest_submissions()
+            await self.flush_ingest_resolutions()
             return
 
         self._log_resolution_due(due, now=now)
@@ -441,6 +473,8 @@ class Validator(BaseValidatorNeuron):
         if local_due:
             await self.resolve_local_due(local_due)
         await self.flush_bt_feedback()
+        await self.flush_ingest_submissions()
+        await self.flush_ingest_resolutions()
 
     async def resolve_local_due(self, due: list[str]):
         """Resolve legacy local-oracle forecasts."""
@@ -483,6 +517,7 @@ class Validator(BaseValidatorNeuron):
                 resolve_at=f.get("resolve_at", 1.0),
             )
             self.scores[uid] = ema_update(float(self.scores[uid]), reward)
+            self._queue_ingest_resolution(f, outcome=outcome, reward=reward)
             self.resolved_count += 1
             resolved_this_round += 1
             bt.logging.debug(
@@ -635,6 +670,7 @@ class Validator(BaseValidatorNeuron):
                     prev_score = float(self.scores[uid])
                     reward = self._score_resolved_forecast(f, outcome)
                     self.scores[uid] = ema_update(float(self.scores[uid]), reward)
+                    self._queue_ingest_resolution(f, outcome=outcome, reward=reward)
                     self.resolved_count += 1
                     bt.logging.debug(
                         f"resolved bt uid={uid} family={f.get('family')} "
@@ -796,6 +832,186 @@ class Validator(BaseValidatorNeuron):
                 remaining.append(payload)
         self.feedback_queue = remaining
 
+    # -------------------------------------------------- forecast ingestion
+    @staticmethod
+    def _epoch_to_iso(value: Any) -> Optional[str]:
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            return None
+
+    def _build_activity_payload(self, forecast: dict) -> dict[str, Any]:
+        """Map an internal pending-forecast dict to the ingestion API's CreateActivityDto.
+
+        Shared by both the BT-Forecast and legacy local-oracle pending-dict shapes,
+        which differ slightly in which fields they populate.
+        """
+        event_type = str(forecast.get("event_type") or "")
+        if event_type not in {member.value for member in ForecastEventType}:
+            event_type = "other"
+
+        probability = forecast.get("probability")
+        submitted_at = forecast.get("submitted_at")
+        issued_at = forecast.get("issued_at")
+        response_time_ms = None
+        if isinstance(submitted_at, (int, float)) and isinstance(issued_at, (int, float)):
+            response_time_ms = max(0, int((float(submitted_at) - float(issued_at)) * 1000))
+
+        horizon_days = forecast.get("horizon_days")
+        forecast_window = forecast.get("forecast_window") or (
+            f"{horizon_days}d" if horizon_days is not None else None
+        )
+
+        payload: dict[str, Any] = {
+            "eventType": event_type,
+            "runId": forecast.get("run_id"),
+            "questionKey": forecast.get("question_key") or forecast.get("forecast_id"),
+            "forecastId": forecast.get("forecast_id"),
+            "forecastWindow": forecast_window,
+            "resolveAt": self._epoch_to_iso(forecast.get("resolve_at")),
+            "prediction": forecast.get("prediction"),
+            "probability": probability,
+            "confidence": forecast.get("confidence"),
+            "reasoning": forecast.get("reasoning") or None,
+            "model": forecast.get("model") or None,
+            "features": forecast.get("features") or None,
+            "isNoAnswer": probability is None,
+            "responseTimeMs": response_time_ms,
+            "submittedAt": self._epoch_to_iso(submitted_at),
+        }
+        return {key: value for key, value in payload.items() if value is not None}
+
+    def _queue_ingest_submission(self, fid: str, forecast: dict) -> None:
+        """Queue one forecast activity for POSTing to the ingestion API. No-op if unconfigured."""
+        if self.ingest_client is None:
+            return
+        hotkey = forecast.get("hotkey")
+        if not hotkey:
+            return
+        self.ingest_submit_queue.append(
+            {"fid": fid, "hotkey": hotkey, "payload": self._build_activity_payload(forecast)}
+        )
+
+    def _queue_ingest_resolution(self, forecast: dict, *, outcome: bool, reward: float) -> None:
+        """Queue one resolution PATCH. Skipped if the submission never got an activity id."""
+        if self.ingest_client is None:
+            return
+        activity_id = forecast.get("ingest_activity_id")
+        hotkey = forecast.get("hotkey")
+        if not activity_id or not hotkey:
+            return
+        probability = forecast.get("probability")
+        payload: dict[str, Any] = {"outcome": bool(outcome), "rewardComposite": float(reward)}
+        if probability is not None:
+            payload["brierScore"] = brier_score(probability, outcome)
+        self.ingest_resolve_queue.append(
+            {"hotkey": hotkey, "activity_id": activity_id, "payload": payload}
+        )
+
+    @staticmethod
+    def _is_ingest_client_error(exc: Exception) -> bool:
+        """True for a non-retryable 4xx - the caller should drop, not requeue."""
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return False
+        status = exc.response.status_code if exc.response is not None else None
+        return status is not None and 400 <= status < 500
+
+    async def flush_ingest_submissions(self):
+        """Best-effort retrying sender for ingestion-API activity POSTs."""
+        if not self.ingest_submit_queue or self.ingest_client is None:
+            return
+        remaining = []
+        for item in self.ingest_submit_queue:
+            fid = item.get("fid")
+            hotkey = item.get("hotkey")
+            payload = item.get("payload") or {}
+            try:
+                result = await self.ingest_client.submit_activity(hotkey, payload)
+                activity_id = result.get("id") if isinstance(result, dict) else None
+                if activity_id and fid in self.pending:
+                    self.pending[fid]["ingest_activity_id"] = activity_id
+            except Exception as e:  # noqa: BLE001
+                if self._is_ingest_client_error(e):
+                    bt.logging.warning(
+                        f"ingest activity submit rejected, dropping: hotkey={hotkey}: {e}"
+                    )
+                    continue
+                bt.logging.warning(f"ingest activity submit failed, will retry: {e}")
+                remaining.append(item)
+        self.ingest_submit_queue = remaining
+
+    async def flush_ingest_resolutions(self):
+        """Best-effort retrying sender for ingestion-API resolve PATCHes."""
+        if not self.ingest_resolve_queue or self.ingest_client is None:
+            return
+        remaining = []
+        for item in self.ingest_resolve_queue:
+            hotkey = item.get("hotkey")
+            activity_id = item.get("activity_id")
+            payload = item.get("payload") or {}
+            try:
+                await self.ingest_client.resolve_activity(hotkey, activity_id, payload)
+            except Exception as e:  # noqa: BLE001
+                if self._is_ingest_client_error(e):
+                    bt.logging.warning(
+                        f"ingest activity resolve rejected, dropping: "
+                        f"hotkey={hotkey} activity_id={activity_id}: {e}"
+                    )
+                    continue
+                bt.logging.warning(f"ingest activity resolve failed, will retry: {e}")
+                remaining.append(item)
+        self.ingest_resolve_queue = remaining
+
+    def _build_miner_registry_payload(self, uid: int) -> dict[str, Any]:
+        metagraph = self.metagraph
+        payload: dict[str, Any] = {
+            "uid": int(uid),
+            "hotkey": metagraph.hotkeys[uid],
+            "netuid": int(getattr(self.config, "netuid", 0)),
+        }
+        coldkeys = getattr(metagraph, "coldkeys", None)
+        if coldkeys is not None and uid < len(coldkeys):
+            payload["coldkey"] = coldkeys[uid]
+        stake = getattr(metagraph, "stake", None)
+        if stake is not None and uid < len(stake):
+            payload["stakeTao"] = float(stake[uid])
+        # metagraph.trust isn't present on every bittensor version's metagraph -
+        # read defensively and omit rather than assume it exists.
+        trust = getattr(metagraph, "trust", None)
+        if trust is not None and uid < len(trust):
+            payload["trust"] = float(trust[uid])
+        incentive = getattr(metagraph, "incentive", None)
+        if incentive is not None and uid < len(incentive):
+            payload["incentive"] = float(incentive[uid])
+        active = getattr(metagraph, "active", None)
+        if active is not None and uid < len(active):
+            payload["active"] = bool(active[uid])
+        return payload
+
+    async def sync_miner_registry(self):
+        """Periodically upsert metagraph miner state to the ingestion API."""
+        if self.ingest_client is None:
+            return
+        interval = _env_float(
+            C.INGEST_MINER_SYNC_INTERVAL_SECONDS_ENV,
+            C.INGEST_MINER_SYNC_INTERVAL_SECONDS,
+        )
+        now = time.time()
+        if self.last_miner_registry_sync_at and now - self.last_miner_registry_sync_at < interval:
+            return
+
+        hotkeys = getattr(self.metagraph, "hotkeys", [])
+        synced = 0
+        for uid in range(len(hotkeys)):
+            try:
+                payload = self._build_miner_registry_payload(uid)
+                await self.ingest_client.upsert_miner(payload)
+                synced += 1
+            except Exception as e:  # noqa: BLE001
+                bt.logging.debug(f"miner registry sync failed for uid={uid}: {e}")
+        self.last_miner_registry_sync_at = now
+        bt.logging.info(f"synced {synced}/{len(hotkeys)} miner(s) to ingestion API")
+
     # --------------------------------------------------------------- issue
     def build_question(self, event_type: str, reference: dict) -> ForecastSynapse:
         now = time.time()
@@ -925,6 +1141,7 @@ class Validator(BaseValidatorNeuron):
                 self._record_participation(uid)
             self.pending[fid] = {
                 "uid": int(uid),
+                "hotkey": self.metagraph.hotkeys[int(uid)],
                 "forecast_id": getattr(resp, "forecast_id", "") or fid,
                 "event_type": event_type,
                 "prediction": prediction,
@@ -940,6 +1157,7 @@ class Validator(BaseValidatorNeuron):
                 "asset": C.FORECAST_ASSET,
                 "resolve_at": synapse.resolve_at,
             }
+            self._queue_ingest_submission(fid, self.pending[fid])
             issued += 1
         bt.logging.info(
             f"issued {issued} {event_type} forecasts @ ref={reference.get('reference_value')} "
@@ -1514,6 +1732,12 @@ class Validator(BaseValidatorNeuron):
                 "engine_probability": question.engine_probability,
                 "measurement": question.measurement,
             }
+            # Only queue once per (run, question, uid): the first time it's seen,
+            # or the first time it goes from no-answer to answered. Repeat
+            # "still no answer" retries would just 409 against the API's
+            # (minerId, questionKey) uniqueness constraint.
+            if not existing or (existing.get("probability") is None and probability is not None):
+                self._queue_ingest_submission(fid, self.pending[fid])
             issued += 1
         return issued, answered
 
@@ -1666,6 +1890,7 @@ class Validator(BaseValidatorNeuron):
             await self.resolve_due()
             self.save_masxai_state()
             await self.issue_round()
+            await self.sync_miner_registry()
             self.save_masxai_state()
         # brief pause so we don't hot-loop; the base class also paces by epoch
         await asyncio.sleep(5)

@@ -126,6 +126,10 @@ def _validator(fake_client: _FakeBtForecastClient) -> Validator:
     validator.resolved_count = 0
     validator.last_issue_at = 0.0
     validator.participation_scores = {}
+    validator.ingest_client = None
+    validator.ingest_submit_queue = []
+    validator.ingest_resolve_queue = []
+    validator.last_miner_registry_sync_at = 0.0
     validator.metagraph = _FakeMetagraph()
     validator.wallet = _FakeWallet()
     validator.dendrite = _FakeDendrite()
