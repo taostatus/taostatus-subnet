@@ -7,8 +7,7 @@ torch>=2
 numpy>=1
 setuptools>=68
 
-# MASXAI v1 — free price oracle (CoinGecko) for deferred resolution
+# MASXAI — miner LLM-key contribution pipeline
 httpx>=0.27.0
 python-dotenv>=1.0.0
-SQLAlchemy>=2.0.0
-google-genai>=0.8.0
+pynacl>=1.5

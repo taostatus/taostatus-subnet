@@ -1,213 +1,256 @@
-# MasXAI Subnet MVP
+# MASXAI Subnet
 
-MasXAI is a Bittensor forecasting subnet for Bittensor ecosystem events. Miners
-run Gemini-backed forecasting agents, validators resolve objective ground truth,
-score forecasts, and set miner weights from forecast quality.
+**Netuid:** 501 (testnet) · **Network:** Bittensor
 
-The current implementation keeps the proven deferred-resolution loop from the
-lightweight v1 code, then adds the MVP forecast schema, Gemini miner path, and
-Discord publishing.
+MASXAI is a Bittensor subnet that sources real, working LLM API access from
+its miners and makes it available to an external protocol (the BT Arena
+Protocol) for its own AI agent pipeline. Miners are rewarded for the
+reliability, speed, capability tier, and sustained volume of the access they
+contribute — never for output quality, since the protocol controls every
+prompt and the underlying models are third-party, making output an unfair
+and unmeasurable basis for reward.
 
-## MVP Forecasts
+## Table of contents
 
-Supported event taxonomy:
+- [Introduction](#introduction)
+- [Roles](#roles)
+- [Protocol Boundary](#protocol-boundary)
+- [Incentive Mechanism](#incentive-mechanism)
+- [Security Model](#security-model)
+- [Installation](#installation)
+- [Running a Miner](#running-a-miner)
+- [Running a Validator](#running-a-validator)
+- [Testing](#testing)
+- [Repository Structure](#repository-structure)
+- [License](#license)
 
-- `tao_price_movement`
-- `subnet_token_price`
-- `new_subnet_registration`
-- `governance_outcome`
-- `ecosystem_growth_metric`
-- `significant_bittensor_event`
+For the full sequence-level walkthrough — every message exchanged, the exact
+scoring formula applied to a report, and how weight actually reaches the
+chain — see [docs/subnet_flow.md](docs/subnet_flow.md).
 
-The validator only issues event types listed in `masxai/constants.py` as
-`ENABLED_EVENT_TYPES`. By default this is `tao_price_movement`, because it has
-automatic objective resolution through the price oracle. Add more event types to
-that list only after adding an objective resolver in `masxai/oracle.py`.
+## Introduction
 
-## Forecast Schema
+AI agent pipelines need language model access, and language model access
+costs real money per call. Rather than one operator paying for all of it
+centrally, this subnet lets a decentralized network of miners supply that
+access, and pays them according to Bittensor's standard incentive model:
+weights set by a validator, emission split by Yuma Consensus, most of it
+reserved by a fixed burn.
 
-Miner responses follow the MVP schema:
+The subnet does not ask miners to predict, forecast, or generate content of
+any kind. A miner's entire job is to keep one working LLM credential
+available and answer honestly when asked whether they have one to share.
 
-```json
-{
-  "forecast_id": "uuid",
-  "event_type": "tao_price_movement",
-  "prediction": true,
-  "confidence": 0.92,
-  "forecast_window": "1h",
-  "reasoning": "network activity and price momentum remain positive",
-  "timestamp": "ISO8601"
-}
-```
+## Roles
 
-## Miner Workflow
+**Miner** (`neurons/miner.py`) — configures an LLM API key for an allowed
+provider/model and opts in. Answers a single synapse type (`LLMKeySynapse`):
+encrypts the key client-side and returns it, or declines cleanly if not
+opted in or the request doesn't match an allowed model. Never contacts the
+protocol backend directly.
 
-1. Receive a validator forecasting task.
-2. Build a Gemini prompt from the task and validator-supplied context.
-3. Generate a structured forecast.
-4. Return the forecast to the validator.
-5. Publish a summary to Discord when `DISCORD_WEBHOOK_URL` is configured.
+**Validator** (`neurons/validator.py`) — the sole bridge between the chain
+and the protocol. On a fixed interval, asks every eligible miner for a key,
+relays accepted submissions to the protocol unmodified (it cannot decrypt
+them), and separately polls the protocol for usage reports. Turns those
+reports into an on-chain weight via `masxai/scoring.py`, and submits weights
+every eligible epoch regardless of how much data currently exists —
+Bittensor's Yuma Consensus penalizes a validator that goes silent, so the
+validator always has *something* valid to submit, even before any miner has
+proven a working key.
 
-Gemini configuration lives in a local `.env` file:
+**Protocol (BT Arena)** — an external service, not part of this repository
+(`BT-Arena_next_phase/backend` in this workspace). Publishes the encryption keypair and
+the allowed provider/model list, validates and stores submitted keys, draws
+on them operationally, and reports raw usage statistics back to the
+validator. Never sees the chain and never dictates a reward — see
+[Protocol Boundary](#protocol-boundary).
 
-```bash
-cp .env.example .env
-```
+## Protocol Boundary
 
-Then edit `.env`:
+The subnet and the protocol are two independent systems connected by exactly
+one channel: the validator's HTTP calls to the protocol's `/llm-keys/*` API.
 
-```env
-GEMINI_API_KEY=your-gemini-key
-GEMINI_ENABLED=true
-GEMINI_MODEL=gemini-2.5-pro
-GEMINI_TIMEOUT=8
-DISCORD_WEBHOOK_URL=your-discord-webhook
-MASXAI_FALLBACK_TAO_PRICE_USD=
-MASXAI_FORECAST_INTERVAL_SECONDS=300
-```
+| The protocol may | The protocol may never |
+|---|---|
+| Supply topics/allowed-model lists | Dictate the weight-setting formula |
+| Supply raw usage reports (success/failure counts, latency) | Compute or influence a miner's score directly |
+| Mark a key inactive | Reach a miner directly — only the validator relays |
+| Reject a submission (bad model, failed validation) | See chain state or metagraph data |
 
-`.env` is ignored by git. The miner loads it automatically.
+This split means a compromised or misbehaving protocol backend can, at
+worst, feed bad topics or bad usage data — which fail-closed handling and
+scoring gates already contain — but it can never touch a chain-level trust
+boundary.
 
-`MASXAI_FALLBACK_TAO_PRICE_USD` is optional. Leave it empty for objective
-oracle-based scoring. For testnet/dev only, set it to a TAO/USD value if your
-machine cannot reach CoinGecko, Binance, or Kraken and the validator logs
-`oracle unavailable; skipping issue this epoch`.
+## Incentive Mechanism
 
-`MASXAI_FORECAST_INTERVAL_SECONDS` controls how often the validator asks miners
-for a new forecast. `300` means one forecast round every 5 minutes.
+### What is measured, and why
 
-Without a Gemini key, the miner returns a neutral baseline forecast so local
-testing still works.
+Reward cannot be based on how *good* an AI's answer is: the protocol writes
+every prompt sent through a contributed key, and the models themselves are
+third-party (OpenAI's, Anthropic's, etc.), so two miners running the
+identical model would produce statistically identical output regardless of
+effort. Scoring output would really be scoring the model vendor and the
+protocol's own prompting — not the miner.
 
-If the miner logs `ConnectTimeout` for Gemini, the server cannot reach
-`generativelanguage.googleapis.com` quickly enough. You can raise
-`GEMINI_TIMEOUT` up to about `15`, or set `GEMINI_ENABLED=false` to run explicit
-baseline mode until outbound connectivity is fixed.
-
-## Validator Workflow
-
-Default local/dev mode still snapshots objective reference data and resolves the
-one-hour TAO price question locally. Phase 1 centralized mode is enabled by
-setting `BT_FORECAST_BEARER_TOKEN`; the production BT-Forecast base URL is the
-default and can be overridden with `BT_FORECAST_BASE_URL`:
-
-1. Poll the BT-Forecast FastAPI service for today's deterministic run id
-   (`bt-YYYY-MM-DD`), e.g. `/v1/forecast-runs/bt-2026-07-22`.
-2. If the run's `generation` is not `complete`, wait for the API's
-   `poll_after_s` value before polling the same run again.
-3. When `generation` is `complete`, fetch miner-safe questions from
-   `/v1/forecast-runs/{run_id}/questions`.
-   Private service-only benchmark fields are not copied into the synapse.
-4. Query miner axons with `ForecastSynapse` v3.
-5. Store miner forecasts in the pending queue, keyed by run id, question key,
-   and miner uid.
-6. Wait until each question's `cutoff_date`.
-7. Fetch actual outcomes from `/v1/resolutions`.
-8. Score each miner against the real outcome, never against the engine answer.
-9. Queue accurate miner forecasts for `/v1/miner-results` feedback.
-10. EMA the score into `self.scores` so the template weight machinery can submit
-   weights on chain.
-
-Pending forecasts and scores are persisted to `validator_state.json`. In
-centralized mode, each active pending row uses a deterministic
-`(run_id, question_key, uid)` key so a re-issued question updates that miner's
-latest active answer instead of creating duplicate unresolved rows.
-
-Unanswered miner calls are retried until the question cutoff. Retry cadence starts
-at `MASXAI_BT_FORECAST_NO_ANSWER_RETRY_SECONDS` and backs off up to
-`MASXAI_BT_FORECAST_NO_ANSWER_RETRY_MAX_SECONDS`, so a validator can recover when
-miners come online later without hammering the network. Stale pending rows,
-old run metadata, and queued BT-Forecast feedback are bounded by environment
-settings in `.env.example`.
-
-## Scoring
-
-Structured forecasts use the Phase 1 weighted score:
+Instead, `masxai/scoring.py::llm_key_efficiency_score()` measures only what a
+miner genuinely controls:
 
 ```text
-Final Score =
-50% Brier skill vs baseline +
-20% Confidence Calibration +
-20% Historical Consistency +
-10% Timeliness
+composite = 0.5 · reliability          (success rate over a report window)
+          + 0.25 · latency_score       (response speed, clamped against a ceiling)
+          + 0.25 · volume_score        (real call volume, capped at a target)
+
+score = composite × model_tier_weight  (which model the miner configured)
 ```
 
-`probability` is the primary accuracy input. With the default composite baseline
-gate, a flat 0.5 forecast earns zero composite reward.
+- A key the protocol marks inactive (revoked, exhausted, invalid) scores
+  `0.0` unconditionally, regardless of tier.
+- Below a minimum call count in a report window, the window is skipped
+  entirely rather than penalized — a quiet key is not treated as a bad key.
+- `score` is folded into a per-miner exponential moving average
+  (`self.scores[uid]`), so a single bad or single lucky window has limited
+  effect; sustained performance is what actually accumulates.
 
-The validator waits for at least `MASXAI_MIN_RESOLVED_BEFORE_WEIGHTS` resolved
-miner forecasts, plus the chain's minimum allowed weight count, before submitting
-weights. This keeps emissions gated on real resolved performance instead of mere
-participation.
+**Answering the validator's periodic check-in earns nothing on its own.**
+Weight comes exclusively from `self.scores` — a value that stays at `0.0`
+until the protocol has reported real, verified usage. A liveness-only
+`participation_scores` EMA is tracked separately for observability, but is
+never blended into submitted weight.
 
-Lineage defaults off for open-source deployments. Enable
-`BT_FORECAST_INCLUDE_LINEAGE` only when a private validator operator explicitly
-needs benchmark telemetry. Miner rewards do not depend on that telemetry.
+### Burn
 
-Legacy Brier helpers remain in `masxai/scoring.py` for probability-only tests and
-older local mocks.
+On top of the above, this subnet reserves the large majority of emission for
+a fixed burn UID (`masxai/constants.py::BURN_UID = 25`,
+`BURN_PERCENTAGE = 0.95`), applied by the vendored template's own
+`_apply_burn_allocation()` (`template/base/validator.py`) before anything
+reaches the chain. This is unconditional — it does not shrink as more real,
+proven miner data accumulates. Only the remaining share is split among
+miners with a positive score, proportional to it.
 
-## Setup
+### Worked example
+
+Three miners, a 100-unit reward pool for one epoch:
+
+| Miner | Contribution | Reliability | Speed | Volume | Tier | Score |
+|---|---|---|---|---|---|---|
+| A | GPT-4o, well-used | 49/50 | fast | full | ×1.0 | ≈0.97 |
+| B | DeepSeek, well-used | 50/50 | slow | full | ×0.5 | ≈0.43 |
+| C | Declined this round | — | — | — | — | 0 |
+
+1. **Burn takes 95 units first, unconditionally.** 5 units remain.
+2. **The remaining 5 units split proportional to score:** A gets
+   `0.97 / (0.97 + 0.43) ≈ 69%` (≈3.5 units), B gets `≈31%` (≈1.5 units), C
+   gets nothing.
+
+Notice B is *more reliable* than A (100% vs 98%) but still earns less
+overall — a slower, lower-tier model is capped below what a fast, top-tier
+one can reach, even at perfect reliability.
+
+## Security Model
+
+- **End-to-end key encryption.** A miner encrypts its raw key client-side
+  (`masxai/llm_key_crypto.py`, NaCl `SealedBox`) for the protocol's published
+  public key before it ever leaves the miner process. The validator relays
+  only an opaque ciphertext blob and holds no private key to decrypt it —
+  this is a structural guarantee, not a policy.
+- **Two independent locks.** The protocol decrypts the transport ciphertext
+  on arrival, then re-encrypts the key for storage using a completely
+  separate at-rest key. A compromise of one does not expose the other.
+- **Duplicate-key farming is rejected.** The same underlying key registered
+  under a second hotkey is detected and refused — first registrant only.
+- **Mandatory validator permit on the miner's blacklist.** Unlike a
+  read-only query, an accepted `LLMKeySynapse` response triggers a
+  state-changing action (a key submission relayed onward), so it is never
+  answered without a validator permit.
+- **Least-trust protocol boundary.** See [Protocol Boundary](#protocol-boundary).
+
+## Installation
 
 ```bash
-python3 -m venv .venv
+git clone <this repo>
+cd masxai-subnet
+python -m venv .venv
 source .venv/bin/activate
-pip install -e .
 pip install -r requirements.txt
-python scripts/patch_btcli_compat.py
 cp .env.example .env
 ```
 
-Run `python scripts/patch_btcli_compat.py` again after installing or upgrading
-`bittensor-cli`. It only patches the CLI package in the active environment and
-does not change MASXAI subnet core code. It fixes known testnet CLI issues:
-missing `Swap.AlphaSqrtPrice` in `wallet overview`, public RPC storage-work
-limits during netuid-filtered `wallet overview`, and negative transaction era
-during `subnet register`.
+See `min_compute.yml` for hardware requirements — this subnet is I/O-bound
+(HTTP calls and lightweight encryption), not compute-bound; no GPU is
+required for either role.
 
-Run tests:
+## Running a Miner
+
+Set in `.env`:
 
 ```bash
-python -m pytest -q
+MASXAI_LLM_KEY_CONTRIB_ENABLED=true
+MASXAI_LLM_KEY_CONTRIB_PROVIDER=openai
+MASXAI_LLM_KEY_CONTRIB_MODEL=gpt-4o-mini
+MASXAI_LLM_KEY_CONTRIB_API_KEY=sk-...
 ```
 
-Run the local loop without chain access:
+Run:
 
 ```bash
-python scripts/mock_run.py
-```
-
-## Testnet 501
-
-```bash
-btcli subnet register --netuid 501 --subtensor.network test \
-  --wallet.name masxai-miner --wallet.hotkey default
-btcli subnet register --netuid 501 --subtensor.network test \
-  --wallet.name masxai-validator --wallet.hotkey default
-
-btcli stake add --netuid 501 --subtensor.network test \
-  --wallet.name masxai-validator --wallet.hotkey default
-
 python neurons/miner.py --netuid 501 --subtensor.network test \
-  --wallet.name masxai-miner --wallet.hotkey default \
-  --axon.port 8901 --logging.debug
-
-python neurons/validator.py --netuid 501 --subtensor.network test \
-  --wallet.name masxai-validator --wallet.hotkey default --logging.debug
+  --wallet.name <wallet> --wallet.hotkey <hotkey>
 ```
 
-Prefer `scripts/run_testnet.sh miner` and `scripts/run_testnet.sh validator` for
-testnet runs; the script exports `BT_NO_PARSE_CLI_ARGS=false` so Bittensor CLI
-flags are honored by recent SDK versions.
+Leaving `MASXAI_LLM_KEY_CONTRIB_ENABLED` unset/false runs a miner that
+declines every ask cleanly (`has_key=False`) — useful for verifying
+axon/blacklist/priority behavior without exposing a real key.
 
-`--subtensor.network test` connects to the test network, not mainnet `finney`.
-Weights and emissions from testnet will not appear on mainnet explorers. The
-validator only submits weights after at least one forecast has resolved, which is
-one hour by default (`FORECAST_HORIZON_SECONDS=3600`).
+Full guide, including how to be a strong contributor: [MINER.md](MINER.md).
 
-## MVP Economics
+## Running a Validator
 
-The product target is to burn 96% of miner emissions and distribute 4% according
-to validator weights. This repo currently computes and submits weights; emission
-burn mechanics must be enforced in subnet economics/runtime configuration, not
-inside miner forecast code.
+Set in `.env`:
+
+```bash
+MASXAI_LLM_KEY_BASE_URL=<protocol backend base URL>
+MASXAI_LLM_KEY_VALIDATOR_TOKEN=<validator credential issued by the protocol>
+```
+
+Run:
+
+```bash
+python neurons/validator.py --netuid 501 --subtensor.network test \
+  --wallet.name <wallet> --wallet.hotkey <hotkey>
+```
+
+Leaving `MASXAI_LLM_KEY_VALIDATOR_TOKEN` unset runs the validator with the
+pipeline off: `self.scores` stays at zero for everyone, so burn effectively
+reserves all of emission until the pipeline is configured — the validator
+still submits a valid weight vector every epoch, satisfying Bittensor's
+never-go-silent requirement.
+
+Full guide: [VALIDATOR.md](VALIDATOR.md).
+
+## Testing
+
+```bash
+python -m pytest tests/ -v
+```
+
+## Repository Structure
+
+```
+masxai/
+  protocol.py          LLMKeySynapse -- the subnet's sole wire contract
+  llm_key_crypto.py     miner-side transport encryption (encrypt only)
+  llm_key_client.py     validator-side HTTP client to the protocol backend
+  scoring.py             llm_key_efficiency_score() and the generic EMA helper
+  constants.py            all tunables, env-var-overridable
+neurons/
+  miner.py                miner neuron entrypoint
+  validator.py             validator neuron entrypoint
+BT-Arena_next_phase/backend/  the protocol backend (separate service, this workspace only)
+tests/                       pytest suite mirroring the modules above
+```
+
+## License
+
+See [LICENSE](LICENSE).
