@@ -72,6 +72,11 @@ class Validator(BaseValidatorNeuron):
         self.ingest_client = open_ingest_client_from_env()
         self.ingest_submit_queue: list[dict[str, Any]] = []
         self.ingest_resolve_queue: list[dict[str, Any]] = []
+        # Hotkeys confirmed upserted into the ingestion API's miner registry.
+        # An activity is only ever submitted for a hotkey once it's in this
+        # set - closes the race where a miner registers mid-run and gets
+        # queried before the next periodic sync_miner_registry() upserts it.
+        self.ingest_registered_hotkeys: set[str] = set()
         self.last_miner_registry_sync_at = 0.0
         self.load_masxai_state()
         bt.logging.info(
@@ -95,6 +100,7 @@ class Validator(BaseValidatorNeuron):
             )
             self.ingest_submit_queue = list(s.get("ingest_submit_queue", []))
             self.ingest_resolve_queue = list(s.get("ingest_resolve_queue", []))
+            self.ingest_registered_hotkeys = set(s.get("ingest_registered_hotkeys", []))
             self.last_miner_registry_sync_at = float(s.get("last_miner_registry_sync_at", 0.0))
             scores = s.get("scores")
             if scores is not None:
@@ -128,6 +134,7 @@ class Validator(BaseValidatorNeuron):
                         "last_weights_resolved_count": self.last_weights_resolved_count,
                         "ingest_submit_queue": self.ingest_submit_queue,
                         "ingest_resolve_queue": self.ingest_resolve_queue,
+                        "ingest_registered_hotkeys": sorted(self.ingest_registered_hotkeys),
                         "last_miner_registry_sync_at": self.last_miner_registry_sync_at,
                         "scores": self.scores.tolist(),
                     },
@@ -395,7 +402,12 @@ class Validator(BaseValidatorNeuron):
             return
         self._enqueue_bounded(
             self.ingest_submit_queue,
-            {"fid": fid, "hotkey": hotkey, "payload": self._build_activity_payload(forecast)},
+            {
+                "fid": fid,
+                "uid": forecast.get("uid"),
+                "hotkey": hotkey,
+                "payload": self._build_activity_payload(forecast),
+            },
         )
 
     def _queue_ingest_resolution(self, forecast: dict, *, outcome: bool, reward: float) -> None:
@@ -431,6 +443,22 @@ class Validator(BaseValidatorNeuron):
         status = exc.response.status_code if exc.response is not None else None
         return status is not None and 400 <= status < 500
 
+    async def _ensure_miner_registered(self, uid: Optional[int], hotkey: str) -> None:
+        """Upsert a miner into the ingestion API's registry the first time we see it.
+
+        Guarantees a miner row exists in the backend before any activity is
+        submitted for it, instead of relying on the periodic (10min-default)
+        sync_miner_registry() cadence to have caught up with a newly-joined miner.
+        """
+        if hotkey in self.ingest_registered_hotkeys:
+            return
+        if uid is not None:
+            payload = self._build_miner_registry_payload(int(uid))
+        else:
+            payload = {"hotkey": hotkey, "netuid": int(getattr(self.config, "netuid", 0))}
+        await self.ingest_client.upsert_miner(payload)
+        self.ingest_registered_hotkeys.add(hotkey)
+
     async def flush_ingest_submissions(self):
         """Best-effort retrying sender for ingestion-API activity POSTs."""
         if not self.ingest_submit_queue or self.ingest_client is None:
@@ -438,8 +466,22 @@ class Validator(BaseValidatorNeuron):
         remaining = []
         for item in self.ingest_submit_queue:
             fid = item.get("fid")
+            uid = item.get("uid")
             hotkey = item.get("hotkey")
             payload = item.get("payload") or {}
+            try:
+                await self._ensure_miner_registered(uid, hotkey)
+            except Exception as e:  # noqa: BLE001
+                if self._is_ingest_client_error(e):
+                    bt.logging.warning(
+                        f"ingest miner upsert rejected, dropping activity: hotkey={hotkey}: {e}"
+                    )
+                    continue
+                bt.logging.warning(
+                    f"ingest miner upsert failed, will retry activity: hotkey={hotkey}: {e}"
+                )
+                remaining.append(item)
+                continue
             try:
                 result = await self.ingest_client.submit_activity(hotkey, payload)
                 activity_id = result.get("id") if isinstance(result, dict) else None
@@ -521,6 +563,7 @@ class Validator(BaseValidatorNeuron):
             try:
                 payload = self._build_miner_registry_payload(uid)
                 await self.ingest_client.upsert_miner(payload)
+                self.ingest_registered_hotkeys.add(hotkeys[uid])
                 synced += 1
             except Exception as e:  # noqa: BLE001
                 bt.logging.debug(f"miner registry sync failed for uid={uid}: {e}")

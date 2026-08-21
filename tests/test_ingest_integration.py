@@ -59,6 +59,7 @@ def _validator(ingest_client) -> Validator:
     validator.ingest_client = ingest_client
     validator.ingest_submit_queue = []
     validator.ingest_resolve_queue = []
+    validator.ingest_registered_hotkeys = set()
     validator.last_miner_registry_sync_at = 0.0
     validator.metagraph = _FakeIngestMetagraph()
     validator.config = SimpleNamespace(netuid=501)
@@ -258,6 +259,65 @@ def test_flush_methods_are_noop_when_unconfigured():
     # queues (defends against a client being cleared mid-run).
     assert len(validator.ingest_submit_queue) == 1
     assert len(validator.ingest_resolve_queue) == 1
+
+
+# --------------------------------------------------------------- miner registration gating
+
+
+def test_flush_ingest_submissions_registers_miner_before_first_activity():
+    client = _FakeIngestClient()
+    validator = _validator(client)
+    validator.ingest_submit_queue = [
+        {"fid": "fid-1", "uid": 0, "hotkey": "hotkey-0", "payload": {"eventType": "other"}}
+    ]
+
+    asyncio.run(validator.flush_ingest_submissions())
+
+    assert len(client.upsert_calls) == 1
+    assert client.upsert_calls[0]["hotkey"] == "hotkey-0"
+    assert client.submit_calls == [("hotkey-0", {"eventType": "other"})]
+    assert "hotkey-0" in validator.ingest_registered_hotkeys
+
+
+def test_flush_ingest_submissions_skips_upsert_for_already_registered_hotkey():
+    client = _FakeIngestClient()
+    validator = _validator(client)
+    validator.ingest_registered_hotkeys = {"hotkey-0"}
+    validator.ingest_submit_queue = [
+        {"fid": "fid-1", "uid": 0, "hotkey": "hotkey-0", "payload": {"eventType": "other"}}
+    ]
+
+    asyncio.run(validator.flush_ingest_submissions())
+
+    assert client.upsert_calls == []
+    assert client.submit_calls == [("hotkey-0", {"eventType": "other"})]
+
+
+def test_flush_ingest_submissions_requeues_without_submitting_when_registration_fails():
+    client = _FakeIngestClient()
+
+    async def _failing_upsert(payload):
+        raise httpx.ConnectError("boom")
+
+    client.upsert_miner = _failing_upsert  # noqa: SLF001
+    validator = _validator(client)
+    item = {"fid": "fid-1", "uid": 0, "hotkey": "hotkey-0", "payload": {"eventType": "other"}}
+    validator.ingest_submit_queue = [item]
+
+    asyncio.run(validator.flush_ingest_submissions())
+
+    assert validator.ingest_submit_queue == [item]
+    assert client.submit_calls == []
+    assert "hotkey-0" not in validator.ingest_registered_hotkeys
+
+
+def test_sync_miner_registry_marks_hotkeys_registered():
+    client = _FakeIngestClient()
+    validator = _validator(client)
+
+    asyncio.run(validator.sync_miner_registry())
+
+    assert validator.ingest_registered_hotkeys == {"hotkey-0", "hotkey-1"}
 
 
 # --------------------------------------------------------------- miner registry sync
