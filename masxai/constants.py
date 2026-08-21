@@ -65,3 +65,20 @@ GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GEMINI_TIMEOUT = 8
 DISCORD_TIMEOUT = 5
+
+# --- miner forecast ingestion API (optional) ---
+# A separate backend that accepts machine-to-machine reports of miner metagraph
+# state and forecast activity, authenticated via a static X-API-Key. Fully
+# opt-in: unless both env vars below are set, open_ingest_client_from_env()
+# returns None and every validator hook that depends on it becomes a no-op.
+INGEST_BASE_URL_ENV = "MASXAI_INGEST_BASE_URL"
+INGEST_API_KEY_ENV = "INGEST_API_KEY"
+INGEST_TIMEOUT_ENV = "MASXAI_INGEST_TIMEOUT"
+INGEST_MAX_RETRIES_ENV = "MASXAI_INGEST_MAX_RETRIES"
+INGEST_MINER_SYNC_INTERVAL_SECONDS_ENV = "MASXAI_INGEST_MINER_SYNC_INTERVAL_SECONDS"
+INGEST_QUEUE_MAX_ENV = "MASXAI_INGEST_QUEUE_MAX"
+
+INGEST_TIMEOUT = 10
+INGEST_MAX_RETRIES = 3
+INGEST_MINER_SYNC_INTERVAL_SECONDS = 600      # 10 minutes
+INGEST_QUEUE_MAX = 1000
