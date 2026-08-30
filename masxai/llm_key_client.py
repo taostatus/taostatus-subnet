@@ -32,23 +32,61 @@ class LLMKeyAllowedModel(BaseModel):
     model: str
 
 
-class LLMKeySubmitResult(BaseModel):
+class LLMKeySubmitKeyResult(BaseModel):
+    """Per-key outcome of one slot in a batch submission."""
+
+    slot: int
+    key_id: Optional[int] = None  # stable backend row id, set when accepted
+    provider: str = ""
+    model: str = ""
     accepted: bool
     status: str
     reason: Optional[str] = None
 
 
+class LLMKeySubmitResult(BaseModel):
+    accepted: bool  # aggregate: at least one key accepted
+    status: str
+    reason: Optional[str] = None
+    results: list[LLMKeySubmitKeyResult] = Field(default_factory=list)
+
+
 class LLMKeyUsageReport(BaseModel):
     hotkey: str
+    # Which of the hotkey's keys served this call. The validator blends
+    # reward tiers per call from provider/model and kills per key_id. None
+    # only on rows written before the backend's multi-key migration.
+    key_id: Optional[int] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
     window_start: Optional[str] = None
     window_end: Optional[str] = None
     success_count: int = 0
     failure_count: int = 0
     avg_latency_ms: Optional[float] = None
     p95_latency_ms: Optional[float] = None
+    avg_quality_score: Optional[float] = None
     error_categories: dict[str, Any] = Field(default_factory=dict)
     key_active: bool = True
     created_at: Optional[str] = None
+
+
+class LLMKeyRosterEntry(BaseModel):
+    """One KEY's current status (a multi-key hotkey appears once per slot),
+    from GET /llm-keys/roster -- a precise, near-real-time signal (validator
+    polls it every report-poll cycle) for DEAD/REVOKED transitions,
+    complementing the staleness-timeout backstop in
+    _decay_stale_llm_key_scores() for anything this can't see (e.g. a
+    transient outage between validator and protocol)."""
+
+    hotkey: str
+    key_id: Optional[int] = None
+    slot: int = 0
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    status: str
+    status_reason: Optional[str] = None
+    updated_at: Optional[str] = None
 
 
 class LLMKeyClient:
@@ -104,28 +142,23 @@ class LLMKeyClient:
             if isinstance(item, dict)
         ]
 
-    async def submit_key(
+    async def submit_keys(
         self,
         *,
         hotkey: str,
         uid: Optional[int],
-        provider: str,
-        model: str,
-        encrypted_key_blob: str,
-        blob_encoding: str,
-        pubkey_id_used: str,
+        keys: list[dict[str, Any]],
     ) -> LLMKeySubmitResult:
+        """Relay a miner's key batch (each entry: slot, provider, model,
+        encrypted_key_blob, blob_encoding, pubkey_id_used) in one round trip.
+        The backend answers per-key results plus a legacy aggregate."""
         payload = await self._request_json(
             "POST",
             "/llm-keys/submit",
             json_body={
                 "hotkey": hotkey,
                 "uid": uid,
-                "provider": provider,
-                "model": model,
-                "encrypted_key_blob": encrypted_key_blob,
-                "blob_encoding": blob_encoding,
-                "pubkey_id_used": pubkey_id_used,
+                "keys": keys,
             },
         )
         return LLMKeySubmitResult.model_validate(payload)
@@ -142,6 +175,14 @@ class LLMKeyClient:
         ]
         next_since = payload.get("next_since")
         return reports, next_since
+
+    async def get_key_statuses(self) -> list[LLMKeyRosterEntry]:
+        payload = await self._request_json("GET", "/llm-keys/roster")
+        return [
+            LLMKeyRosterEntry.model_validate(item)
+            for item in payload.get("entries", [])
+            if isinstance(item, dict)
+        ]
 
     async def _request_json(
         self,

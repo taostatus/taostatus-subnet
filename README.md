@@ -5,10 +5,13 @@
 MASXAI is a Bittensor subnet that sources real, working LLM API access from
 its miners and makes it available to an external protocol (the BT Arena
 Protocol) for its own AI agent pipeline. Miners are rewarded for the
-reliability, speed, capability tier, and sustained volume of the access they
-contribute — never for output quality, since the protocol controls every
-prompt and the underlying models are third-party, making output an unfair
-and unmeasurable basis for reward.
+reliability, speed, capability tier, sustained successful volume, and
+per-call output groundedness (self-graded by the calling agent — a property
+of how each call went, not a judgment of the underlying model's general
+ability, which stays unmeasurable since the protocol controls every prompt
+and the models are third-party) of the access they contribute. A key that
+stops working, or keeps producing fabricated/ungrounded output, stops
+earning immediately.
 
 ## Table of contents
 
@@ -24,9 +27,13 @@ and unmeasurable basis for reward.
 - [Repository Structure](#repository-structure)
 - [License](#license)
 
-For the full sequence-level walkthrough — every message exchanged, the exact
-scoring formula applied to a report, and how weight actually reaches the
-chain — see [docs/subnet_flow.md](docs/subnet_flow.md).
+For the full end-to-end walkthrough — how the miner, validator, protocol
+backend, and agents fit together, the exact scoring formula, how weight
+reaches the chain, and a fully worked simulated example with real numbers —
+see [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every environment
+variable across all four components, with example values and what each one
+does in plain language, is in
+[docs/ENV_REFERENCE.md](docs/ENV_REFERENCE.md).
 
 ## Introduction
 

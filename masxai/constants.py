@@ -36,9 +36,21 @@ STATE_FILE = "validator_state.json"
 # open_llm_key_client_from_env() returns None, so the submission/report-poll
 # rounds never run and self.scores (the only driver of weight) stays at zero.
 LLM_KEY_CONTRIB_ENABLED_ENV = "MASXAI_LLM_KEY_CONTRIB_ENABLED"
+# Multi-key config: a JSON array of up to LLM_KEY_MAX_KEYS_PER_HOTKEY
+# entries, [{"provider": "openai", "model": "gpt-4o", "api_key": "sk-..."}].
+# List order is the slot order -- editing slot N's entry replaces slot N's
+# key on the next ask.
+LLM_KEYS_JSON_ENV = "MASXAI_LLM_KEYS_JSON"
+# Legacy single-key triple, still honored as slot 0 when LLM_KEYS_JSON_ENV
+# is unset.
 LLM_KEY_CONTRIB_PROVIDER_ENV = "MASXAI_LLM_KEY_CONTRIB_PROVIDER"
 LLM_KEY_CONTRIB_MODEL_ENV = "MASXAI_LLM_KEY_CONTRIB_MODEL"
 LLM_KEY_CONTRIB_API_KEY_ENV = "MASXAI_LLM_KEY_CONTRIB_API_KEY"
+
+# Mirrors the protocol backend's llm_key_max_keys_per_hotkey. Enforced miner
+# -side (cap what's sent), validator-side (cap what's relayed), and
+# backend-side (slots 0..4 only).
+LLM_KEY_MAX_KEYS_PER_HOTKEY = 5
 
 LLM_KEY_BASE_URL_ENV = "MASXAI_LLM_KEY_BASE_URL"
 LLM_KEY_VALIDATOR_TOKEN_ENV = "MASXAI_LLM_KEY_VALIDATOR_TOKEN"
@@ -72,6 +84,28 @@ LLM_KEY_REPORT_POLL_FAILURE_BACKOFF_SECONDS = 30
 LLM_KEY_HOTKEY_STATUS_EVICTION_GRACE_SECONDS_ENV = "MASXAI_LLM_KEY_HOTKEY_STATUS_EVICTION_GRACE_SECONDS"
 LLM_KEY_HOTKEY_STATUS_EVICTION_GRACE_SECONDS = 24 * 60 * 60
 
+# The protocol reports one row per single call, not a pre-aggregated window
+# -- raw report rows for a hotkey accumulate in Validator.llm_key_pending_calls
+# until LLM_KEY_MIN_CALLS_FOR_SCORING is reached (see llm_key_report_poll_round).
+# A low-traffic key that never reaches that threshold on its own is
+# force-flushed (scored on whatever it has, confidence-floor-damped) after
+# this long, rather than accumulating forever. The protocol's only currently
+# -wired report source is a daily health-check ping per active key, so this
+# gives up to ~5 daily pings (the default call-volume floor) plus one full
+# extra cycle of slack before forcing a score.
+LLM_KEY_PENDING_WINDOW_MAX_SECONDS_ENV = "MASXAI_LLM_KEY_PENDING_WINDOW_MAX_SECONDS"
+LLM_KEY_PENDING_WINDOW_MAX_SECONDS = 7 * 24 * 60 * 60
+
+# A hotkey whose score is positive but hasn't had a fresh usage report in
+# this long gets actively decayed toward zero each poll (see
+# _decay_stale_llm_key_scores) instead of freezing forever -- covers a key
+# that was rejected on resubmission, went DEAD, or was REVOKED, none of
+# which necessarily produce another report to naturally zero it out via the
+# key_active=False path. Set well above the daily health-check cadence so
+# ordinary timing jitter on a healthy, low-traffic key never triggers it.
+LLM_KEY_STALENESS_TIMEOUT_SECONDS_ENV = "MASXAI_LLM_KEY_STALENESS_TIMEOUT_SECONDS"
+LLM_KEY_STALENESS_TIMEOUT_SECONDS = 48 * 60 * 60
+
 # If the validator has accepted keys on file but report polls stay empty for
 # longer than this, warn -- the protocol backend likely isn't feeding usage
 # data (see llm_key_report_poll_round()).
@@ -87,25 +121,64 @@ LLM_KEY_EMA_ALPHA = 0.15
 LLM_KEY_EMA_CONFIDENCE_FLOOR_ENV = "MASXAI_LLM_KEY_EMA_CONFIDENCE_FLOOR"
 LLM_KEY_EMA_CONFIDENCE_FLOOR = 0.2
 
-# Composite = reliability_weight*reliability + latency_weight*latency_score
-#           + volume_weight*volume_score, then scaled by model_tier_weight.
-# Output quality can't be fairly judged here (the protocol controls every
-# prompt, and the models are third-party) -- these three terms plus tier
-# reward only what a miner actually controls: operational reliability,
-# speed, real sustained capacity, and which model tier they bring.
-LLM_KEY_RELIABILITY_WEIGHT = 0.5
-LLM_KEY_LATENCY_WEIGHT = 0.25
+# Composite = reliability_weight*reliability + quality_weight*quality
+#           + latency_weight*latency_score + volume_weight*volume_score,
+# then scaled by model_tier_weight. Reliability stays dominant (a call that
+# fails outright is worse than one that merely produced a mediocre answer).
+# quality_score is self-graded by the calling agent (e.g. Chain-Agent's
+# groundedness/fabrication check) per call and reported alongside
+# success/latency -- it's None (treated as neutral 0.5, not penalized) for
+# any call the agent couldn't grade, which is expected for most traffic.
+LLM_KEY_RELIABILITY_WEIGHT = 0.4
+LLM_KEY_QUALITY_WEIGHT = 0.2
+LLM_KEY_LATENCY_WEIGHT = 0.2
 LLM_KEY_LATENCY_CEILING_SECONDS = 5.0
 LLM_KEY_MIN_CALLS_FOR_SCORING_ENV = "MASXAI_LLM_KEY_MIN_CALLS_FOR_SCORING"
 LLM_KEY_MIN_CALLS_FOR_SCORING = 5      # below this, skip the EMA update (no signal, not a penalty)
 
-# Volume: rewards real sustained capacity, not just call-level pass/fail --
-# a key serving 300 calls should score higher than one serving 3, even at
-# identical success rates. Naturally bounded by acquire_key()'s daily-call
-# cap on the protocol side, so this can't be gamed with unbounded artificial
+# Hard floors: a scored window that trips either one earns 0.0 outright --
+# the additive composite must never let a key that isn't actually working
+# (or is emitting low-quality output) keep collecting the neutral-default
+# quality/latency terms plus volume credit. On top of that, the validator
+# drops the EMA straight to zero (see _record_llm_key_score) when the
+# tripped window carries at least LLM_KEY_MIN_CALLS_FOR_SCORING calls of
+# evidence, so a confirmed-bad key stops earning emission this epoch, not
+# several EMA steps from now. Reliability at exactly the floor still scores.
+LLM_KEY_RELIABILITY_HARD_FLOOR_ENV = "MASXAI_LLM_KEY_RELIABILITY_HARD_FLOOR"
+LLM_KEY_RELIABILITY_HARD_FLOOR = 0.5   # majority-failing window -> key isn't working
+LLM_KEY_QUALITY_HARD_FLOOR_ENV = "MASXAI_LLM_KEY_QUALITY_HARD_FLOOR"
+LLM_KEY_QUALITY_HARD_FLOOR = 0.35      # below Chain-Agent's 0.6 reasoned-INSUFFICIENT, above its 0.1/0.2 bad grades
+# The quality hard floor only applies once this many calls in the window
+# actually carried a measured quality_score -- one self-graded bad reply in
+# an otherwise healthy window is signal for the quality axis, not grounds to
+# zero the whole key.
+LLM_KEY_QUALITY_FLOOR_MIN_GRADED_ENV = "MASXAI_LLM_KEY_QUALITY_FLOOR_MIN_GRADED"
+LLM_KEY_QUALITY_FLOOR_MIN_GRADED = 3
+
+# error_categories values that mean the key itself is unusable at the
+# provider (bad credentials, exhausted budget, region/permission block) --
+# as opposed to transient trouble (rate_limit, timeout, provider_outage),
+# which stays a reliability matter. Matched case-insensitively. Two
+# vocabularies land in the same field: the protocol health check's
+# lowercased KeyValidationStatus values, and the exception class names the
+# agents report verbatim on a failed call. One such report row zeroes the
+# hotkey's score immediately (see llm_key_report_poll_round).
+LLM_KEY_FATAL_ERROR_CATEGORIES = frozenset({
+    "invalid_key",
+    "no_funds_or_budget",
+    "permission_or_region",
+    "authenticationerror",
+    "permissiondeniederror",
+})
+
+# Volume: rewards real sustained *successful* capacity, not just call-level
+# pass/fail -- a key serving 300 good calls should score higher than one
+# serving 3, even at identical success rates, and failed calls never count
+# as delivered volume. Naturally bounded by acquire_key()'s daily-call cap
+# on the protocol side, so this can't be gamed with unbounded artificial
 # call volume.
-LLM_KEY_VOLUME_WEIGHT = 0.25
-LLM_KEY_VOLUME_TARGET_CALLS = 50       # calls per report window considered "fully utilized"
+LLM_KEY_VOLUME_WEIGHT = 0.2
+LLM_KEY_VOLUME_TARGET_CALLS = 50       # successful calls per report window considered "fully utilized"
 
 # Model tier: the one real "quality" lever a miner controls (which model
 # they configure), applied as a final multiplier on the composite above so a

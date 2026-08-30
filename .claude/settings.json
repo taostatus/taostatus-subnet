@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\), f\\) for f in ['app/api/routes/agents.py','app/api/routes/agent_keys.py','app/api/routes/arena_debates.py','app/api/security.py','app/infra/db/models.py','app/infra/db/repository.py','app/main.py','app/core/domain/schemas.py','alembic/versions/010_agents_and_arena_debates.py']]; print\\('syntax OK'\\)\")",
+      "Bash(python3 -c \"import fastapi, sqlalchemy\")"
+    ]
+  }
+}

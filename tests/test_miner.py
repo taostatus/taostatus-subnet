@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from types import SimpleNamespace
 
 from nacl.public import PrivateKey
@@ -31,16 +32,25 @@ def _synapse(hotkey):
 
 def _clear_llm_key_env(monkeypatch):
     monkeypatch.delenv(C.LLM_KEY_CONTRIB_ENABLED_ENV, raising=False)
+    monkeypatch.delenv(C.LLM_KEYS_JSON_ENV, raising=False)
     monkeypatch.delenv(C.LLM_KEY_CONTRIB_PROVIDER_ENV, raising=False)
     monkeypatch.delenv(C.LLM_KEY_CONTRIB_MODEL_ENV, raising=False)
     monkeypatch.delenv(C.LLM_KEY_CONTRIB_API_KEY_ENV, raising=False)
 
 
 def _set_llm_key_env(monkeypatch, *, provider="openai", model="gpt-4o-mini", api_key="sk-test-123"):
+    """Legacy single-key triple -- still honored as slot 0."""
+    _clear_llm_key_env(monkeypatch)
     monkeypatch.setenv(C.LLM_KEY_CONTRIB_ENABLED_ENV, "true")
     monkeypatch.setenv(C.LLM_KEY_CONTRIB_PROVIDER_ENV, provider)
     monkeypatch.setenv(C.LLM_KEY_CONTRIB_MODEL_ENV, model)
     monkeypatch.setenv(C.LLM_KEY_CONTRIB_API_KEY_ENV, api_key)
+
+
+def _set_llm_keys_json_env(monkeypatch, entries):
+    _clear_llm_key_env(monkeypatch)
+    monkeypatch.setenv(C.LLM_KEY_CONTRIB_ENABLED_ENV, "true")
+    monkeypatch.setenv(C.LLM_KEYS_JSON_ENV, json.dumps(entries))
 
 
 def _key_request_synapse(*, allowed_models=None) -> LLMKeySynapse:
@@ -61,7 +71,7 @@ def test_forward_declines_when_not_opted_in(monkeypatch):
     result = asyncio.run(miner.forward(_key_request_synapse()))
 
     assert result.has_key is False
-    assert result.encrypted_key_blob == ""
+    assert result.keys == []
 
 
 def test_forward_declines_when_pubkey_missing(monkeypatch):
@@ -82,10 +92,11 @@ def test_forward_declines_when_model_not_allowed(monkeypatch):
     result = asyncio.run(miner.forward(synapse))
 
     assert result.has_key is False
-    assert result.encrypted_key_blob == ""
+    assert result.keys == []
 
 
 def test_forward_encrypts_when_opted_in_and_allowed(monkeypatch):
+    # Legacy single-key env config still contributes, as slot 0.
     _set_llm_key_env(monkeypatch)
     miner = _miner(_FakeMetagraph())
     synapse = _key_request_synapse(allowed_models=["openai/gpt-4o-mini"])
@@ -93,11 +104,75 @@ def test_forward_encrypts_when_opted_in_and_allowed(monkeypatch):
     result = asyncio.run(miner.forward(synapse))
 
     assert result.has_key is True
-    assert result.provider == "openai"
-    assert result.model == "gpt-4o-mini"
-    assert result.encrypted_key_blob != ""
-    assert result.pubkey_id_used == "v1"
-    assert result.blob_encoding == "nacl-sealedbox-v1"
+    assert len(result.keys) == 1
+    key = result.keys[0]
+    assert key["slot"] == 0
+    assert key["provider"] == "openai"
+    assert key["model"] == "gpt-4o-mini"
+    assert key["encrypted_key_blob"] != ""
+    assert key["pubkey_id_used"] == "v1"
+    assert key["blob_encoding"] == "nacl-sealedbox-v1"
+
+
+def test_forward_sends_every_configured_key_with_stable_slots(monkeypatch):
+    _set_llm_keys_json_env(monkeypatch, [
+        {"provider": "openai", "model": "gpt-4o", "api_key": "sk-a"},
+        {"provider": "openai", "model": "gpt-4o", "api_key": "sk-b"},  # same model twice: capacity stacking
+        {"provider": "anthropic", "model": "claude-3-5-sonnet-20241022", "api_key": "sk-c"},
+    ])
+    miner = _miner(_FakeMetagraph())
+    synapse = _key_request_synapse(
+        allowed_models=["openai/gpt-4o", "anthropic/claude-3-5-sonnet-20241022"],
+    )
+
+    result = asyncio.run(miner.forward(synapse))
+
+    assert result.has_key is True
+    assert [k["slot"] for k in result.keys] == [0, 1, 2]
+    assert [k["model"] for k in result.keys] == [
+        "gpt-4o", "gpt-4o", "claude-3-5-sonnet-20241022",
+    ]
+    # each slot's blob is its own key, independently encrypted
+    assert len({k["encrypted_key_blob"] for k in result.keys}) == 3
+
+
+def test_forward_skips_disallowed_slot_but_keeps_the_rest(monkeypatch):
+    # Slot numbers stay stable even when a middle slot is skipped -- the
+    # backend replaces by slot, so renumbering would swap keys around.
+    _set_llm_keys_json_env(monkeypatch, [
+        {"provider": "openai", "model": "gpt-4o", "api_key": "sk-a"},
+        {"provider": "deepseek", "model": "not-allowed-model", "api_key": "sk-b"},
+        {"provider": "openai", "model": "gpt-4o", "api_key": "sk-c"},
+    ])
+    miner = _miner(_FakeMetagraph())
+    synapse = _key_request_synapse(allowed_models=["openai/gpt-4o"])
+
+    result = asyncio.run(miner.forward(synapse))
+
+    assert [k["slot"] for k in result.keys] == [0, 2]
+
+
+def test_configs_cap_at_max_and_skip_malformed(monkeypatch):
+    from neurons.miner import _llm_key_contrib_configs
+
+    entries = [{"provider": "openai", "model": "gpt-4o", "api_key": f"sk-{i}"} for i in range(7)]
+    entries.insert(2, {"provider": "openai"})  # malformed: no model/api_key
+    _set_llm_keys_json_env(monkeypatch, entries)
+
+    configs = _llm_key_contrib_configs()
+
+    assert len(configs) == C.LLM_KEY_MAX_KEYS_PER_HOTKEY
+    assert all(len(c) == 3 for c in configs)
+
+
+def test_configs_empty_on_malformed_json(monkeypatch):
+    from neurons.miner import _llm_key_contrib_configs
+
+    _clear_llm_key_env(monkeypatch)
+    monkeypatch.setenv(C.LLM_KEY_CONTRIB_ENABLED_ENV, "true")
+    monkeypatch.setenv(C.LLM_KEYS_JSON_ENV, "{not json")
+
+    assert _llm_key_contrib_configs() == []
 
 
 def test_blacklist_requires_permit_unconditionally(monkeypatch):

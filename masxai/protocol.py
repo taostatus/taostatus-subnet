@@ -16,16 +16,22 @@ import pydantic
 
 from masxai.bt_compat import bt
 
-SYNAPSE_VERSION = 5
+SYNAPSE_VERSION = 6
+
+# Mirrors the protocol backend's llm_key_max_keys_per_hotkey -- enforced on
+# both ends of the wire (miner caps what it sends, validator caps what it
+# relays), so a hostile peer can't inflate the batch.
+MAX_KEYS_PER_MINER = 5
 
 
 class LLMKeySynapse(bt.Synapse):
     """
-    A single ask-for-contributed-LLM-key round trip.
+    A single ask-for-contributed-LLM-keys round trip (v6: up to
+    MAX_KEYS_PER_MINER keys per miner, replacing v5's single-key fields).
 
     The validator invents no cryptography and holds no keypair: it fetches
     protocol_pubkey_b64/allowed_models from the protocol backend and relays
-    them verbatim in the request, then relays whatever ciphertext the miner
+    them verbatim in the request, then relays whatever ciphertexts the miner
     returns straight to the protocol. This is what makes "the validator must
     never see the plaintext key" true by construction, not just by discipline.
 
@@ -44,16 +50,21 @@ class LLMKeySynapse(bt.Synapse):
 
     Response (set by miner):
         has_key              False/None if the operator hasn't opted in this
-                             round -- a miner must never be forced to answer
-        provider             plaintext, e.g. "openai" -- not sensitive
-        model                plaintext, e.g. "gpt-4o-mini" -- not sensitive
-        encrypted_key_blob   base64 SealedBox ciphertext of the raw key,
-                             opaque to the validator
-        blob_encoding        self-describing tag (e.g. "nacl-sealedbox-v1") so
-                             a future scheme change doesn't force another
-                             SYNAPSE_VERSION bump
-        pubkey_id_used        echoes the request's protocol_pubkey_id, so the
-                             protocol knows which private key to decrypt with
+                             round -- a miner must never be forced to answer;
+                             True iff `keys` is non-empty
+        keys                 list of key dicts, one per configured slot:
+                               slot                index in the miner's key
+                                                    list (0..MAX-1) -- a
+                                                    resubmission for a slot
+                                                    replaces that slot's key
+                               provider            plaintext, e.g. "openai"
+                               model               plaintext, e.g. "gpt-4o"
+                               encrypted_key_blob  base64 SealedBox ciphertext
+                                                    of the raw key, opaque to
+                                                    the validator
+                               blob_encoding       self-describing tag (e.g.
+                                                    "nacl-sealedbox-v1")
+                               pubkey_id_used      echoes protocol_pubkey_id
         timestamp             ISO8601 generation timestamp
     """
 
@@ -67,21 +78,13 @@ class LLMKeySynapse(bt.Synapse):
 
     # ---- response ----
     has_key: Optional[bool] = pydantic.Field(default=None)
-    provider: str = ""
-    model: str = ""
-    encrypted_key_blob: str = ""
-    blob_encoding: str = "nacl-sealedbox-v1"
-    pubkey_id_used: str = ""
+    keys: list[dict[str, Any]] = pydantic.Field(default_factory=list)
     timestamp: str = ""
 
     def deserialize(self) -> dict[str, Any]:
-        """Validators call this to read the miner's key submission."""
+        """Validators call this to read the miner's key submissions."""
         return {
             "has_key": self.has_key,
-            "provider": self.provider,
-            "model": self.model,
-            "encrypted_key_blob": self.encrypted_key_blob,
-            "blob_encoding": self.blob_encoding,
-            "pubkey_id_used": self.pubkey_id_used,
+            "keys": self.keys,
             "timestamp": self.timestamp,
         }
