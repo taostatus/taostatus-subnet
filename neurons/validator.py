@@ -1,20 +1,37 @@
 """
-neurons/validator.py - MASXAI MVP validator.
+neurons/validator.py - MASXAI validator: LLM-key contribution pipeline.
 
-The validator issues structured forecasting tasks, stores miner forecasts, waits
-for the forecast window to complete, resolves ground truth through objective
-oracles, scores miners, and lets the template weight machinery use self.scores.
+The validator periodically asks each miner to contribute an LLM API key via
+LLMKeySynapse, relays accepted submissions to the protocol backend, polls for
+usage/efficiency reports, and blends a liveness-participation signal with the
+protocol-reported efficiency EMA (self.scores) into on-chain weights.
+
+A miner contributes up to LLM_KEY_MAX_KEYS_PER_HOTKEY (5) keys. The protocol
+reports one row per single call, each tagged with which key served it
+(key_id + provider/model) -- rows accumulate per (hotkey, key) in
+self.llm_key_pending_calls until the hotkey has pooled enough calls to say
+anything meaningful, then get scored as ONE pooled window: reliability/
+quality/latency/volume across all live keys' calls, with the reward-tier
+multiplier blended per call from each row's own model (see
+llm_key_report_poll_round / _maybe_flush_pending).
+
+A confirmed-bad KEY stops earning immediately, not gradually -- but only
+that key: a report row with key_active=False, a DEAD/REVOKED roster entry, a
+fatal auth/billing error category, or a per-key sub-window that trips a hard
+floor cuts exactly that key's recent traffic share out of the hotkey's score
+(_kill_hotkey_key); the hotkey hard-zeroes only when its LAST live key dies
+(_zero_llm_key_score), or when a full pooled window itself trips a floor
+(the whole fleet is failing). Gradual EMA decay is reserved for the one case
+where nothing is confirmed -- a hotkey whose reports simply went stale
+(_decay_stale_llm_key_scores), where silence isn't yet proof of a bad key.
 """
 
 import asyncio
-import hashlib
 import json
 import os
 import sys
 import time
 import uuid
-from collections import defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -22,20 +39,18 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from masxai.protocol import ForecastSynapse, ForecastEventType
+from masxai.protocol import LLMKeySynapse
 from masxai import constants as C
-from masxai import oracle
 from masxai.bt_compat import bt
 from masxai.env import load_env
-from masxai.oracle_bt import (
-    BtForecastQuestion,
-    BtForecastResolution,
-    bt_forecast_required_from_env,
-    bt_forecast_run_id_from_env,
-    open_bt_forecast_client_from_env,
-    parse_api_timestamp,
+from masxai.llm_key_client import open_llm_key_client_from_env
+from masxai.scoring import (
+    ema_update,
+    has_fatal_error_category,
+    llm_key_efficiency_score,
+    sanitize_latency_ms,
+    sanitize_quality_score,
 )
-from masxai.scoring import brier_score, ema_update, score_structured_forecast
 
 try:
     from template.base.validator import BaseValidatorNeuron
@@ -51,28 +66,10 @@ except Exception:
             return None
 
 
-def _parse_timestamp(value: str) -> Optional[float]:
-    if not value:
-        return None
-    try:
-        normalized = value.replace("Z", "+00:00")
-        return datetime.fromisoformat(normalized).timestamp()
-    except Exception:
-        return None
-
-
 def _env_float(name: str, default: float) -> float:
     load_env()
     try:
         return float(os.getenv(name, default))
-    except ValueError:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    load_env()
-    try:
-        return int(os.getenv(name, default))
     except ValueError:
         return default
 
@@ -83,6 +80,14 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    load_env()
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def _repo_root() -> Path:
@@ -104,41 +109,42 @@ class Validator(BaseValidatorNeuron):
     def __init__(self, config=None):
         load_env()
         super().__init__(config=config)
-        # pending[key] = structured forecast response plus resolver state.
-        # Central BT-Forecast keys are deterministic by run/question/miner.
-        self.pending: dict[str, dict] = {}
-        self.issued_questions: dict[str, float] = {}
-        self.feedback_queue: list[dict[str, Any]] = []
-        self.bt_forecast_runs: dict[str, dict[str, Any]] = {}
-        # Interim liveness signal: uid -> EMA of valid-response participation,
-        # separate from self.scores (the resolved-accuracy EMA).
+        # Liveness signal: uid -> EMA of "responded to the LLM-key ask this
+        # round," independent of whether the miner actually had a key to
+        # contribute. Never a value/correctness signal.
         self.participation_scores: dict[int, float] = {}
-        self.bt_forecast_client = open_bt_forecast_client_from_env()
-        self.bt_forecast_required = bt_forecast_required_from_env()
-        self.resolved_count = 0
-        self.last_issue_at = 0.0
-        # Gate scoring/weight emission to one cadence per forecast horizon.
-        self.last_resolution_at = 0.0
-        self.last_weights_set_at = 0.0
-        self.last_weights_resolved_count = 0
+        # None (unconfigured) is this pipeline's kill switch, checked before
+        # every submission/report-poll round. self.scores (inherited from
+        # BaseValidatorNeuron) is the persisted LLM-key efficiency EMA.
+        self.llm_key_client = open_llm_key_client_from_env()
+        self.llm_key_hotkey_status: dict[str, dict[str, Any]] = {}
+        # Rolling per-hotkey accumulator of raw single-call reports not yet
+        # scored -- see module docstring. Persisted so a validator restart
+        # doesn't lose a low-traffic hotkey's partial progress toward the
+        # volume floor.
+        self.llm_key_pending_calls: dict[str, dict[str, Any]] = {}
+        self.last_llm_key_ask_at = 0.0
+        self.last_llm_key_report_poll_at = 0.0
+        self.last_llm_key_report_cursor: str = ""
+        # In-memory only (not persisted): tracks how long report polls have
+        # come back empty despite accepted keys on file. See
+        # llm_key_report_poll_round()'s empty-reports warning.
+        self.llm_key_reports_empty_since: float = 0.0
         self.load_masxai_state()
         bt.logging.info(
             "MASXAI validator initialized | "
-            f"bt_forecast_enabled={self.bt_forecast_client is not None} "
-            f"bt_forecast_required={self.bt_forecast_required} "
+            f"llm_key_enabled={self.llm_key_client is not None} "
             f"state_file={_state_file_path()}"
         )
 
     # ---------------------------------------------------------------- state
     def load_masxai_state(self):
-        if not hasattr(self, "issued_questions"):
-            self.issued_questions = {}
-        if not hasattr(self, "feedback_queue"):
-            self.feedback_queue = []
-        if not hasattr(self, "bt_forecast_runs"):
-            self.bt_forecast_runs = {}
         if not hasattr(self, "participation_scores"):
             self.participation_scores = {}
+        if not hasattr(self, "llm_key_hotkey_status"):
+            self.llm_key_hotkey_status = {}
+        if not hasattr(self, "llm_key_pending_calls"):
+            self.llm_key_pending_calls = {}
         state_path = _state_file_path()
         if not state_path.exists():
             bt.logging.info(f"validator state file not found: {state_path}")
@@ -146,23 +152,22 @@ class Validator(BaseValidatorNeuron):
         try:
             with state_path.open("r") as f:
                 s = json.load(f)
-            self.pending = s.get("pending", {})
-            sanitized = self._sanitize_fallback_pending()
-            self.issued_questions = {
-                str(k): float(v) for k, v in s.get("issued_questions", {}).items()
-            }
-            self.feedback_queue = list(s.get("feedback_queue", []))
-            self.bt_forecast_runs = {
-                str(k): v
-                for k, v in s.get("bt_forecast_runs", {}).items()
-                if isinstance(v, dict)
-            }
-            self.resolved_count = s.get("resolved_count", 0)
-            self.last_issue_at = float(s.get("last_issue_at", 0.0))
             self.participation_scores = {
                 int(k): float(v) for k, v in s.get("participation_scores", {}).items()
             }
-            pruned = self.prune_masxai_state()
+            self.llm_key_hotkey_status = {
+                str(k): v
+                for k, v in s.get("llm_key_hotkey_status", {}).items()
+                if isinstance(v, dict)
+            }
+            self.llm_key_pending_calls = {
+                str(k): self._migrate_pending_entry(v)
+                for k, v in s.get("llm_key_pending_calls", {}).items()
+                if isinstance(v, dict)
+            }
+            self.last_llm_key_ask_at = float(s.get("last_llm_key_ask_at", 0.0))
+            self.last_llm_key_report_poll_at = float(s.get("last_llm_key_report_poll_at", 0.0))
+            self.last_llm_key_report_cursor = str(s.get("last_llm_key_report_cursor", ""))
             scores = s.get("scores")
             if scores is not None:
                 arr = np.array(scores, dtype=np.float32)
@@ -176,58 +181,56 @@ class Validator(BaseValidatorNeuron):
                     copy_len = min(len(arr), len(self.scores))
                     self.scores[:copy_len] = arr[:copy_len]
             bt.logging.info(
-                f"loaded state from {state_path}: {len(self.pending)} pending, "
-                f"{self.resolved_count} resolved, "
-                f"{len(self.feedback_queue)} feedback payload(s) queued"
+                f"loaded state from {state_path}: "
+                f"{len(self.llm_key_hotkey_status)} hotkey(s) tracked"
             )
-            if sanitized:
-                bt.logging.info(
-                    f"normalized {sanitized} fallback forecast(s) to no-answer"
-                )
-            if any(pruned.values()):
-                bt.logging.info(f"pruned validator state on load: {pruned}")
         except Exception as e:  # noqa: BLE001
             bt.logging.warning(f"could not load state, starting fresh: {e}")
 
-    def _sanitize_fallback_pending(self) -> int:
-        sanitized = 0
-        for forecast in self.pending.values():
-            if not self._is_no_answer_model(forecast.get("model")):
-                continue
-            if (
-                forecast.get("probability") is not None
-                or forecast.get("prediction") is not None
-                or forecast.get("confidence") is not None
-            ):
-                sanitized += 1
-            forecast["probability"] = None
-            forecast["prediction"] = None
-            forecast["confidence"] = None
-        return sanitized
+    @staticmethod
+    def _migrate_pending_entry(entry: dict) -> dict:
+        """Upgrade a pre-multi-key pending accumulator (flat per-hotkey
+        counters) into the per-key shape: the old counters become one
+        "legacy" sub-accumulator with an unresolved tier (tier None resolves
+        at flush via the submission-time fallback). Current-shape entries
+        pass through untouched, so this is idempotent."""
+        if "keys" in entry:
+            return entry
+        if "success_count" not in entry:
+            return {"keys": {}, "first_seen_at": entry.get("first_seen_at", 0.0),
+                    "last_seen_at": entry.get("last_seen_at", 0.0)}
+        return {
+            "keys": {
+                "legacy": {
+                    "success_count": entry.get("success_count", 0),
+                    "failure_count": entry.get("failure_count", 0),
+                    "latency_ms_weighted_sum": entry.get("latency_ms_weighted_sum", 0.0),
+                    "latency_weighted_count": entry.get("latency_weighted_count", 0),
+                    "quality_weighted_sum": entry.get("quality_weighted_sum", 0.0),
+                    "quality_weighted_count": entry.get("quality_weighted_count", 0),
+                    "tier": None,
+                },
+            },
+            "first_seen_at": entry.get("first_seen_at", 0.0),
+            "last_seen_at": entry.get("last_seen_at", 0.0),
+        }
 
     def save_masxai_state(self):
         try:
-            pruned = self.prune_masxai_state()
-            if any(pruned.values()):
-                bt.logging.info(f"pruned validator state before save: {pruned}")
             state_path = _state_file_path()
             state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = state_path.with_name(f"{state_path.name}.tmp")
             with tmp_path.open("w") as f:
                 json.dump(
                     {
-                        "pending": self.pending,
-                        "issued_questions": self.issued_questions,
-                        "feedback_queue": self.feedback_queue,
-                        "bt_forecast_runs": self.bt_forecast_runs,
-                        "resolved_count": self.resolved_count,
-                        "last_issue_at": self.last_issue_at,
                         "participation_scores": {
                             str(uid): score for uid, score in self.participation_scores.items()
                         },
-                        "last_resolution_at": self.last_resolution_at,
-                        "last_weights_set_at": self.last_weights_set_at,
-                        "last_weights_resolved_count": self.last_weights_resolved_count,
+                        "llm_key_hotkey_status": self.llm_key_hotkey_status,
+                        "llm_key_pending_calls": self.llm_key_pending_calls,
+                        "last_llm_key_ask_at": self.last_llm_key_ask_at,
+                        "last_llm_key_report_poll_at": self.last_llm_key_report_poll_at,
+                        "last_llm_key_report_cursor": self.last_llm_key_report_cursor,
                         "scores": self.scores.tolist(),
                     },
                     f,
@@ -236,166 +239,539 @@ class Validator(BaseValidatorNeuron):
         except Exception as e:  # noqa: BLE001
             bt.logging.warning(f"could not save state: {e}")
 
-    def prune_masxai_state(self, *, now: Optional[float] = None) -> dict[str, int]:
-        """Keep persisted validator state bounded and safe to read after restarts."""
-        now = time.time() if now is None else now
-        stats = {
-            "malformed_pending": 0,
-            "stale_pending": 0,
-            "old_runs": 0,
-            "feedback": 0,
-        }
-
-        resolution_wait = _env_float(
-            C.BT_FORECAST_RESOLUTION_WAIT_SECONDS_ENV,
-            C.BT_FORECAST_RESOLUTION_WAIT_SECONDS,
-        )
-        for fid, forecast in list(getattr(self, "pending", {}).items()):
-            if not isinstance(forecast, dict):
-                self.pending.pop(fid, None)
-                stats["malformed_pending"] += 1
-                continue
-            try:
-                resolve_at = float(forecast.get("resolve_at") or 0.0)
-            except (TypeError, ValueError):
-                self.pending.pop(fid, None)
-                stats["malformed_pending"] += 1
-                continue
-            if resolve_at <= 0.0:
-                self.pending.pop(fid, None)
-                stats["malformed_pending"] += 1
-                continue
-            if (
-                forecast.get("source") == "bt_forecast"
-                and now - resolve_at > resolution_wait
-            ):
-                self.pending.pop(fid, None)
-                stats["stale_pending"] += 1
-
-        max_feedback = max(
-            0,
-            _env_int(
-                C.BT_FORECAST_FEEDBACK_QUEUE_MAX_ENV,
-                C.BT_FORECAST_FEEDBACK_QUEUE_MAX,
-            ),
-        )
-        if max_feedback and len(getattr(self, "feedback_queue", [])) > max_feedback:
-            overflow = len(self.feedback_queue) - max_feedback
-            self.feedback_queue = self.feedback_queue[-max_feedback:]
-            stats["feedback"] = overflow
-
-        retention_seconds = max(
-            0.0,
-            _env_float(
-                C.BT_FORECAST_RUN_STATE_RETENTION_SECONDS_ENV,
-                C.BT_FORECAST_RUN_STATE_RETENTION_SECONDS,
-            ),
-        )
-        pending_runs = {
-            str(forecast.get("run_id"))
-            for forecast in getattr(self, "pending", {}).values()
-            if isinstance(forecast, dict) and forecast.get("source") == "bt_forecast"
-        }
-        for run_id, run_state in list(getattr(self, "bt_forecast_runs", {}).items()):
-            if run_id in pending_runs:
-                continue
-            if not isinstance(run_state, dict):
-                self.bt_forecast_runs.pop(run_id, None)
-                stats["old_runs"] += 1
-                continue
-            last_seen = self._bt_run_last_seen_timestamp(str(run_id), run_state)
-            if (
-                retention_seconds > 0.0
-                and last_seen is not None
-                and now - last_seen > retention_seconds
-            ):
-                self.bt_forecast_runs.pop(run_id, None)
-                stats["old_runs"] += 1
-        return stats
-
     # ------------------------------------------------------------- weights
-    def _has_scored_weights(self) -> bool:
-        """True only after real resolutions have produced positive miner scores."""
-        resolved_count = int(getattr(self, "resolved_count", 0) or 0)
-        if resolved_count < self._min_resolved_before_weights():
-            return False
-
-        scores = getattr(self, "scores", None)
-        if scores is None:
-            return False
-        score_array = np.nan_to_num(
-            np.asarray(scores, dtype=np.float32),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        positive_scores = int(np.count_nonzero(score_array > 0.0))
-        return positive_scores >= self._min_allowed_weight_count()
-
-    def _min_resolved_before_weights(self) -> int:
-        return max(
-            1,
-            _env_int(
-                C.MIN_RESOLVED_BEFORE_WEIGHTS_ENV,
-                C.MIN_RESOLVED_BEFORE_WEIGHTS,
-            ),
-        )
-
-    def _min_allowed_weight_count(self) -> int:
-        try:
-            return max(
-                1,
-                int(self.subtensor.min_allowed_weights(netuid=self.config.netuid)),
-            )
-        except Exception:
-            return 1
-
     def _record_participation(self, uid: int) -> None:
-        """Bump a miner's interim liveness score for a valid, well-formed response.
+        """Bump a miner's liveness score for answering the LLM-key ask this
+        round, whether or not it had a key to contribute.
 
-        This is never a correctness signal (no ground truth exists yet) - it only
-        keeps miners who are actively answering from earning zero weight while
-        their forecasts are pending resolution.
+        This is tracked purely for observability (is this miner's software
+        online and responsive at all) and is never a value/correctness
+        signal. It deliberately does NOT feed into submitted chain weight -
+        see _blended_weight_array(): weight is earned only through a
+        confirmed, currently-active contributed key, never merely by
+        answering the ask.
         """
         alpha = _env_float(C.PARTICIPATION_EMA_ALPHA_ENV, C.PARTICIPATION_EMA_ALPHA)
         prev = self.participation_scores.get(int(uid), 0.0)
         self.participation_scores[int(uid)] = ema_update(prev, C.PARTICIPATION_REWARD, alpha=alpha)
 
-    def _blended_weight_array(self) -> np.ndarray:
-        """Combine interim participation with resolved accuracy for submission.
+    def _model_tier_weight(self, hotkey: str) -> float:
+        """Legacy fallback tier: the provider/model this hotkey submitted
+        back when it was single-key (stored flat on its status entry).
+        Only consulted for report rows that carry no key identity of their
+        own (pre-multi-key backend rows, or a migrated pending window) --
+        every current row's tier comes from _tier_for_report() instead.
+        Unknown/unlisted provider+model falls back to the default tier
+        rather than erroring or scoring zero."""
+        status = self.llm_key_hotkey_status.get(hotkey, {})
+        key = f"{status.get('provider', '')}/{status.get('model', '')}"
+        return C.LLM_KEY_MODEL_TIER_WEIGHTS.get(key, C.LLM_KEY_MODEL_TIER_DEFAULT_WEIGHT)
 
-        Before enough forecasts have resolved, weights are participation-only so
-        the validator still submits every epoch (keeping it "active" for Yuma
-        consensus) without rewarding unresolved accuracy. Once real resolutions
-        exist, accuracy dominates and participation is a small blended share.
+    def _tier_for_report(self, hotkey: str, report) -> float:
+        """Reward tier for one usage row: taken from the row's OWN
+        provider/model (each call is worth its own model's tier -- this is
+        what makes a mixed 5-key fleet blend correctly and keeps stacked
+        cheap keys from borrowing a top-tier multiplier), falling back to
+        the legacy submission-time lookup for rows without key identity."""
+        if report.provider and report.model:
+            return C.LLM_KEY_MODEL_TIER_WEIGHTS.get(
+                f"{report.provider}/{report.model}", C.LLM_KEY_MODEL_TIER_DEFAULT_WEIGHT
+            )
+        return self._model_tier_weight(hotkey)
+
+    @staticmethod
+    def _report_sub_key(report) -> str:
+        """Stable per-key bucket id for a usage row: the backend's key row id
+        when present (stable across slot replacements), else provider/model,
+        else a single legacy bucket -- so old-backend rows degrade to
+        exactly the previous one-key-per-hotkey behavior."""
+        if getattr(report, "key_id", None) is not None:
+            return str(report.key_id)
+        if getattr(report, "provider", None) and getattr(report, "model", None):
+            return f"{report.provider}/{report.model}"
+        return "legacy"
+
+    def _record_llm_key_score(
+        self,
+        uid: int,
+        *,
+        hotkey: str,
+        success_count: int,
+        failure_count: int,
+        avg_latency_ms: Optional[float],
+        key_active: bool,
+        quality_score: Optional[float] = None,
+        min_calls_for_scoring: Optional[int] = None,
+        quality_call_count: Optional[int] = None,
+        model_tier_weight: Optional[float] = None,
+    ) -> None:
+        """EMA-update self.scores[uid] (the persisted LLM-key efficiency EMA)
+        from one aggregated usage window -- a single raw per-call report row
+        never has enough volume to score on its own (the protocol reports
+        one row per call), so callers pass the sum across
+        self.llm_key_pending_calls's rolling accumulator (see
+        llm_key_report_poll_round), not a raw report object directly.
+
+        A None reward (not enough call volume yet) is skipped rather than
+        EMA'd in as a zero - a quiet key isn't a bad key.
+
+        A 0.0 reward is where emission actually stops: an inactive key, or a
+        window that tripped a hard floor (majority failures / confirmed
+        low-quality output) while carrying at least the configured
+        call-volume floor of evidence, hard-zeroes the score outright
+        instead of riding the EMA down over many polls. Only an
+        under-volume force-flushed window (min_calls_for_scoring lowered to
+        1 by _maybe_flush_pending) that happens to score 0.0 still takes
+        the damped EMA path -- one bad call is not confirmation.
         """
-        n = int(self.metagraph.n)
-        participation = np.zeros(n, dtype=np.float32)
-        for uid, score in self.participation_scores.items():
-            if 0 <= int(uid) < n:
-                participation[int(uid)] = float(score)
+        avg_latency_s = avg_latency_ms / 1000.0 if avg_latency_ms is not None else None
+        configured_min_calls = _env_int(
+            C.LLM_KEY_MIN_CALLS_FOR_SCORING_ENV, C.LLM_KEY_MIN_CALLS_FOR_SCORING
+        )
+        if min_calls_for_scoring is None:
+            min_calls_for_scoring = configured_min_calls
+        if model_tier_weight is None:
+            # Legacy fallback -- callers with a pooled multi-key window pass
+            # the per-call blended tier explicitly.
+            model_tier_weight = self._model_tier_weight(hotkey)
+        reward = llm_key_efficiency_score(
+            success_count=success_count,
+            failure_count=failure_count,
+            avg_latency_s=avg_latency_s,
+            key_active=key_active,
+            quality_score=quality_score,
+            model_tier_weight=model_tier_weight,
+            min_calls_for_scoring=min_calls_for_scoring,
+            quality_call_count=quality_call_count,
+            reliability_floor=_env_float(
+                C.LLM_KEY_RELIABILITY_HARD_FLOOR_ENV, C.LLM_KEY_RELIABILITY_HARD_FLOOR
+            ),
+            quality_floor=_env_float(
+                C.LLM_KEY_QUALITY_HARD_FLOOR_ENV, C.LLM_KEY_QUALITY_HARD_FLOOR
+            ),
+            quality_floor_min_graded=_env_int(
+                C.LLM_KEY_QUALITY_FLOOR_MIN_GRADED_ENV, C.LLM_KEY_QUALITY_FLOOR_MIN_GRADED
+            ),
+        )
+        if reward is None:
+            return
+        total_calls = success_count + failure_count
+        if reward <= 0.0 and (not key_active or total_calls >= configured_min_calls):
+            self._zero_llm_key_score(
+                uid,
+                hotkey=hotkey,
+                reason=(
+                    "protocol reported key inactive"
+                    if not key_active
+                    else f"hard floor tripped on a full window "
+                    f"({success_count} ok / {failure_count} failed, quality={quality_score})"
+                ),
+            )
+            return
+        alpha = _env_float(C.LLM_KEY_EMA_ALPHA_ENV, C.LLM_KEY_EMA_ALPHA)
+        # Scale down the EMA step for low-volume windows so a single noisy
+        # call doesn't swing self.scores at full weight. (An inactive key
+        # never reaches here -- it hard-zeroes above.)
+        confidence = min(1.0, total_calls / C.LLM_KEY_VOLUME_TARGET_CALLS)
+        floor = _env_float(C.LLM_KEY_EMA_CONFIDENCE_FLOOR_ENV, C.LLM_KEY_EMA_CONFIDENCE_FLOOR)
+        alpha *= max(floor, confidence)
+        uid = int(uid)
+        if 0 <= uid < len(self.scores):
+            self.scores[uid] = ema_update(float(self.scores[uid]), reward, alpha=alpha)
+        else:
+            bt.logging.warning(
+                f"llm-key: uid={uid} out of range for scores array (len={len(self.scores)}); "
+                f"dropping score update for hotkey={hotkey} (metagraph resize race?)"
+            )
 
-        if not self._has_scored_weights():
-            return participation
+    def _zero_llm_key_score(self, uid: int, *, hotkey: str, reason: str) -> None:
+        """Immediate emission cut for a confirmed-bad key: score drops to 0.0
+        outright, so the miner earns nothing from the very next weight
+        submission. Used for every signal strong enough to be conclusive --
+        key_active=False report, DEAD/REVOKED roster status, a fatal
+        auth/billing error category, or a full scored window below a hard
+        floor. Contrast _decay_score_toward_zero, the gradual path reserved
+        for mere staleness, where silence isn't yet proof."""
+        uid = int(uid)
+        if not (0 <= uid < len(self.scores)):
+            bt.logging.warning(
+                f"llm-key: uid={uid} out of range for scores array (len={len(self.scores)}); "
+                f"dropping score zero for hotkey={hotkey} (metagraph resize race?)"
+            )
+            return
+        if float(self.scores[uid]) > 0.0:
+            bt.logging.info(
+                f"llm-key: zeroing score for uid={uid} hotkey={hotkey} -- {reason}"
+            )
+        self.scores[uid] = 0.0
 
-        accuracy = np.nan_to_num(
+    def _hotkey_key_states(self, hotkey: str) -> dict[str, dict[str, Any]]:
+        """The per-key tracking map inside a hotkey's status entry, keyed by
+        the same sub-key scheme as _report_sub_key (created lazily so legacy
+        state entries keep working untouched)."""
+        status = self.llm_key_hotkey_status.setdefault(hotkey, {})
+        return status.setdefault("keys", {})
+
+    def _kill_hotkey_key(self, uid: int, hotkey: str, sub_key: str, *, reason: str) -> None:
+        """Immediate, surgical emission cut for ONE confirmed-bad key of a
+        multi-key hotkey: drop its pending rows, mark it locally dead, and
+        cut its recent traffic share out of the hotkey's score -- the
+        healthy sibling keys keep earning their part undisturbed. When the
+        last live key dies, this degenerates to the full hard zero. Safe to
+        call repeatedly (the roster re-reports DEAD every poll): a key
+        already marked dead is a no-op, so the share can never be
+        double-deducted."""
+        key_states = self._hotkey_key_states(hotkey)
+        entry = key_states.setdefault(sub_key, {})
+        if entry.get("alive") is False:
+            return  # already killed -- never deduct the share twice
+        entry["alive"] = False
+        entry["killed_reason"] = reason
+
+        # Recent-traffic share: this key's calls vs the hotkey's total,
+        # over the current pending window plus the last flushed one.
+        acc = self.llm_key_pending_calls.get(hotkey)
+        pending_subs = (acc or {}).get("keys", {})
+
+        def _calls(sub: dict) -> int:
+            return int(sub.get("success_count", 0)) + int(sub.get("failure_count", 0))
+
+        dead_calls = _calls(pending_subs.get(sub_key, {})) + int(entry.get("last_window_calls", 0))
+        total_calls = sum(_calls(sub) for sub in pending_subs.values()) + sum(
+            int(state.get("last_window_calls", 0)) for state in key_states.values()
+        )
+
+        # Its rows are moot once the key is confirmed dead.
+        if acc is not None:
+            pending_subs.pop(sub_key, None)
+            if not pending_subs:
+                self.llm_key_pending_calls.pop(hotkey, None)
+
+        live = [k for k, state in key_states.items() if state.get("alive", True)]
+        if not live:
+            self._zero_llm_key_score(uid, hotkey=hotkey, reason=f"last live key killed: {reason}")
+            return
+
+        if total_calls > 0 and dead_calls > 0:
+            share = dead_calls / total_calls
+        else:
+            # No traffic evidence either way -- assume an equal split among
+            # the keys that existed before this kill.
+            share = 1.0 / (len(live) + 1)
+        share = max(0.0, min(1.0, share))
+        uid = int(uid)
+        if 0 <= uid < len(self.scores) and float(self.scores[uid]) > 0.0:
+            old = float(self.scores[uid])
+            self.scores[uid] = old * (1.0 - share)
+            bt.logging.info(
+                f"llm-key: killed key {sub_key} of hotkey={hotkey} ({reason}); "
+                f"cut {share:.0%} recent-traffic share from uid={uid} "
+                f"({old:.4f} -> {float(self.scores[uid]):.4f}), {len(live)} live key(s) remain"
+            )
+
+    def _decay_score_toward_zero(self, uid: int) -> None:
+        """One EMA step toward a reward of 0.0 -- the gradual mechanic behind
+        the staleness-timeout decay, for the one case where nothing is
+        confirmed bad yet (reports simply stopped coming). Every
+        confirmed-bad signal hard-zeroes via _zero_llm_key_score instead."""
+        uid = int(uid)
+        if 0 <= uid < len(self.scores):
+            alpha = _env_float(C.LLM_KEY_EMA_ALPHA_ENV, C.LLM_KEY_EMA_ALPHA)
+            self.scores[uid] = ema_update(float(self.scores[uid]), 0.0, alpha=alpha)
+
+    def _decay_stale_llm_key_scores(self, now: float) -> None:
+        """A hotkey whose score is positive but hasn't had a fresh usage
+        report in LLM_KEY_STALENESS_TIMEOUT_SECONDS gets actively decayed
+        toward zero each poll, instead of freezing forever. Covers a key
+        that was rejected on resubmission, went DEAD, or was REVOKED --
+        none of which necessarily produce another report to zero it out via
+        the key_active=False path, since a rejected/revoked hotkey simply
+        stops being reported on at all. Backstop for anything
+        _poll_llm_key_roster's faster, precise signal can't see (a
+        transient outage, or an older protocol without that endpoint)."""
+        timeout = max(
+            0.0,
+            _env_float(
+                C.LLM_KEY_STALENESS_TIMEOUT_SECONDS_ENV, C.LLM_KEY_STALENESS_TIMEOUT_SECONDS
+            ),
+        )
+        for hotkey, status in self.llm_key_hotkey_status.items():
+            uid = status.get("uid")
+            if uid is None or not (0 <= int(uid) < len(self.scores)):
+                continue
+            if float(self.scores[int(uid)]) <= 0.0:
+                continue
+            last_report_at = status.get("last_report_at")
+            if last_report_at is None:
+                continue
+            if now - float(last_report_at) >= timeout:
+                self._decay_score_toward_zero(int(uid))
+
+    async def _poll_llm_key_roster(self) -> None:
+        """Precise, near-real-time per-key DEAD/REVOKED detection via
+        GET /llm-keys/roster (one entry per key): the protocol has confirmed
+        that key is gone, so its contribution is cut immediately -- no
+        emission on a dead key for even one more epoch -- rather than
+        waiting out LLM_KEY_STALENESS_TIMEOUT_SECONDS. A hotkey's healthy
+        sibling keys are untouched; the hotkey hard-zeroes only when its
+        last live key dies. Idempotent across polls (the roster re-reports
+        DEAD forever; _kill_hotkey_key no-ops on an already-dead key).
+        Best-effort -- a failure here just falls back to the
+        staleness-timeout backstop."""
+        client = self.llm_key_client
+        if client is None:
+            return
+        try:
+            roster = await client.get_key_statuses()
+        except Exception as e:  # noqa: BLE001
+            bt.logging.warning(f"llm-key: roster poll failed: {e}")
+            return
+        for entry in roster:
+            if entry.status not in ("DEAD", "REVOKED"):
+                continue
+            status = self.llm_key_hotkey_status.get(entry.hotkey)
+            if status is None:
+                continue
+            uid = status.get("uid")
+            if uid is None or not (0 <= int(uid) < len(self.scores)):
+                continue
+            if entry.key_id is not None:
+                sub_key = str(entry.key_id)
+            elif entry.provider and entry.model:
+                sub_key = f"{entry.provider}/{entry.model}"
+            else:
+                sub_key = "legacy"
+            self._kill_hotkey_key(
+                int(uid),
+                entry.hotkey,
+                sub_key,
+                reason=f"roster reports key {entry.status}",
+            )
+
+    def _fold_report_into_pending(self, hotkey: str, report, now: float) -> None:
+        """Fold one raw single-call usage-report row into its key's
+        sub-accumulator inside the hotkey's rolling window. A malformed row
+        (negative counts) is dropped entirely -- consistent with
+        llm_key_efficiency_score()'s "skip, don't guess" treatment of the
+        same condition; latency/quality are sanitized and weighted-averaged
+        independently, so a bad reading in one never disqualifies the row's
+        contribution to the other.
+
+        A successful row also revives a locally-killed key: a replaced slot
+        keeps its backend key_id, so fresh working traffic on it is direct
+        evidence the miner swapped in a working key."""
+        if report.success_count < 0 or report.failure_count < 0:
+            bt.logging.warning(
+                f"llm-key: dropping malformed report for hotkey={hotkey} "
+                f"(negative success/failure count: {report.success_count}/{report.failure_count})"
+            )
+            return
+        acc = self.llm_key_pending_calls.setdefault(
+            hotkey, {"keys": {}, "first_seen_at": now, "last_seen_at": now},
+        )
+        sub_key = self._report_sub_key(report)
+        sub = acc["keys"].setdefault(
+            sub_key,
+            {
+                "success_count": 0,
+                "failure_count": 0,
+                "latency_ms_weighted_sum": 0.0,
+                "latency_weighted_count": 0,
+                "quality_weighted_sum": 0.0,
+                "quality_weighted_count": 0,
+                "tier": self._tier_for_report(hotkey, report),
+            },
+        )
+        # Refresh the tier each fold -- a replaced slot keeps its key_id but
+        # may declare a different model.
+        sub["tier"] = self._tier_for_report(hotkey, report)
+        row_calls = report.success_count + report.failure_count
+        sub["success_count"] += report.success_count
+        sub["failure_count"] += report.failure_count
+        latency = sanitize_latency_ms(report.avg_latency_ms)
+        if latency is not None and row_calls > 0:
+            sub["latency_ms_weighted_sum"] += latency * row_calls
+            sub["latency_weighted_count"] += row_calls
+        quality = sanitize_quality_score(getattr(report, "avg_quality_score", None))
+        if quality is not None and row_calls > 0:
+            sub["quality_weighted_sum"] += quality * row_calls
+            sub["quality_weighted_count"] += row_calls
+        acc["last_seen_at"] = now
+
+        if report.success_count > 0:
+            entry = self._hotkey_key_states(hotkey).setdefault(sub_key, {})
+            if getattr(report, "provider", None):
+                entry["provider"] = report.provider
+                entry["model"] = report.model
+            if entry.get("alive") is False:
+                entry["alive"] = True
+                entry.pop("killed_reason", None)
+                bt.logging.info(
+                    f"llm-key: key {sub_key} of hotkey={hotkey} is serving successful "
+                    "calls again (slot replaced or recovered); reviving it"
+                )
+
+    def _sub_window_floor_reason(self, sub: dict, *, min_calls: int) -> Optional[str]:
+        """Does one key's sub-window, on its own evidence, trip a hard floor?
+        Only conclusive at the configured call-volume floor -- a couple of
+        bad calls is signal, not a verdict."""
+        total = int(sub.get("success_count", 0)) + int(sub.get("failure_count", 0))
+        if total < min_calls:
+            return None
+        reliability_floor = _env_float(
+            C.LLM_KEY_RELIABILITY_HARD_FLOOR_ENV, C.LLM_KEY_RELIABILITY_HARD_FLOOR
+        )
+        if sub.get("success_count", 0) / total < reliability_floor:
+            return (
+                f"per-key reliability floor ({sub['success_count']} ok / "
+                f"{sub['failure_count']} failed)"
+            )
+        qcount = int(sub.get("quality_weighted_count", 0))
+        min_graded = _env_int(
+            C.LLM_KEY_QUALITY_FLOOR_MIN_GRADED_ENV, C.LLM_KEY_QUALITY_FLOOR_MIN_GRADED
+        )
+        if qcount >= min_graded:
+            avg_quality = sub["quality_weighted_sum"] / qcount
+            quality_floor = _env_float(
+                C.LLM_KEY_QUALITY_HARD_FLOOR_ENV, C.LLM_KEY_QUALITY_HARD_FLOOR
+            )
+            if avg_quality < quality_floor:
+                return f"per-key quality floor (avg quality {avg_quality:.2f} over {qcount} graded)"
+        return None
+
+    def _maybe_flush_pending(self, uid: int, hotkey: str, now: float) -> bool:
+        """If hotkey's pooled pending window has crossed the call-volume
+        floor, or aged past the max pending-window, score it as ONE window
+        across all its live keys' calls -- with the reward tier blended per
+        call -- and clear the accumulator so the next window starts fresh
+        (non-overlapping). Returns True if a flush (and score) happened.
+
+        Before pooling, each key's own sub-window is checked against the
+        hard floors: a single junk key (all failures, or fabricated output)
+        with enough evidence is killed and excluded, so it can't hide inside
+        an otherwise healthy fleet's average forever -- the pooled floors
+        then only trip when the fleet as a whole is failing.
+
+        A force-flush past the max age passes min_calls_for_scoring=1 so
+        llm_key_efficiency_score()'s volume gate passes trivially, while
+        _record_llm_key_score's own confidence-floor alpha-scaling still
+        damps a small forced sample -- no new scoring logic needed for this
+        case."""
+        acc = self.llm_key_pending_calls.get(hotkey)
+        if acc is None:
+            return False
+        min_calls = _env_int(
+            C.LLM_KEY_MIN_CALLS_FOR_SCORING_ENV, C.LLM_KEY_MIN_CALLS_FOR_SCORING
+        )
+
+        # Per-key junk gate first (kills mutate the accumulator).
+        for sub_key, sub in list(acc.get("keys", {}).items()):
+            reason = self._sub_window_floor_reason(sub, min_calls=min_calls)
+            if reason is not None:
+                self._kill_hotkey_key(int(uid), hotkey, sub_key, reason=reason)
+        acc = self.llm_key_pending_calls.get(hotkey)
+        if acc is None or not acc.get("keys"):
+            return False  # everything this window held was killed
+        subs = acc["keys"]
+
+        success_count = sum(int(s.get("success_count", 0)) for s in subs.values())
+        failure_count = sum(int(s.get("failure_count", 0)) for s in subs.values())
+        total = success_count + failure_count
+        max_age = max(
+            0.0,
+            _env_float(
+                C.LLM_KEY_PENDING_WINDOW_MAX_SECONDS_ENV, C.LLM_KEY_PENDING_WINDOW_MAX_SECONDS
+            ),
+        )
+        aged_out = now - float(acc.get("first_seen_at", now)) >= max_age
+        if total < min_calls and not aged_out:
+            return False
+
+        latency_sum = sum(float(s.get("latency_ms_weighted_sum", 0.0)) for s in subs.values())
+        latency_count = sum(int(s.get("latency_weighted_count", 0)) for s in subs.values())
+        quality_sum = sum(float(s.get("quality_weighted_sum", 0.0)) for s in subs.values())
+        quality_count = sum(int(s.get("quality_weighted_count", 0)) for s in subs.values())
+        avg_latency_ms = latency_sum / latency_count if latency_count > 0 else None
+        avg_quality = quality_sum / quality_count if quality_count > 0 else None
+
+        # Per-call blended reward tier: each call is worth its own model's
+        # tier, so a mixed fleet averages by delivered traffic and stacked
+        # cheap keys can't borrow a top-tier multiplier. A migrated legacy
+        # sub-window (tier None) resolves via the submission-time fallback.
+        def _sub_tier(sub: dict) -> float:
+            tier = sub.get("tier")
+            return float(tier) if tier is not None else self._model_tier_weight(hotkey)
+
+        blended_tier = (
+            sum(
+                _sub_tier(s)
+                * (int(s.get("success_count", 0)) + int(s.get("failure_count", 0)))
+                for s in subs.values()
+            )
+            / total
+            if total > 0
+            else self._model_tier_weight(hotkey)
+        )
+
+        # Remember each key's share of this window for later kill-share math.
+        key_states = self._hotkey_key_states(hotkey)
+        for sub_key, sub in subs.items():
+            state = key_states.setdefault(sub_key, {})
+            state["last_window_calls"] = int(sub.get("success_count", 0)) + int(
+                sub.get("failure_count", 0)
+            )
+
+        self._record_llm_key_score(
+            uid,
+            hotkey=hotkey,
+            success_count=success_count,
+            failure_count=failure_count,
+            avg_latency_ms=avg_latency_ms,
+            quality_score=avg_quality,
+            key_active=True,
+            min_calls_for_scoring=1 if (aged_out and total < min_calls) else min_calls,
+            quality_call_count=quality_count,
+            model_tier_weight=blended_tier,
+        )
+        self.llm_key_pending_calls.pop(hotkey, None)
+        return True
+
+    def _blended_weight_array(self) -> np.ndarray:
+        """Weight is earned only through confirmed LLM-key efficiency.
+
+        self.scores[uid] is positive only once the protocol has reported
+        real, verified usage for a key it currently considers active -
+        merely answering the ask, or having a key that's been submitted but
+        not yet confirmed working, earns nothing here. Key validity isn't
+        something the validator can judge on its own, so it doesn't extend
+        weight on the strength of a submission alone, only on the strength of
+        reported real usage.
+
+        participation_scores is intentionally excluded - it's tracked for
+        liveness/observability only (see _record_participation), never
+        blended into submitted weight.
+
+        Whatever this returns is then wrapped by the template's own burn
+        allocation (masxai/constants.py: BURN_UID/BURN_PERCENTAGE), which
+        unconditionally reserves the large majority of emission for the burn
+        uid regardless of how much real efficiency data exists here - see
+        set_weights().
+        """
+        return np.nan_to_num(
             np.asarray(self.scores, dtype=np.float32),
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
         )
-        share = min(
-            max(_env_float(C.PARTICIPATION_WEIGHT_ENV, C.PARTICIPATION_WEIGHT), 0.0),
-            1.0,
-        )
-        return (1.0 - share) * accuracy + share * participation
 
     def set_weights(self):
         """Always submit weights so the validator stays active on-chain.
 
-        The submitted array blends interim participation with resolved accuracy
-        (see _blended_weight_array); self.scores itself - the persisted,
-        resolution-driven accuracy EMA - is left untouched.
+        The submitted array is the nan-safe LLM-key efficiency signal (see
+        _blended_weight_array); self.scores itself - the persisted,
+        report-driven efficiency EMA - is left untouched. The template's own
+        burn allocation (BURN_UID/BURN_PERCENTAGE) further reserves most of
+        emission for the burn uid before anything reaches the chain.
         """
         original_scores = self.scores
         self.scores = self._blended_weight_array()
@@ -404,1233 +780,341 @@ class Validator(BaseValidatorNeuron):
         finally:
             self.scores = original_scores
 
-    # ------------------------------------------------------------- resolve
-    async def resolve_due(self):
-        """Resolve every pending forecast whose horizon has passed."""
-        now = time.time()
-        due = []
-        malformed = []
-        for fid, forecast in list(self.pending.items()):
-            try:
-                resolve_at = float(forecast.get("resolve_at") or 0.0)
-            except (AttributeError, TypeError, ValueError):
-                malformed.append(fid)
-                continue
-            if resolve_at <= 0.0:
-                malformed.append(fid)
-                continue
-            if resolve_at <= now:
-                due.append(fid)
-        if malformed:
-            self._drop_pending(malformed)
-            bt.logging.warning(
-                f"dropped {len(malformed)} malformed pending forecast(s) before resolution"
-            )
-        if not due:
-            await self.flush_bt_feedback()
-            return
+    # ---------------------------------------------------------- llm-key pipeline
+    async def llm_key_submission_round(self) -> None:
+        """Ask every eligible miner for its contributed LLM key, relay
+        accepted submissions to the protocol backend, and record liveness
+        participation for every miner that answered (whether or not it had a
+        key to contribute).
 
-        self._log_resolution_due(due, now=now)
-
-        bt_due = [fid for fid in due if self.pending[fid].get("source") == "bt_forecast"]
-        bt_due_set = set(bt_due)
-        local_due = [fid for fid in due if fid not in bt_due_set]
-
-        if bt_due:
-            await self.resolve_bt_forecast_due(bt_due, now=now)
-        if local_due:
-            await self.resolve_local_due(local_due)
-        await self.flush_bt_feedback()
-
-    async def resolve_local_due(self, due: list[str]):
-        """Resolve legacy local-oracle forecasts."""
-        tasks = []
-        valid_due = []
-        for fid in due:
-            if fid not in self.pending:
-                continue
-            f = self.pending[fid]
-            valid_due.append(fid)
-            tasks.append(
-                oracle.resolve_forecast_outcome(
-                    f,
-                    subtensor=getattr(self, "subtensor", None),
-                )
-            )
-
-        if not tasks:
-            return
-
-        outcomes = await asyncio.gather(*tasks)
-
-        resolved_this_round = 0
-        for fid, outcome in zip(valid_due, outcomes):
-            if outcome is None:
-                bt.logging.info(f"oracle unavailable for {fid}; deferring resolution")
-                continue
-
-            f = self.pending.pop(fid)
-            uid = f["uid"]
-            prev_score = float(self.scores[uid])
-            reward = score_structured_forecast(
-                prediction=f.get("prediction"),
-                confidence=f.get("confidence"),
-                outcome=outcome,
-                probability=f.get("probability"),
-                previous_score=prev_score,
-                submitted_at=f.get("submitted_at", f.get("issued_at", 0.0)),
-                issued_at=f.get("issued_at", 0.0),
-                resolve_at=f.get("resolve_at", 1.0),
-            )
-            self.scores[uid] = ema_update(float(self.scores[uid]), reward)
-            self.resolved_count += 1
-            resolved_this_round += 1
-            bt.logging.debug(
-                f"resolved uid={uid} event={f.get('event_type')} "
-                f"prediction={f.get('prediction')} confidence={f.get('confidence')} "
-                f"outcome={outcome} "
-                f"reward={reward:.3f} -> score={self.scores[uid]:.3f}"
-            )
-        if resolved_this_round > 0:
-            self.last_resolution_at = time.time()
-        bt.logging.info(
-            f"resolved due forecasts | "
-            f"total resolved={self.resolved_count}"
-        )
-
-    async def resolve_bt_forecast_due(self, due: list[str], *, now: float):
-        """Resolve centralized BT-Forecast questions through the FastAPI API."""
-        client = self._bt_forecast_client()
-        if client is None:
-            bt.logging.warning("BT-Forecast API unavailable; deferring centralized resolutions")
-            return
-
-        by_run: dict[str, list[str]] = defaultdict(list)
-        for fid in due:
-            f = self.pending.get(fid)
-            if not f:
-                continue
-            by_run[str(f.get("run_id") or bt_forecast_run_id_from_env())].append(fid)
-
-        fetch_plan: list[tuple[str, list[str]]] = []
-        skipped_runs = 0
-        for run_id, fids in by_run.items():
-            run_state = self._bt_run_state(run_id)
-            next_poll_at = self._bt_next_resolution_poll_at(run_state)
-            if next_poll_at is not None and next_poll_at > now:
-                skipped_runs += 1
-                remaining = int(next_poll_at - now)
-                bt.logging.debug(
-                    f"BT-Forecast run {run_id} resolution retry not due for {remaining}s"
-                )
-                continue
-            fetch_plan.append((run_id, fids))
-
-        if not fetch_plan:
-            if skipped_runs:
-                bt.logging.debug(
-                    f"BT-Forecast resolution pass deferred by retry schedule | "
-                    f"runs_waiting={skipped_runs}"
-                )
-            return
-
-        resolution_wait = _env_float(
-            C.BT_FORECAST_RESOLUTION_WAIT_SECONDS_ENV,
-            C.BT_FORECAST_RESOLUTION_WAIT_SECONDS,
-        )
-        resolved_questions = 0
-        dropped_questions = 0
-        unresolved_questions = 0
-        stale_forecasts = 0
-        runs_polled = 0
-
-        fetches = [
-            client.get_resolutions(run_id=run_id)
-            for run_id, _fids in fetch_plan
-        ]
-        fetch_results = await asyncio.gather(*fetches, return_exceptions=True)
-
-        for (run_id, fids), fetch_result in zip(fetch_plan, fetch_results):
-            run_state = self._bt_run_state(run_id)
-            polled_at = datetime.now(timezone.utc).isoformat()
-            runs_polled += 1
-            run_state["last_resolution_polled_at"] = polled_at
-
-            if isinstance(fetch_result, Exception):
-                run_state["last_resolution_error_at"] = polled_at
-                self._schedule_next_bt_resolution_poll(run_state, now=now)
-                bt.logging.warning(
-                    f"BT-Forecast resolutions fetch failed run_id={run_id}: "
-                    f"{fetch_result}"
-                )
-                continue
-            resolutions = list(fetch_result or [])
-            run_state["last_resolution_count"] = len(resolutions)
-
-            resolution_by_key = {r.question_key: r for r in resolutions}
-            by_question: dict[str, list[str]] = defaultdict(list)
-            for fid in fids:
-                f = self.pending.get(fid)
-                if f:
-                    by_question[str(f.get("question_key") or fid)].append(fid)
-
-            run_unresolved_questions = 0
-            for question_key, question_fids in by_question.items():
-                sample = self.pending.get(question_fids[0])
-                if not sample:
-                    continue
-                resolution = resolution_by_key.get(question_key)
-                try:
-                    sample_resolve_at = float(sample.get("resolve_at", now))
-                except (TypeError, ValueError):
-                    sample_resolve_at = now
-                status = str(getattr(resolution, "status", "") or "").strip().lower()
-                if resolution is None or status in C.BT_FORECAST_OPEN_STATUSES:
-                    if now - sample_resolve_at > resolution_wait:
-                        self._drop_pending(question_fids)
-                        dropped_questions += 1
-                        bt.logging.info(
-                            f"dropped unscored BT-Forecast question after wait window: {question_key}"
-                        )
-                    else:
-                        unresolved_questions += 1
-                        run_unresolved_questions += 1
-                    continue
-
-                if status in C.BT_FORECAST_UNSCORED_TERMINAL_STATUSES:
-                    self._drop_pending(question_fids)
-                    dropped_questions += 1
-                    bt.logging.info(
-                        f"dropped unscored BT-Forecast question status={status}: "
-                        f"{question_key}"
-                    )
-                    continue
-
-                outcome = resolution.bool_outcome()
-                if outcome is None:
-                    unresolved_questions += 1
-                    run_unresolved_questions += 1
-                    bt.logging.warning(
-                        f"BT-Forecast resolution has no boolean outcome "
-                        f"status={status or 'unknown'} question_key={question_key}"
-                    )
-                    continue
-
-                forecasts = [self.pending[fid] for fid in question_fids if fid in self.pending]
-                feedback_payload = self._build_miner_results_payload(
-                    run_id=run_id,
-                    question_key=question_key,
-                    forecasts=forecasts,
-                    resolution=resolution,
-                    outcome=outcome,
-                )
-                for fid in question_fids:
-                    if fid not in self.pending:
-                        continue
-                    f = self.pending.pop(fid)
-                    uid = self._forecast_uid(f)
-                    if uid is None or not self._scoreable_uid(uid, f):
-                        stale_forecasts += 1
-                        continue
-                    prev_score = float(self.scores[uid])
-                    reward = self._score_resolved_forecast(f, outcome)
-                    self.scores[uid] = ema_update(float(self.scores[uid]), reward)
-                    self.resolved_count += 1
-                    bt.logging.debug(
-                        f"resolved bt uid={uid} family={f.get('family')} "
-                        f"probability={f.get('probability')} outcome={outcome} "
-                        f"reward={reward:.3f} prev={prev_score:.3f} "
-                        f"score={self.scores[uid]:.3f}"
-                    )
-
-                if feedback_payload["results"]:
-                    self.feedback_queue.append(feedback_payload)
-                resolved_questions += 1
-
-            if run_unresolved_questions:
-                self._schedule_next_bt_resolution_poll(run_state, now=now)
-            else:
-                run_state.pop("next_resolution_poll_at", None)
-
-        bt.logging.info(
-            f"BT-Forecast resolution pass | runs_polled={runs_polled} "
-            f"runs_waiting={skipped_runs} questions_resolved={resolved_questions} "
-            f"questions_unresolved={unresolved_questions} "
-            f"questions_dropped={dropped_questions} stale_forecasts={stale_forecasts} "
-            f"total_resolved={self.resolved_count}"
-        )
-
-    def _log_resolution_due(self, due: list[str], *, now: float) -> None:
-        last_logged = float(getattr(self, "_last_resolution_due_log_at", 0.0) or 0.0)
-        if now - last_logged < 60.0:
-            return
-        self._last_resolution_due_log_at = now
-        bt_due = 0
-        runs = set()
-        questions = set()
-        oldest_resolve_at = now
-        for fid in due:
-            forecast = self.pending.get(fid)
-            if not forecast:
-                continue
-            try:
-                resolve_at = float(forecast.get("resolve_at") or now)
-            except (TypeError, ValueError):
-                resolve_at = now
-            oldest_resolve_at = min(oldest_resolve_at, resolve_at)
-            if forecast.get("source") == "bt_forecast":
-                bt_due += 1
-                runs.add(str(forecast.get("run_id") or "unknown"))
-                questions.add(str(forecast.get("question_key") or fid))
-        bt.logging.info(
-            f"resolution due | total={len(due)} bt={bt_due} "
-            f"local={len(due) - bt_due} bt_runs={len(runs)} "
-            f"bt_questions={len(questions)} oldest_lag_s={int(max(0.0, now - oldest_resolve_at))}"
-        )
-
-    def _bt_resolution_retry_seconds(self) -> float:
-        return max(
-            0.0,
-            _env_float(
-                C.BT_FORECAST_RESOLUTION_RETRY_SECONDS_ENV,
-                C.BT_FORECAST_RESOLUTION_RETRY_SECONDS,
-            ),
-        )
-
-    @staticmethod
-    def _bt_next_resolution_poll_at(run_state: dict[str, Any]) -> Optional[float]:
-        try:
-            next_poll_at = run_state.get("next_resolution_poll_at")
-            if next_poll_at is None:
-                return None
-            return float(next_poll_at)
-        except (TypeError, ValueError):
-            return None
-
-    def _schedule_next_bt_resolution_poll(
-        self,
-        run_state: dict[str, Any],
-        *,
-        now: float,
-    ) -> None:
-        retry_seconds = self._bt_resolution_retry_seconds()
-        if retry_seconds <= 0.0:
-            run_state.pop("next_resolution_poll_at", None)
-            return
-        run_state["next_resolution_poll_at"] = now + retry_seconds
-
-    @staticmethod
-    def _forecast_uid(forecast: dict) -> Optional[int]:
-        try:
-            return int(forecast["uid"])
-        except (KeyError, TypeError, ValueError):
-            return None
-
-    def _scoreable_uid(self, uid: int, forecast: dict) -> bool:
-        scores = getattr(self, "scores", None)
-        if scores is None or uid < 0 or uid >= len(scores):
-            bt.logging.warning(
-                f"dropping resolved forecast for unscoreable uid={uid}: "
-                "uid is outside the current score array"
-            )
-            return False
-
-        try:
-            metagraph_size = self._metagraph_size()
-        except Exception:
-            metagraph_size = len(scores)
-        if metagraph_size > 0 and uid >= metagraph_size:
-            bt.logging.warning(
-                f"dropping resolved forecast for stale uid={uid}: "
-                "uid is outside the current metagraph"
-            )
-            return False
-
-        hotkey = forecast.get("hotkey")
-        hotkeys = getattr(getattr(self, "metagraph", None), "hotkeys", [])
-        if hotkey and uid < len(hotkeys) and hotkeys[uid] != hotkey:
-            bt.logging.warning(
-                f"dropping resolved forecast for stale uid={uid}: "
-                "hotkey changed since forecast submission"
-            )
-            return False
-        return True
-
-    def _score_resolved_forecast(self, forecast: dict, outcome: bool) -> float:
-        uid = int(forecast["uid"])
-        return score_structured_forecast(
-            prediction=forecast.get("prediction"),
-            confidence=forecast.get("confidence"),
-            probability=forecast.get("probability"),
-            outcome=outcome,
-            previous_score=float(self.scores[uid]),
-            submitted_at=forecast.get("submitted_at", forecast.get("issued_at", 0.0)),
-            issued_at=forecast.get("issued_at", 0.0),
-            resolve_at=forecast.get("resolve_at", 1.0),
-        )
-
-    def _drop_pending(self, fids: list[str]) -> None:
-        for fid in fids:
-            self.pending.pop(fid, None)
-
-    async def flush_bt_feedback(self):
-        """Best-effort retrying sender for validator -> BT-Forecast calibration feedback."""
-        if not getattr(self, "feedback_queue", None):
-            return
-        client = self._bt_forecast_client()
+        No-op if llm_key_client is None (unconfigured). The protocol's public
+        key and allowed-models list are fetched fresh every round rather than
+        cached, so a possible protocol-side transport-keypair rotation can
+        never cause a submission encrypted against a stale key.
+        """
+        client = self.llm_key_client
         if client is None:
             return
-        remaining = []
-        for payload in self.feedback_queue:
-            try:
-                await client.post_miner_results(payload)
-                bt.logging.info(
-                    f"posted BT-Forecast miner feedback question_key={payload.get('question_key')} "
-                    f"results={len(payload.get('results', []))}"
-                )
-            except Exception as e:  # noqa: BLE001
-                bt.logging.warning(
-                    f"BT-Forecast miner feedback post failed "
-                    f"question_key={payload.get('question_key')}: {e}"
-                )
-                remaining.append(payload)
-        self.feedback_queue = remaining
-
-    # --------------------------------------------------------------- issue
-    def build_question(self, event_type: str, reference: dict) -> ForecastSynapse:
         now = time.time()
-        resolve_at = now + C.FORECAST_HORIZON_SECONDS
-        mins = C.FORECAST_HORIZON_SECONDS // 60
-        reference_value = reference.get("reference_value")
-        metadata = reference.get("reference_metadata", {})
-
-        if event_type == ForecastEventType.TAO_PRICE_MOVEMENT.value:
-            question = (
-                f"Will TAO/USD be higher than ${float(reference_value):.4f} "
-                f"in {mins} minutes?"
-            )
-            context = (
-                f"Event type: {event_type}\n"
-                f"Current TAO/USD reference price: {reference_value}\n"
-                f"Forecast window: {C.FORECAST_WINDOW}\n"
-                "Use recent Bittensor market, subnet, governance, and ecosystem "
-                "signals available to your miner before answering."
-            )
-        elif event_type == ForecastEventType.NEW_SUBNET_REGISTRATION.value:
-            count = int(reference_value)
-            question = f"Will at least one new Bittensor subnet register in the next {C.FORECAST_WINDOW}?"
-            context = (
-                f"Event type: {event_type}\n"
-                f"Current subnet count: {count}\n"
-                f"Forecast window: {C.FORECAST_WINDOW}"
-            )
-        else:
-            question = f"Will the MASXAI event '{event_type}' occur within {C.FORECAST_WINDOW}?"
-            context = f"Event type: {event_type}\nForecast window: {C.FORECAST_WINDOW}"
-
-        return ForecastSynapse(
-            forecast_id=uuid.uuid4().hex,
-            question=question,
-            event_type=event_type,
-            asset=C.FORECAST_ASSET,
-            reference_value=reference_value,
-            reference_metadata=metadata,
-            forecast_window=C.FORECAST_WINDOW,
-            issued_at=now,
-            resolve_at=resolve_at,
-            context=context,
-        )
-
-    async def issue_round(self):
-        """Fetch/issue forecast questions, query miners, and store responses."""
-        now = time.time()
-
-        client = self._bt_forecast_client()
-        if client is not None:
-            current_run_id = bt_forecast_run_id_from_env()
-            await self.issue_bt_forecast_round(
-                client=client,
-                now=now,
-                run_id=current_run_id,
-            )
-            await self.retry_unanswered_bt_forecast_runs(
-                client=client,
-                now=now,
-                exclude_run_id=current_run_id,
-            )
-            return
-
-        if not self._issue_interval_reached(now):
-            return
-
-        if self._bt_forecast_required():
-            bt.logging.warning(
-                "MASXAI_BT_FORECAST_REQUIRED=true but BT_FORECAST_BEARER_TOKEN is unset; "
-                "skipping legacy local issue"
-            )
-            self.last_issue_at = time.time()
-            return
-
-        await self.issue_local_round(now=now)
-        self.last_issue_at = time.time()
-
-    def _issue_interval_reached(self, now: float) -> bool:
         interval = max(
             0.0,
-            _env_float("MASXAI_FORECAST_INTERVAL_SECONDS", C.FORECAST_INTERVAL_SECONDS),
+            _env_float(
+                C.LLM_KEY_SUBMISSION_INTERVAL_SECONDS_ENV,
+                C.LLM_KEY_SUBMISSION_INTERVAL_SECONDS,
+            ),
         )
-        if self.last_issue_at and now - self.last_issue_at < interval:
-            remaining = int(interval - (now - self.last_issue_at))
-            bt.logging.debug(f"forecast interval not reached; next issue in {remaining}s")
-            return False
-        return True
+        if self.last_llm_key_ask_at and now - self.last_llm_key_ask_at < interval:
+            return
 
-    async def issue_local_round(self, *, now: float):
-        """Legacy local-oracle issue path for development and fallback."""
-        event_type = C.ENABLED_EVENT_TYPES[self.resolved_count % len(C.ENABLED_EVENT_TYPES)]
-        reference = await oracle.snapshot_reference(
-            event_type,
-            asset=C.FORECAST_ASSET,
-            subtensor=getattr(self, "subtensor", None),
-        )
-        if reference is None:
-            bt.logging.info("oracle unavailable; skipping issue this epoch")
+        try:
+            public_key = await client.get_public_key()
+            allowed_models = await client.get_allowed_models()
+        except Exception as e:  # noqa: BLE001
+            bt.logging.warning(f"llm-key: could not fetch public key/allowed models: {e}")
+            backoff = min(
+                max(
+                    0.0,
+                    _env_float(
+                        C.LLM_KEY_ASK_FAILURE_BACKOFF_SECONDS_ENV,
+                        C.LLM_KEY_ASK_FAILURE_BACKOFF_SECONDS,
+                    ),
+                ),
+                interval,
+            )
+            self.last_llm_key_ask_at = now - interval + backoff
             return
 
         miner_uids = self.get_miner_uids()
-        if len(miner_uids) == 0:
-            bt.logging.info("no miners to query this epoch")
+        if not miner_uids:
+            self.last_llm_key_ask_at = now
             return
 
-        synapse = self.build_question(event_type, reference)
+        synapse = LLMKeySynapse(
+            request_id=uuid.uuid4().hex,
+            protocol_pubkey_id=public_key.pubkey_id,
+            protocol_pubkey_b64=public_key.pubkey_b64,
+            allowed_models=[f"{m.provider}/{m.model}" for m in allowed_models],
+            issued_at=now,
+        )
         axons = [self.metagraph.axons[uid] for uid in miner_uids]
-
         responses = await self.dendrite(
             axons=axons,
             synapse=synapse,
             deserialize=False,
-            timeout=C.QUERY_TIMEOUT,
+            timeout=C.LLM_KEY_QUERY_TIMEOUT,
         )
 
-        issued = 0
         answered = 0
-        submitted_at = time.time()
-        response_list = list(responses or [])
-        for index, uid in enumerate(miner_uids):
-            resp = response_list[index] if index < len(response_list) else None
-            fid = uuid.uuid4().hex
-            probability, prediction, confidence = self._normalize_miner_response(resp)
-            if probability is not None:
-                answered += 1
-                self._record_participation(uid)
-            self.pending[fid] = {
-                "uid": int(uid),
-                "forecast_id": getattr(resp, "forecast_id", "") or fid,
-                "event_type": event_type,
-                "prediction": prediction,
-                "confidence": confidence,
-                "probability": probability,
-                "reasoning": getattr(resp, "reasoning", ""),
-                "model": getattr(resp, "model", "") or "no-response",
-                "timestamp": getattr(resp, "timestamp", ""),
-                "submitted_at": _parse_timestamp(getattr(resp, "timestamp", "")) or submitted_at,
-                "reference_value": reference.get("reference_value"),
-                "reference_metadata": reference.get("reference_metadata", {}),
-                "issued_at": synapse.issued_at,
-                "asset": C.FORECAST_ASSET,
-                "resolve_at": synapse.resolve_at,
-            }
-            issued += 1
-        bt.logging.info(
-            f"issued {issued} {event_type} forecasts @ ref={reference.get('reference_value')} "
-            f"| answered={answered}/{len(miner_uids)} "
-            f"(resolve in {C.FORECAST_HORIZON_SECONDS//60}m) | "
-            f"pending now={len(self.pending)}"
-        )
-
-    async def issue_bt_forecast_round(
-        self,
-        *,
-        client,
-        now: float,
-        run_id: Optional[str] = None,
-    ):
-        """Poll the daily BT-Forecast run, then relay questions once complete."""
-        run_id = run_id or bt_forecast_run_id_from_env()
-        run_state = self._bt_run_state(run_id)
-        if run_state.get("questions_issued_at"):
-            retry_unanswered = self._bt_unanswered_retry_due(run_id, run_state, now)
-            if not retry_unanswered:
-                if self._bt_run_has_unanswered_pending(run_id, now=now):
-                    bt.logging.debug(
-                        f"BT-Forecast run {run_id} waiting before retrying "
-                        "unanswered miner forecasts"
-                    )
-                else:
-                    bt.logging.debug(f"BT-Forecast run {run_id} already issued")
-                return
-            bt.logging.info(
-                f"BT-Forecast run {run_id} has unanswered miner forecasts; "
-                "retrying unanswered entries"
-            )
-        else:
-            retry_unanswered = False
-
-        next_poll_at = float(run_state.get("next_poll_at") or 0.0)
-        if next_poll_at > now:
-            remaining = int(next_poll_at - now)
-            bt.logging.debug(
-                f"BT-Forecast run {run_id} waiting for next status poll in {remaining}s"
-            )
-            return
-
-        try:
-            run = await client.get_run(run_id)
-        except Exception as e:  # noqa: BLE001
-            bt.logging.warning(f"BT-Forecast run poll failed run_id={run_id}: {e}")
-            run_state["next_poll_at"] = now + C.BT_FORECAST_DEFAULT_POLL_AFTER_SECONDS
-            return
-
-        run_state.update(
-            {
-                "run_id": run.run_id,
-                "status": run.status,
-                "generation": run.generation,
-                "question_count": run.question_count,
-                "ready_at": run.ready_at,
-                "template_version": run.template_version,
-                "measurement_version": run.measurement_version,
-                "poll_after_s": run.poll_after_s,
-                "last_polled_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-
-        if not self._bt_run_generation_complete(run.generation):
-            poll_after_s = self._bt_run_poll_after_seconds(run.poll_after_s)
-            run_state["poll_after_s"] = poll_after_s
-            run_state["next_poll_at"] = now + poll_after_s
-            pending_since = float(run_state.get("pending_since") or 0.0)
-            if pending_since <= 0.0:
-                pending_since = now
-                run_state["pending_since"] = pending_since
-            stuck_seconds = now - pending_since
-            bt.logging.info(
-                f"BT-Forecast run {run_id} generation={run.generation or 'unknown'} "
-                f"status={run.status}; polling again in {poll_after_s}s"
-            )
-            self._check_stuck_bt_forecast_run(run_id, stuck_seconds)
-            if self._should_fallback_to_local_issue(stuck_seconds):
-                bt.logging.error(
-                    f"BT-Forecast run {run_id} has been stuck for {int(stuck_seconds)}s; "
-                    "falling back to the legacy local-oracle issue path for this cycle"
+        submitted = 0
+        for uid, resp in zip(miner_uids, responses):
+            if getattr(resp, "has_key", None) is None:
+                continue  # timed out / never reached the miner's forward_llm_key
+            answered += 1
+            self._record_participation(uid)
+            if getattr(resp, "version", None) != synapse.version:
+                bt.logging.warning(
+                    f"llm-key: uid={uid} responded with protocol version "
+                    f"{getattr(resp, 'version', None)!r} (expected {synapse.version}); "
+                    "skipping key submission this round -- see CLAUDE.md 'Before Changing Protocol'"
                 )
-                await self.issue_local_round(now=now)
-            return
-        run_state.pop("pending_since", None)
-
-        include_lineage = _env_flag(C.BT_FORECAST_INCLUDE_LINEAGE_ENV, False)
-        questions = self._bt_cached_questions(run_state)
-        if questions is None:
+                continue
+            if not resp.has_key:
+                continue
+            keys_payload = self._validate_miner_keys(uid, getattr(resp, "keys", None))
+            if not keys_payload:
+                continue
+            hotkey = self.metagraph.hotkeys[int(uid)]
             try:
-                questions = await client.get_questions(run_id, include_lineage=include_lineage)
+                result = await client.submit_keys(
+                    hotkey=hotkey, uid=int(uid), keys=keys_payload,
+                )
             except Exception as e:  # noqa: BLE001
-                bt.logging.warning(f"BT-Forecast question fetch failed run_id={run_id}: {e}")
-                run_state["next_poll_at"] = now + C.BT_FORECAST_DEFAULT_POLL_AFTER_SECONDS
-                return
-            run_state["questions_fetched_at"] = datetime.now(timezone.utc).isoformat()
-            run_state["questions"] = [self._bt_serialize_question(q) for q in questions]
+                bt.logging.warning(f"llm-key: submit failed for uid={uid}: {e}")
+                continue
+            entry = self.llm_key_hotkey_status.setdefault(hotkey, {})
+            entry.update({
+                "uid": int(uid),
+                "accepted": result.accepted,
+                "status": result.status,
+                "reason": result.reason,
+                "submitted_at": now,
+            })
+            key_states = entry.setdefault("keys", {})
+            for key_result in result.results:
+                if key_result.key_id is None:
+                    continue  # rejected slot: no stored key row to track
+                state = key_states.setdefault(str(key_result.key_id), {})
+                state.update({
+                    "slot": key_result.slot,
+                    "provider": key_result.provider,
+                    "model": key_result.model,
+                    "accepted": key_result.accepted,
+                    "status": key_result.status,
+                    "reason": key_result.reason,
+                })
+                if key_result.accepted:
+                    # A freshly accepted (possibly replacement) key starts
+                    # clean -- never inherits its predecessor's local kill.
+                    state["alive"] = True
+                    state.pop("killed_reason", None)
+            if result.accepted:
+                submitted += 1
 
-        run_state["question_keys"] = [q.question_key for q in questions]
-        run_state["next_poll_at"] = None
-
-        questions = [q for q in questions if not q.predetermined_at_creation]
-        if retry_unanswered:
-            questions = [
-                q
-                for q in questions
-                if self._bt_question_has_unanswered_pending(
-                    run_id,
-                    q.question_key,
-                    now=now,
-                )
-            ]
-        else:
-            questions = [q for q in questions if self._should_issue_bt_question(q, now=now)]
-        max_questions = _env_int(
-            C.BT_FORECAST_MAX_QUESTIONS_ENV,
-            C.BT_FORECAST_MAX_QUESTIONS_PER_ROUND,
-        )
-        if max_questions > 0:
-            questions = questions[:max_questions]
-        if not questions:
-            if retry_unanswered:
-                run_state["last_unanswered_retry_at"] = datetime.now(timezone.utc).isoformat()
-                bt.logging.info(
-                    f"BT-Forecast run {run_id}: no unanswered open miner forecasts to retry"
-                )
-            else:
-                bt.logging.info(f"BT-Forecast run {run_id}: no new miner-safe questions to issue")
-                run_state["questions_issued_at"] = datetime.now(timezone.utc).isoformat()
-                run_state["issued_question_count"] = 0
-            return
-
-        miner_uids = self.get_miner_uids()
-        if len(miner_uids) == 0:
-            bt.logging.info("no miners to query this epoch")
-            return
-
-        issued = 0
-        answered = 0
-        for question in questions:
-            question_miner_uids = miner_uids
-            if retry_unanswered:
-                question_miner_uids = self._bt_unanswered_uids_for_question(
-                    run_id,
-                    question.question_key,
-                    miner_uids,
-                    now=now,
-                )
-                if not question_miner_uids:
-                    continue
-            synapse = self.build_bt_forecast_synapse(question, run_id=run_id)
-            axons = [self.metagraph.axons[uid] for uid in question_miner_uids]
-            responses = await self.dendrite(
-                axons=axons,
-                synapse=synapse,
-                deserialize=False,
-                timeout=C.QUERY_TIMEOUT,
-            )
-            count, answered_count = self._store_bt_forecast_responses(
-                run_id=run_id,
-                question=question,
-                synapse=synapse,
-                miner_uids=question_miner_uids,
-                responses=responses,
-            )
-            issued += count
-            answered += answered_count
-            if answered_count > 0:
-                self.issued_questions[question.question_key] = now
-
-        if not run_state.get("questions_issued_at"):
-            run_state["questions_issued_at"] = datetime.now(timezone.utc).isoformat()
-        if retry_unanswered:
-            run_state["last_unanswered_retry_at"] = datetime.now(timezone.utc).isoformat()
-        run_state["issued_question_count"] = len(questions)
-        run_state["last_issue_call_count"] = issued
-        run_state["last_issue_answered_count"] = answered
-        self.last_issue_at = time.time()
         bt.logging.info(
-            f"issued {issued} BT-Forecast miner calls from run={run_id} "
-            f"questions={len(questions)} answered={answered}/{issued} "
-            f"pending now={len(self.pending)}"
+            f"llm-key submission round: answered={answered}/{len(miner_uids)} "
+            f"contributed={submitted}"
         )
+        self.last_llm_key_ask_at = now
 
-    async def retry_unanswered_bt_forecast_runs(
-        self,
-        *,
-        client,
-        now: float,
-        exclude_run_id: Optional[str] = None,
-    ) -> None:
-        """Retry unanswered forecasts from earlier still-open BT-Forecast runs."""
-        for run_id, run_state in list(getattr(self, "bt_forecast_runs", {}).items()):
-            if run_id == exclude_run_id or not isinstance(run_state, dict):
-                continue
-            if not run_state.get("questions_issued_at"):
-                continue
-            if not self._bt_unanswered_retry_due(run_id, run_state, now):
-                continue
-            await self.issue_bt_forecast_round(
-                client=client,
-                now=now,
-                run_id=run_id,
-            )
-
-    def _bt_run_state(self, run_id: str) -> dict[str, Any]:
-        if not hasattr(self, "bt_forecast_runs"):
-            self.bt_forecast_runs = {}
-        state = self.bt_forecast_runs.get(run_id)
-        if not isinstance(state, dict):
-            state = {}
-            self.bt_forecast_runs[run_id] = state
-        return state
-
-    @staticmethod
-    def _bt_run_last_seen_timestamp(
-        run_id: str,
-        run_state: dict[str, Any],
-    ) -> Optional[float]:
-        timestamps = []
-        for key in (
-            "last_unanswered_retry_at",
-            "questions_issued_at",
-            "questions_fetched_at",
-            "last_polled_at",
-        ):
-            parsed = _parse_timestamp(str(run_state.get(key) or ""))
-            if parsed is not None:
-                timestamps.append(parsed)
-        if run_id.startswith("bt-"):
-            try:
-                run_date = datetime.fromisoformat(run_id[3:]).replace(tzinfo=timezone.utc)
-                timestamps.append(run_date.timestamp())
-            except ValueError:
-                pass
-        return max(timestamps) if timestamps else None
-
-    def _bt_run_has_only_unanswered_pending(
-        self, run_id: str, *, now: Optional[float] = None
-    ) -> bool:
-        now = time.time() if now is None else now
-        pending = [
-            forecast
-            for forecast in self.pending.values()
-            if forecast.get("source") == "bt_forecast"
-            and str(forecast.get("run_id")) == run_id
-            and self._forecast_open(forecast, now)
-        ]
-        if not pending:
-            return False
-        return all(forecast.get("probability") is None for forecast in pending)
-
-    def _bt_run_has_unanswered_pending(
-        self, run_id: str, *, now: Optional[float] = None
-    ) -> bool:
-        now = time.time() if now is None else now
-        return any(
-            forecast.get("source") == "bt_forecast"
-            and str(forecast.get("run_id")) == run_id
-            and self._forecast_open(forecast, now)
-            and forecast.get("probability") is None
-            for forecast in self.pending.values()
-        )
-
-    def _bt_question_has_unanswered_pending(
-        self,
-        run_id: str,
-        question_key: str,
-        *,
-        now: Optional[float] = None,
-    ) -> bool:
-        now = time.time() if now is None else now
-        return any(
-            forecast.get("source") == "bt_forecast"
-            and str(forecast.get("run_id")) == run_id
-            and str(forecast.get("question_key")) == question_key
-            and self._forecast_open(forecast, now)
-            and forecast.get("probability") is None
-            for forecast in self.pending.values()
-        )
-
-    def _bt_unanswered_uids_for_question(
-        self,
-        run_id: str,
-        question_key: str,
-        miner_uids: list[int],
-        *,
-        now: Optional[float] = None,
-    ) -> list[int]:
-        now = time.time() if now is None else now
-        has_open_pending = any(
-            forecast.get("source") == "bt_forecast"
-            and str(forecast.get("run_id")) == run_id
-            and str(forecast.get("question_key")) == question_key
-            and self._forecast_open(forecast, now)
-            for forecast in self.pending.values()
-        )
-        if not has_open_pending:
+    def _validate_miner_keys(self, uid: int, raw_keys) -> list[dict[str, Any]]:
+        """Sanitize a miner's key batch before relaying it: cap at
+        LLM_KEY_MAX_KEYS_PER_HOTKEY, require every field, and require sane,
+        unique slots -- a hostile miner must not be able to inflate the
+        relay or smuggle malformed entries to the protocol."""
+        if not isinstance(raw_keys, list):
             return []
-
-        retry_uids: list[int] = []
-        for uid in miner_uids:
-            fid = self._bt_pending_key(run_id, question_key, int(uid))
-            forecast = self.pending.get(fid)
-            if forecast is None:
-                retry_uids.append(int(uid))
+        payload: list[dict[str, Any]] = []
+        seen_slots: set[int] = set()
+        for item in raw_keys:
+            if len(payload) >= C.LLM_KEY_MAX_KEYS_PER_HOTKEY:
+                bt.logging.warning(
+                    f"llm-key: uid={uid} sent more than "
+                    f"{C.LLM_KEY_MAX_KEYS_PER_HOTKEY} keys; ignoring the extras"
+                )
+                break
+            if not isinstance(item, dict):
                 continue
+            slot = item.get("slot")
+            provider = str(item.get("provider", "")).strip()
+            model = str(item.get("model", "")).strip()
+            blob = str(item.get("encrypted_key_blob", "")).strip()
+            pubkey_id = str(item.get("pubkey_id_used", "")).strip()
             if (
-                forecast.get("source") == "bt_forecast"
-                and self._forecast_open(forecast, now)
-                and forecast.get("probability") is None
+                not isinstance(slot, int)
+                or not (0 <= slot < C.LLM_KEY_MAX_KEYS_PER_HOTKEY)
+                or slot in seen_slots
+                or not provider
+                or not model
+                or not blob
+                or not pubkey_id
             ):
-                retry_uids.append(int(uid))
-        return retry_uids
+                bt.logging.debug(f"llm-key: uid={uid} sent a malformed key entry; skipping it")
+                continue
+            seen_slots.add(slot)
+            payload.append({
+                "slot": slot,
+                "provider": provider,
+                "model": model,
+                "encrypted_key_blob": blob,
+                "blob_encoding": str(item.get("blob_encoding", "nacl-sealedbox-v1")),
+                "pubkey_id_used": pubkey_id,
+            })
+        return payload
 
-    @staticmethod
-    def _forecast_open(forecast: dict, now: float) -> bool:
-        try:
-            return float(forecast.get("resolve_at") or 0.0) > now
-        except (AttributeError, TypeError, ValueError):
-            return False
-
-    def _bt_no_answer_retry_due(
-        self, run_id: str, run_state: dict[str, Any], now: float
-    ) -> bool:
-        if not self._bt_run_has_only_unanswered_pending(run_id, now=now):
-            return False
-        return self._bt_unanswered_retry_due(run_id, run_state, now)
-
-    def _bt_unanswered_retry_due(
-        self, run_id: str, run_state: dict[str, Any], now: float
-    ) -> bool:
-        if not self._bt_run_has_unanswered_pending(run_id, now=now):
-            return False
-        last_attempt = _parse_timestamp(
-            str(
-                run_state.get("last_unanswered_retry_at")
-                or run_state.get("questions_issued_at")
-                or ""
-            )
-        )
-        if last_attempt is None:
-            return True
-        retry_seconds = self._bt_unanswered_retry_delay_seconds(run_id, now=now)
-        return now - last_attempt >= retry_seconds
-
-    def _bt_unanswered_retry_base_seconds(self) -> float:
-        return max(
+    def _prune_llm_key_hotkey_status(self, now: float) -> None:
+        """Evict llm_key_hotkey_status entries for hotkeys no longer present
+        in the metagraph, after a grace period of continuous absence -- so a
+        metagraph-resize race or a hotkey that re-registers shortly after
+        dropping out never loses its tracked state. Runs once per
+        report-poll round."""
+        current_hotkeys = set(self.metagraph.hotkeys)
+        grace = max(
             0.0,
             _env_float(
-                C.BT_FORECAST_NO_ANSWER_RETRY_SECONDS_ENV,
-                C.BT_FORECAST_NO_ANSWER_RETRY_SECONDS,
+                C.LLM_KEY_HOTKEY_STATUS_EVICTION_GRACE_SECONDS_ENV,
+                C.LLM_KEY_HOTKEY_STATUS_EVICTION_GRACE_SECONDS,
             ),
         )
+        evicted = []
+        for hotkey, status in list(self.llm_key_hotkey_status.items()):
+            if hotkey in current_hotkeys:
+                status.pop("_missing_since", None)
+                continue
+            missing_since = status.get("_missing_since")
+            if missing_since is None:
+                status["_missing_since"] = now
+                continue
+            if now - float(missing_since) >= grace:
+                del self.llm_key_hotkey_status[hotkey]
+                self.llm_key_pending_calls.pop(hotkey, None)
+                evicted.append(hotkey)
+        if evicted:
+            bt.logging.info(
+                f"llm-key: evicted {len(evicted)} stale hotkey-status entry(ies): {evicted}"
+            )
 
-    def _bt_unanswered_retry_delay_seconds(
-        self, run_id: str, *, now: Optional[float] = None
-    ) -> float:
-        """Back off retries while keeping them active until the question cutoff."""
-        now = time.time() if now is None else now
-        base_seconds = self._bt_unanswered_retry_base_seconds()
-        max_seconds = max(
-            base_seconds,
+    async def llm_key_report_poll_round(self) -> None:
+        """Pull usage reports since the last cursor, fold them into each
+        hotkey's rolling accumulator, score any hotkey that's crossed the
+        volume floor, poll the roster for precise DEAD/REVOKED detection,
+        and decay any hotkey whose score has gone stale with no fresh
+        report. No-op if llm_key_client is None (unconfigured)."""
+        client = self.llm_key_client
+        if client is None:
+            return
+        now = time.time()
+        interval = max(
+            0.0,
             _env_float(
-                C.BT_FORECAST_NO_ANSWER_RETRY_MAX_SECONDS_ENV,
-                C.BT_FORECAST_NO_ANSWER_RETRY_MAX_SECONDS,
+                C.LLM_KEY_REPORT_POLL_INTERVAL_SECONDS_ENV,
+                C.LLM_KEY_REPORT_POLL_INTERVAL_SECONDS,
             ),
         )
-        multiplier = max(
-            1.0,
-            _env_float(
-                C.BT_FORECAST_NO_ANSWER_RETRY_BACKOFF_MULTIPLIER_ENV,
-                C.BT_FORECAST_NO_ANSWER_RETRY_BACKOFF_MULTIPLIER,
-            ),
-        )
-        attempts = []
-        for forecast in self.pending.values():
-            if (
-                forecast.get("source") != "bt_forecast"
-                or str(forecast.get("run_id")) != run_id
-                or forecast.get("probability") is not None
-            ):
-                continue
-            try:
-                resolve_at = float(forecast.get("resolve_at") or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if resolve_at <= now:
-                continue
-            try:
-                attempts.append(int(forecast.get("attempt_count") or 1))
-            except (TypeError, ValueError):
-                attempts.append(1)
-        if not attempts or base_seconds <= 0.0:
-            return base_seconds
-        delay = base_seconds * (multiplier ** max(0, max(attempts) - 1))
-        return min(max_seconds, delay)
-
-    @staticmethod
-    def _bt_run_generation_complete(generation: Optional[str]) -> bool:
-        return (generation or "").strip().lower() == C.BT_FORECAST_COMPLETE_GENERATION
-
-    @staticmethod
-    def _bt_run_poll_after_seconds(value: Optional[int]) -> int:
-        try:
-            seconds = int(value) if value is not None else C.BT_FORECAST_DEFAULT_POLL_AFTER_SECONDS
-        except (TypeError, ValueError):
-            seconds = C.BT_FORECAST_DEFAULT_POLL_AFTER_SECONDS
-        max_seconds = _env_int(
-            C.BT_FORECAST_POLL_AFTER_MAX_SECONDS_ENV,
-            C.BT_FORECAST_POLL_AFTER_MAX_SECONDS,
-        )
-        return max(60, min(seconds, max_seconds))
-
-    def _check_stuck_bt_forecast_run(self, run_id: str, stuck_seconds: float) -> None:
-        """Escalating alert for a run that hasn't reached generation=complete."""
-        error_threshold = _env_float(
-            C.BT_FORECAST_STUCK_RUN_ERROR_SECONDS_ENV,
-            C.BT_FORECAST_STUCK_RUN_ERROR_SECONDS,
-        )
-        warn_threshold = _env_float(
-            C.BT_FORECAST_STUCK_RUN_WARN_SECONDS_ENV,
-            C.BT_FORECAST_STUCK_RUN_WARN_SECONDS,
-        )
-        if error_threshold > 0.0 and stuck_seconds >= error_threshold:
-            bt.logging.error(
-                f"BT-Forecast run {run_id} has not reached generation=complete for "
-                f"{int(stuck_seconds)}s (>= {int(error_threshold)}s); the subnet is "
-                "not issuing new questions. Check the BT-Forecast service."
-            )
-        elif warn_threshold > 0.0 and stuck_seconds >= warn_threshold:
-            bt.logging.warning(
-                f"BT-Forecast run {run_id} has not reached generation=complete for "
-                f"{int(stuck_seconds)}s (>= {int(warn_threshold)}s)."
-            )
-
-    @staticmethod
-    def _should_fallback_to_local_issue(stuck_seconds: float) -> bool:
-        """Opt-in only: disabled unless MASXAI_BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS > 0."""
-        threshold = _env_float(
-            C.BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS_ENV,
-            C.BT_FORECAST_STUCK_RUN_FALLBACK_SECONDS,
-        )
-        return threshold > 0.0 and stuck_seconds >= threshold
-
-    @staticmethod
-    def _bt_serialize_question(question: BtForecastQuestion) -> dict[str, Any]:
-        return question.model_dump()
-
-    @staticmethod
-    def _bt_cached_questions(run_state: dict[str, Any]) -> Optional[list[BtForecastQuestion]]:
-        cached = run_state.get("questions")
-        if not isinstance(cached, list):
-            return None
-        questions = []
-        for item in cached:
-            if not isinstance(item, dict):
-                return None
-            try:
-                questions.append(BtForecastQuestion.model_validate(item))
-            except Exception:
-                return None
-        return questions
-
-    def build_bt_forecast_synapse(self, question: BtForecastQuestion, *, run_id: str) -> ForecastSynapse:
-        issued_at = time.time()
-        resolve_at = parse_api_timestamp(question.cutoff_date) or issued_at
-        context = "\n".join(
-            part
-            for part in (
-                question.evidence_summary,
-                question.resolution_criteria,
-                f"Measurement: {json.dumps(question.measurement, sort_keys=True)}"
-                if question.measurement
-                else "",
-                f"BT-Forecast run: {run_id}",
-            )
-            if part
-        )
-        return ForecastSynapse(
-            forecast_id=uuid.uuid4().hex,
-            question_id=question.question_id,
-            question_key=question.question_key,
-            question=question.question,
-            event_type=ForecastEventType.SIGNIFICANT_BITTENSOR_EVENT.value,
-            family=question.family,
-            scope=question.scope,
-            netuid=question.netuid,
-            horizon_days=question.horizon_days,
-            forecast_window=f"{question.horizon_days}d" if question.horizon_days else "",
-            issued_at=issued_at,
-            resolve_at=resolve_at,
-            context=context,
-        )
-
-    def _should_issue_bt_question(self, question: BtForecastQuestion, *, now: float) -> bool:
-        cutoff_ts = parse_api_timestamp(question.cutoff_date)
-        if cutoff_ts is not None and cutoff_ts <= now:
-            return False
-        reissue_seconds = _env_float(
-            C.BT_FORECAST_REISSUE_SECONDS_ENV,
-            C.BT_FORECAST_REISSUE_SECONDS,
-        )
-        last_issued = self.issued_questions.get(question.question_key)
-        if last_issued is None:
-            return True
-        if reissue_seconds <= 0:
-            return False
-        return now - last_issued >= reissue_seconds
-
-    def _store_bt_forecast_responses(
-        self,
-        *,
-        run_id: str,
-        question: BtForecastQuestion,
-        synapse: ForecastSynapse,
-        miner_uids: list[int],
-        responses,
-    ) -> tuple[int, int]:
-        submitted_at = time.time()
-        issued = 0
-        answered = 0
-        response_list = list(responses or [])
-        for index, uid in enumerate(miner_uids):
-            resp = response_list[index] if index < len(response_list) else None
-            fid = self._bt_pending_key(run_id, question.question_key, int(uid))
-            existing = self.pending.get(fid, {})
-            try:
-                first_issued_at = float(existing.get("issued_at", synapse.issued_at))
-            except (TypeError, ValueError):
-                first_issued_at = synapse.issued_at
-            probability, prediction, confidence = self._normalize_miner_response(resp)
-            if probability is not None:
-                answered += 1
-                self._record_participation(uid)
-            if existing.get("probability") is not None and probability is None:
-                existing["last_queried_at"] = synapse.issued_at
-                existing["attempt_count"] = int(existing.get("attempt_count") or 0) + 1
-                self.pending[fid] = existing
-                issued += 1
-                continue
-            self.pending[fid] = {
-                "source": "bt_forecast",
-                "pending_key": fid,
-                "uid": int(uid),
-                "hotkey": self.metagraph.hotkeys[int(uid)],
-                "forecast_id": getattr(resp, "forecast_id", "") or synapse.forecast_id,
-                "question_id": question.question_id,
-                "question_key": question.question_key,
-                "question": question.question,
-                "event_type": ForecastEventType.SIGNIFICANT_BITTENSOR_EVENT.value,
-                "family": question.family,
-                "scope": question.scope,
-                "netuid": question.netuid,
-                "horizon_days": question.horizon_days,
-                "prediction": prediction,
-                "confidence": confidence,
-                "probability": probability,
-                "reasoning": getattr(resp, "reasoning", ""),
-                "model": getattr(resp, "model", "") or "no-response",
-                "features": dict(getattr(resp, "features", {}) or {}),
-                "timestamp": getattr(resp, "timestamp", ""),
-                "submitted_at": _parse_timestamp(getattr(resp, "timestamp", "")) or submitted_at,
-                "issued_at": first_issued_at,
-                "last_queried_at": synapse.issued_at,
-                "attempt_count": int(existing.get("attempt_count") or 0) + 1,
-                "resolve_at": synapse.resolve_at,
-                "cutoff_date": question.cutoff_date,
-                "run_id": run_id,
-                "engine_probability": question.engine_probability,
-                "measurement": question.measurement,
-            }
-            issued += 1
-        return issued, answered
-
-    @staticmethod
-    def _bt_pending_key(run_id: str, question_key: str, uid: int) -> str:
-        digest = hashlib.sha256(f"{run_id}\n{question_key}\n{int(uid)}".encode("utf-8")).hexdigest()
-        return f"bt_forecast:{digest}"
-
-    def _normalize_miner_response(self, resp) -> tuple[Optional[float], Optional[bool], Optional[float]]:
-        if Validator._is_no_answer_model(getattr(resp, "model", "")):
-            return None, None, None
-
-        probability = getattr(resp, "probability", None)
-        prediction = getattr(resp, "prediction", None)
-        confidence = getattr(resp, "confidence", None)
-        try:
-            probability = float(probability) if probability is not None else None
-        except (TypeError, ValueError):
-            probability = None
-
-        if probability is not None:
-            probability = max(0.0, min(1.0, probability))
-            if prediction is None:
-                prediction = probability >= C.NEUTRAL_PROB
-            if confidence is None:
-                confidence = max(probability, 1.0 - probability)
-        elif prediction is not None and confidence is not None:
-            try:
-                c = float(confidence)
-                probability = c if bool(prediction) else 1.0 - c
-            except (TypeError, ValueError):
-                probability = None
+        if (
+            self.last_llm_key_report_poll_at
+            and now - self.last_llm_key_report_poll_at < interval
+        ):
+            return
 
         try:
-            confidence = float(confidence) if confidence is not None else None
-        except (TypeError, ValueError):
-            confidence = None
-        if confidence is not None:
-            confidence = max(0.0, min(1.0, confidence))
-        return probability, prediction if prediction is None else bool(prediction), confidence
-
-    @staticmethod
-    def _is_no_answer_model(model: Any) -> bool:
-        return str(model or "").startswith("baseline")
-
-    def _build_miner_results_payload(
-        self,
-        *,
-        run_id: str,
-        question_key: str,
-        forecasts: list[dict],
-        resolution: BtForecastResolution,
-        outcome: bool,
-    ) -> dict[str, Any]:
-        sample = forecasts[0] if forecasts else {}
-        threshold = _env_float(
-            C.BT_FORECAST_FEEDBACK_THRESHOLD_ENV,
-            C.BT_FORECAST_FEEDBACK_THRESHOLD,
-        )
-        outcome_value = float(outcome)
-        engine_probability = sample.get("engine_probability")
-        results = []
-        for forecast in forecasts:
-            probability = forecast.get("probability")
-            if probability is None:
-                continue
-            probability = float(probability)
-            dist_to_outcome = abs(probability - outcome_value)
-            if dist_to_outcome > threshold:
-                continue
-            dist_to_engine = (
-                abs(probability - float(engine_probability))
-                if engine_probability is not None
-                else None
+            reports, next_since = await client.get_reports(
+                since=self.last_llm_key_report_cursor or None
             )
-            results.append(
+        except Exception as e:  # noqa: BLE001
+            bt.logging.warning(f"llm-key: report poll failed: {e}")
+            backoff = min(
+                max(
+                    0.0,
+                    _env_float(
+                        C.LLM_KEY_REPORT_POLL_FAILURE_BACKOFF_SECONDS_ENV,
+                        C.LLM_KEY_REPORT_POLL_FAILURE_BACKOFF_SECONDS,
+                    ),
+                ),
+                interval,
+            )
+            self.last_llm_key_report_poll_at = now - interval + backoff
+            return
+
+        processed = 0
+        flushed = 0
+        for report in reports:
+            try:
+                uid = self.metagraph.hotkeys.index(report.hotkey)
+            except ValueError:
+                # Unknown/deregistered hotkey - skip rather than guess a mapping.
+                continue
+            self.llm_key_hotkey_status.setdefault(report.hotkey, {})
+            self.llm_key_hotkey_status[report.hotkey].update(
                 {
-                    "uid": int(forecast["uid"]),
-                    "hotkey": forecast.get("hotkey", ""),
-                    "probability": probability,
-                    "prediction": forecast.get("prediction"),
-                    "confidence": forecast.get("confidence"),
-                    "reasoning": forecast.get("reasoning", ""),
-                    "model": forecast.get("model", ""),
-                    "features": dict(forecast.get("features") or {}),
-                    "issued_at": forecast.get("issued_at"),
-                    "submitted_at": forecast.get("submitted_at"),
-                    "brier": brier_score(probability, outcome),
-                    "dist_to_outcome": dist_to_outcome,
-                    "dist_to_engine": dist_to_engine,
+                    "uid": int(uid),
+                    "last_report_at": now,
+                    "key_active": report.key_active,
                 }
             )
-        return {
-            "run_id": run_id,
-            "question_key": question_key,
-            "family": sample.get("family") or resolution.family,
-            "scope": sample.get("scope") or resolution.scope,
-            "netuid": sample.get("netuid", resolution.netuid),
-            "horizon_days": sample.get("horizon_days", resolution.horizon_days),
-            "outcome": outcome,
-            "measurement_value": resolution.measurement_value,
-            "resolved_at": resolution.resolved_at or datetime.now(timezone.utc).isoformat(),
-            "engine_probability": engine_probability,
-            "results": results,
-        }
+            sub_key = self._report_sub_key(report)
+            if not report.key_active:
+                # Calls made while this key was still alive are moot once
+                # it's confirmed dead -- cut exactly this key's contribution
+                # immediately; the hotkey's other keys keep earning (and the
+                # hotkey hard-zeroes when this was its last live key).
+                self._kill_hotkey_key(
+                    uid, report.hotkey, sub_key, reason="report row marked key inactive"
+                )
+            elif has_fatal_error_category(report.error_categories):
+                # The provider itself rejected this key (bad credentials /
+                # exhausted budget / permission block) -- conclusive on a
+                # single row, no call-volume floor needed. The protocol may
+                # still list the key ACTIVE (its health check can lag or be
+                # disabled), so this is the validator's own fast path to
+                # cutting a key that demonstrably doesn't work.
+                self._kill_hotkey_key(
+                    uid,
+                    report.hotkey,
+                    sub_key,
+                    reason=(
+                        "fatal error category in usage report: "
+                        f"{sorted(report.error_categories)}"
+                    ),
+                )
+            else:
+                self._fold_report_into_pending(report.hotkey, report, now)
+            processed += 1
 
-    def _bt_forecast_client(self):
-        client = getattr(self, "bt_forecast_client", None)
-        if client is None:
-            client = open_bt_forecast_client_from_env()
-            self.bt_forecast_client = client
-        return client
+        # Checked over every pending hotkey, not just ones with a fresh
+        # report this cycle -- otherwise a hotkey that goes quiet forever
+        # (zero further reports) would never force-flush after aging out,
+        # since it would never appear in this poll's report batch again.
+        for hotkey in list(self.llm_key_pending_calls.keys()):
+            status = self.llm_key_hotkey_status.get(hotkey) or {}
+            uid = status.get("uid")
+            if uid is None:
+                continue
+            if self._maybe_flush_pending(int(uid), hotkey, now):
+                flushed += 1
 
-    def _bt_forecast_required(self) -> bool:
-        if not hasattr(self, "bt_forecast_required"):
-            self.bt_forecast_required = bt_forecast_required_from_env()
-        return bool(self.bt_forecast_required)
+        await self._poll_llm_key_roster()
+        self._prune_llm_key_hotkey_status(now)
+        self._decay_stale_llm_key_scores(now)
+
+        if next_since:
+            self.last_llm_key_report_cursor = str(next_since)
+        if reports:
+            self.llm_key_reports_empty_since = 0.0
+            bt.logging.info(
+                f"llm-key report poll: {processed}/{len(reports)} report(s) processed, "
+                f"{flushed} hotkey(s) crossed the volume floor and scored this poll"
+            )
+        else:
+            accepted = sum(1 for s in self.llm_key_hotkey_status.values() if s.get("accepted"))
+            if accepted:
+                if not self.llm_key_reports_empty_since:
+                    self.llm_key_reports_empty_since = now
+                empty_hours = (now - self.llm_key_reports_empty_since) / 3600.0
+                threshold_hours = max(
+                    0.0,
+                    _env_float(
+                        C.LLM_KEY_REPORTS_EMPTY_WARN_SECONDS_ENV,
+                        C.LLM_KEY_REPORTS_EMPTY_WARN_SECONDS,
+                    ),
+                ) / 3600.0
+                if empty_hours >= threshold_hours:
+                    bt.logging.warning(
+                        f"llm-key report poll: zero usage reports for {empty_hours:.1f}h despite "
+                        f"{accepted} accepted key(s) on file -- the protocol backend may not be "
+                        "feeding usage/efficiency data (GET /llm-keys/reports empty); on-chain "
+                        "weight for LLM-key efficiency will stay at zero until this resolves"
+                    )
+        self.last_llm_key_report_poll_at = now
 
     def get_miner_uids(self) -> list[int]:
         """All registered neurons that are serving an axon (i.e., miners)."""
@@ -1657,15 +1141,15 @@ class Validator(BaseValidatorNeuron):
 
     # ------------------------------------------------------------- forward
     async def forward(self):
-        """One validator step: resolve due → issue new → persist."""
+        """One validator step: ask for LLM keys, relay + poll reports, persist."""
         lock = getattr(self, "lock", None)
         if lock is None:
             lock = asyncio.Lock()
             self.lock = lock
         async with lock:
-            await self.resolve_due()
-            self.save_masxai_state()
-            await self.issue_round()
+            if self.llm_key_client is not None:
+                await self.llm_key_submission_round()
+                await self.llm_key_report_poll_round()
             self.save_masxai_state()
         # brief pause so we don't hot-loop; the base class also paces by epoch
         await asyncio.sleep(5)
@@ -1681,16 +1165,15 @@ if __name__ == "__main__":
                     "continuing stale alive logs"
                 )
                 raise SystemExit(1)
-            answered_pending = sum(
+            tracked = len(validator.llm_key_hotkey_status)
+            contributing = sum(
                 1
-                for forecast in validator.pending.values()
-                if forecast.get("probability") is not None
+                for status in validator.llm_key_hotkey_status.values()
+                if status.get("accepted")
             )
-            no_answer_pending = len(validator.pending) - answered_pending
             bt.logging.info(
-                f"MASXAI validator alive | pending={len(validator.pending)} "
-                f"answered={answered_pending} no_answer={no_answer_pending} "
-                f"resolved={validator.resolved_count} | "
+                f"MASXAI validator alive | llm_key_enabled={validator.llm_key_client is not None} "
+                f"hotkeys_tracked={tracked} contributing={contributing} | "
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')}"
             )
             time.sleep(30)

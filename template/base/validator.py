@@ -84,53 +84,6 @@ def _apply_burn_allocation(
     final_weights = final_weights / final_sum
     return final_uids.astype(np.int64), final_weights.astype(np.float32)
 
-BURN_UID = 25
-BURN_PERCENTAGE = 0.95
-
-
-def _apply_burn_allocation(
-    current_uids: np.ndarray,
-    weight_uids: np.ndarray,
-    weights: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    current_uids = np.asarray(current_uids)
-    if BURN_UID not in current_uids.tolist():
-        raise ValueError(
-            f"BURN_UID {BURN_UID} is not present in current metagraph uids: "
-            f"{current_uids.tolist()}"
-        )
-
-    if not 0.0 <= BURN_PERCENTAGE <= 1.0:
-        raise ValueError(
-            f"BURN_PERCENTAGE must be between 0.0 and 1.0, got {BURN_PERCENTAGE}"
-        )
-
-    weight_uids = np.asarray(weight_uids)
-    weights = np.asarray(weights, dtype=np.float64)
-    miner_percentage = 1.0 - BURN_PERCENTAGE
-
-    miner_mask = weight_uids != BURN_UID
-    miner_uids = weight_uids[miner_mask]
-    miner_weights = weights[miner_mask]
-
-    miner_sum = miner_weights.sum()
-    if miner_uids.size > 0 and miner_sum > 0:
-        miner_weights = (miner_weights / miner_sum) * miner_percentage
-        final_uids = np.append(miner_uids, BURN_UID)
-        final_weights = np.append(miner_weights, BURN_PERCENTAGE)
-    else:
-        final_uids = np.asarray([BURN_UID])
-        final_weights = np.asarray([1.0], dtype=np.float64)
-
-    final_sum = final_weights.sum()
-    if final_sum <= 0 or np.isnan(final_sum):
-        raise ValueError(
-            f"Final weights must sum to a positive value, got {final_sum}"
-        )
-
-    return final_uids, (final_weights / final_sum).astype(np.float32)
-
-
 class BaseValidatorNeuron(BaseNeuron):
     """
     Base class for Bittensor validators. Your validator should inherit from this class.
