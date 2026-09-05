@@ -77,6 +77,31 @@ class _FakeLLMKeyDendrite:
         return responses
 
 
+def _five_distinct_keys() -> list[dict]:
+    """Five slot entries with distinct physical-key blobs, meeting
+    LLM_KEY_MIN_KEYS_PER_HOTKEY -- slot 0 mirrors _FakeLLMKeyDendrite's
+    single-key default (openai/gpt-4o-mini) so existing slot-0 assertions
+    still hold."""
+    providers = [
+        ("openai", "gpt-4o-mini"),
+        ("anthropic", "claude-3-haiku"),
+        ("mistral", "mistral-small"),
+        ("deepseek", "deepseek-chat"),
+        ("openai", "gpt-4o"),
+    ]
+    return [
+        {
+            "slot": i,
+            "provider": provider,
+            "model": model,
+            "encrypted_key_blob": f"ZmFrZS1jaXBoZXJ0ZXh0-{i}",
+            "blob_encoding": "nacl-sealedbox-v1",
+            "pubkey_id_used": "v1",
+        }
+        for i, (provider, model) in enumerate(providers)
+    ]
+
+
 class _FakeTimeoutDendrite:
     """Every miner times out: has_key stays None (never touched by forward())."""
 
@@ -182,7 +207,7 @@ def _validator(client, dendrite) -> Validator:
 
 def test_submission_round_only_submits_for_miners_with_a_key():
     client = _FakeLLMKeyClient()
-    dendrite = _FakeLLMKeyDendrite()
+    dendrite = _FakeLLMKeyDendrite(keys=_five_distinct_keys())
     validator = _validator(client, dendrite)
 
     asyncio.run(validator.llm_key_submission_round())
@@ -190,7 +215,7 @@ def test_submission_round_only_submits_for_miners_with_a_key():
     assert len(client.submit_calls) == 1
     submitted = client.submit_calls[0]
     assert submitted["hotkey"] == "miner-hotkey-1"
-    assert len(submitted["keys"]) == 1
+    assert len(submitted["keys"]) == 5
     assert submitted["keys"][0]["slot"] == 0
     assert submitted["keys"][0]["provider"] == "openai"
     assert submitted["keys"][0]["model"] == "gpt-4o-mini"
@@ -260,7 +285,7 @@ def test_submission_round_records_rejection_without_zeroing_an_existing_active_k
             accepted=False, status="REJECTED", reason="existing_key_in_use"
         )
     )
-    dendrite = _FakeLLMKeyDendrite()
+    dendrite = _FakeLLMKeyDendrite(keys=_five_distinct_keys())
     validator = _validator(client, dendrite)
     validator.scores[1] = 0.8
 
@@ -274,7 +299,7 @@ def test_submission_round_rejection_is_a_noop_for_a_hotkey_with_no_prior_score()
     client = _FakeLLMKeyClient(
         submit_result=LLMKeySubmitResult(accepted=False, status="REJECTED", reason="model_not_allowed")
     )
-    dendrite = _FakeLLMKeyDendrite()
+    dendrite = _FakeLLMKeyDendrite(keys=_five_distinct_keys())
     validator = _validator(client, dendrite)
 
     asyncio.run(validator.llm_key_submission_round())

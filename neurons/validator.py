@@ -6,7 +6,12 @@ LLMKeySynapse, relays accepted submissions to the protocol backend, polls for
 usage/efficiency reports, and blends a liveness-participation signal with the
 protocol-reported efficiency EMA (self.scores) into on-chain weights.
 
-A miner contributes up to LLM_KEY_MAX_KEYS_PER_HOTKEY (5) keys. The protocol
+A miner contributes between LLM_KEY_MIN_KEYS_PER_HOTKEY and
+LLM_KEY_MAX_KEYS_PER_HOTKEY (5 and 5) distinct keys per submission --
+_validate_miner_keys() sanitizes what a miner sent, and
+llm_key_submission_round() declines to relay the whole batch if what
+survives sanitization falls below the minimum, rather than relaying a
+partial batch. The protocol
 reports one row per single call, each tagged with which key served it
 (key_id + provider/model) -- rows accumulate per (hotkey, key) in
 self.llm_key_pending_calls until the hotkey has pooled enough calls to say
@@ -861,7 +866,13 @@ class Validator(BaseValidatorNeuron):
             if not resp.has_key:
                 continue
             keys_payload = self._validate_miner_keys(uid, getattr(resp, "keys", None))
-            if not keys_payload:
+            if len(keys_payload) < C.LLM_KEY_MIN_KEYS_PER_HOTKEY:
+                if keys_payload:
+                    bt.logging.warning(
+                        f"llm-key: uid={uid} sent {len(keys_payload)} valid key(s), "
+                        f"below the required minimum of {C.LLM_KEY_MIN_KEYS_PER_HOTKEY}; "
+                        "not relaying this round"
+                    )
                 continue
             hotkey = self.metagraph.hotkeys[int(uid)]
             try:

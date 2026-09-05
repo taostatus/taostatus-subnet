@@ -95,23 +95,19 @@ def test_forward_declines_when_model_not_allowed(monkeypatch):
     assert result.keys == []
 
 
-def test_forward_encrypts_when_opted_in_and_allowed(monkeypatch):
-    # Legacy single-key env config still contributes, as slot 0.
+def test_forward_declines_when_only_legacy_single_key_configured(monkeypatch):
+    # The legacy single-key triple can only ever produce exactly one config
+    # entry -- it can never alone satisfy LLM_KEY_MIN_KEYS_PER_HOTKEY (5), so
+    # a miner relying on it declines the round entirely rather than sending
+    # a lone key that's guaranteed to be short of the requirement.
     _set_llm_key_env(monkeypatch)
     miner = _miner(_FakeMetagraph())
     synapse = _key_request_synapse(allowed_models=["openai/gpt-4o-mini"])
 
     result = asyncio.run(miner.forward(synapse))
 
-    assert result.has_key is True
-    assert len(result.keys) == 1
-    key = result.keys[0]
-    assert key["slot"] == 0
-    assert key["provider"] == "openai"
-    assert key["model"] == "gpt-4o-mini"
-    assert key["encrypted_key_blob"] != ""
-    assert key["pubkey_id_used"] == "v1"
-    assert key["blob_encoding"] == "nacl-sealedbox-v1"
+    assert result.has_key is False
+    assert result.keys == []
 
 
 def test_forward_sends_every_configured_key_with_stable_slots(monkeypatch):
@@ -119,37 +115,52 @@ def test_forward_sends_every_configured_key_with_stable_slots(monkeypatch):
         {"provider": "openai", "model": "gpt-4o", "api_key": "sk-a"},
         {"provider": "openai", "model": "gpt-4o", "api_key": "sk-b"},  # same model twice: capacity stacking
         {"provider": "anthropic", "model": "claude-3-5-sonnet-20241022", "api_key": "sk-c"},
+        {"provider": "mistral", "model": "mistral-large-latest", "api_key": "sk-d"},
+        {"provider": "deepseek", "model": "deepseek-chat", "api_key": "sk-e"},
     ])
     miner = _miner(_FakeMetagraph())
-    synapse = _key_request_synapse(
-        allowed_models=["openai/gpt-4o", "anthropic/claude-3-5-sonnet-20241022"],
-    )
+    synapse = _key_request_synapse(allowed_models=[
+        "openai/gpt-4o", "anthropic/claude-3-5-sonnet-20241022",
+        "mistral/mistral-large-latest", "deepseek/deepseek-chat",
+    ])
 
     result = asyncio.run(miner.forward(synapse))
 
     assert result.has_key is True
-    assert [k["slot"] for k in result.keys] == [0, 1, 2]
+    assert [k["slot"] for k in result.keys] == [0, 1, 2, 3, 4]
     assert [k["model"] for k in result.keys] == [
         "gpt-4o", "gpt-4o", "claude-3-5-sonnet-20241022",
+        "mistral-large-latest", "deepseek-chat",
     ]
     # each slot's blob is its own key, independently encrypted
-    assert len({k["encrypted_key_blob"] for k in result.keys}) == 3
+    assert len({k["encrypted_key_blob"] for k in result.keys}) == 5
+    key = result.keys[0]
+    assert key["provider"] == "openai"
+    assert key["encrypted_key_blob"] != ""
+    assert key["pubkey_id_used"] == "v1"
+    assert key["blob_encoding"] == "nacl-sealedbox-v1"
 
 
 def test_forward_skips_disallowed_slot_but_keeps_the_rest(monkeypatch):
     # Slot numbers stay stable even when a middle slot is skipped -- the
-    # backend replaces by slot, so renumbering would swap keys around.
+    # backend replaces by slot, so renumbering would swap keys around. Five
+    # configured keys meets the minimum at the config level; this round's
+    # allowed_models then drops one slot, independently of that check.
     _set_llm_keys_json_env(monkeypatch, [
         {"provider": "openai", "model": "gpt-4o", "api_key": "sk-a"},
         {"provider": "deepseek", "model": "not-allowed-model", "api_key": "sk-b"},
         {"provider": "openai", "model": "gpt-4o", "api_key": "sk-c"},
+        {"provider": "anthropic", "model": "claude-3-5-sonnet-20241022", "api_key": "sk-d"},
+        {"provider": "mistral", "model": "mistral-large-latest", "api_key": "sk-e"},
     ])
     miner = _miner(_FakeMetagraph())
-    synapse = _key_request_synapse(allowed_models=["openai/gpt-4o"])
+    synapse = _key_request_synapse(allowed_models=[
+        "openai/gpt-4o", "anthropic/claude-3-5-sonnet-20241022", "mistral/mistral-large-latest",
+    ])
 
     result = asyncio.run(miner.forward(synapse))
 
-    assert [k["slot"] for k in result.keys] == [0, 2]
+    assert [k["slot"] for k in result.keys] == [0, 2, 3, 4]
 
 
 def test_configs_cap_at_max_and_skip_malformed(monkeypatch):
@@ -163,6 +174,69 @@ def test_configs_cap_at_max_and_skip_malformed(monkeypatch):
 
     assert len(configs) == C.LLM_KEY_MAX_KEYS_PER_HOTKEY
     assert all(len(c) == 3 for c in configs)
+
+
+def test_configs_below_minimum_declines_entirely(monkeypatch):
+    from neurons.miner import _llm_key_contrib_configs
+
+    assert C.LLM_KEY_MIN_KEYS_PER_HOTKEY == 5  # this test assumes the current default
+    _set_llm_keys_json_env(monkeypatch, [
+        {"provider": "openai", "model": "gpt-4o", "api_key": f"sk-{i}"} for i in range(4)
+    ])
+
+    assert _llm_key_contrib_configs() == []
+
+
+def test_configs_meets_minimum_exactly(monkeypatch):
+    from neurons.miner import _llm_key_contrib_configs
+
+    _set_llm_keys_json_env(monkeypatch, [
+        {"provider": "openai", "model": "gpt-4o", "api_key": f"sk-{i}"}
+        for i in range(C.LLM_KEY_MIN_KEYS_PER_HOTKEY)
+    ])
+
+    configs = _llm_key_contrib_configs()
+
+    assert len(configs) == C.LLM_KEY_MIN_KEYS_PER_HOTKEY
+
+
+def test_configs_dedupes_same_physical_key_across_slots(monkeypatch):
+    # 6 configured, but two entries share the identical physical key --
+    # same provider/model twice is fine (capacity stacking), the same
+    # underlying secret twice is not. Deduping still leaves 5 distinct
+    # keys, so the minimum is still met.
+    from neurons.miner import _llm_key_contrib_configs
+
+    _set_llm_keys_json_env(monkeypatch, [
+        {"provider": "openai", "model": "gpt-4o", "api_key": "sk-shared"},
+        {"provider": "openai", "model": "gpt-4o", "api_key": "sk-shared"},  # same physical key: dropped
+        {"provider": "openai", "model": "gpt-4o", "api_key": "sk-b"},  # same model, distinct key: kept
+        {"provider": "anthropic", "model": "claude-3-5-sonnet-20241022", "api_key": "sk-c"},
+        {"provider": "mistral", "model": "mistral-large-latest", "api_key": "sk-d"},
+        {"provider": "deepseek", "model": "deepseek-chat", "api_key": "sk-e"},
+    ])
+
+    configs = _llm_key_contrib_configs()
+
+    assert len(configs) == 5
+    assert len({api_key for _, _, api_key in configs}) == 5
+
+
+def test_configs_dedup_dropping_below_minimum_declines_entirely(monkeypatch):
+    # 5 configured, but two share a physical key -- dedup leaves only 4
+    # distinct keys, below the minimum, so the whole round is declined
+    # rather than sending an incomplete batch.
+    from neurons.miner import _llm_key_contrib_configs
+
+    _set_llm_keys_json_env(monkeypatch, [
+        {"provider": "openai", "model": "gpt-4o", "api_key": "sk-shared"},
+        {"provider": "openai", "model": "gpt-4o", "api_key": "sk-shared"},
+        {"provider": "anthropic", "model": "claude-3-5-sonnet-20241022", "api_key": "sk-c"},
+        {"provider": "mistral", "model": "mistral-large-latest", "api_key": "sk-d"},
+        {"provider": "deepseek", "model": "deepseek-chat", "api_key": "sk-e"},
+    ])
+
+    assert _llm_key_contrib_configs() == []
 
 
 def test_configs_empty_on_malformed_json(monkeypatch):
