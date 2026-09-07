@@ -52,6 +52,28 @@ LLM_KEY_CONTRIB_API_KEY_ENV = "MASXAI_LLM_KEY_CONTRIB_API_KEY"
 # backend-side (slots 0..4 only).
 LLM_KEY_MAX_KEYS_PER_HOTKEY = 5
 
+# Mirrors the protocol backend's llm_key_min_keys_per_hotkey. A miner must
+# contribute at least this many *distinct* keys per submission or the round
+# is declined entirely (miner-side: never answers has_key=True; validator
+# -side: sanitized batch below this count is not relayed) rather than
+# submitting a partial batch -- same "decline rather than hedge" principle
+# used elsewhere in this project, applied to submission volume instead of
+# debate content. Physical-key uniqueness itself can only be checked where
+# the plaintext is visible: miner-side (before encryption) as a courtesy,
+# and authoritatively at the protocol backend (SHA-256 fingerprint after
+# decryption) -- NaCl SealedBox is deliberately non-deterministic, so
+# neither ciphertext blobs nor the validator (which never decrypts) can
+# ever detect a repeated physical key by comparison alone.
+LLM_KEY_MIN_KEYS_PER_HOTKEY = 5
+
+# --- Discord announcements (optional) ---
+# Unset DISCORD_WEBHOOK_URL_ENV is the kill switch: masxai/discord.py no-ops
+# and the validator never attempts a post. The channel is public, so only
+# on-chain-public data is ever sent (hotkey, provider/model, accept/reject).
+DISCORD_WEBHOOK_URL_ENV = "MASXAI_DISCORD_WEBHOOK_URL"
+DISCORD_TIMEOUT_ENV = "MASXAI_DISCORD_TIMEOUT"
+DISCORD_TIMEOUT = 5.0                  # short on purpose: never hold up a round
+
 LLM_KEY_BASE_URL_ENV = "MASXAI_LLM_KEY_BASE_URL"
 LLM_KEY_VALIDATOR_TOKEN_ENV = "MASXAI_LLM_KEY_VALIDATOR_TOKEN"
 LLM_KEY_TIMEOUT_ENV = "MASXAI_LLM_KEY_TIMEOUT"

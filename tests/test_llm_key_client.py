@@ -197,18 +197,26 @@ def test_request_raises_after_exhausting_retries_on_persistent_network_error(mon
 
 
 def test_open_llm_key_client_from_env_returns_none_when_token_unset(monkeypatch):
+    # load_env() reads the repo's real .env with override=True -- if the
+    # developer machine's actual .env has a real validator token configured
+    # (needed for this project's own local Docker/protocol setup), that
+    # would silently repopulate the var this test just deleted. Stub it out
+    # so this test only ever sees the env it explicitly sets up.
+    monkeypatch.setattr("masxai.llm_key_client.load_env", lambda: None)
     monkeypatch.delenv(C.LLM_KEY_VALIDATOR_TOKEN_ENV, raising=False)
     monkeypatch.setenv(C.LLM_KEY_BASE_URL_ENV, "http://fake-protocol")
     assert open_llm_key_client_from_env() is None
 
 
 def test_open_llm_key_client_from_env_returns_none_when_base_url_unset(monkeypatch):
+    monkeypatch.setattr("masxai.llm_key_client.load_env", lambda: None)
     monkeypatch.setenv(C.LLM_KEY_VALIDATOR_TOKEN_ENV, "tok")
     monkeypatch.delenv(C.LLM_KEY_BASE_URL_ENV, raising=False)
     assert open_llm_key_client_from_env() is None
 
 
 def test_open_llm_key_client_from_env_returns_client_when_configured(monkeypatch):
+    monkeypatch.setattr("masxai.llm_key_client.load_env", lambda: None)
     monkeypatch.setenv(C.LLM_KEY_VALIDATOR_TOKEN_ENV, "tok")
     monkeypatch.setenv(C.LLM_KEY_BASE_URL_ENV, "http://fake-protocol")
     client = open_llm_key_client_from_env()

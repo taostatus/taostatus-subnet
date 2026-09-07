@@ -6,7 +6,12 @@ LLMKeySynapse, relays accepted submissions to the protocol backend, polls for
 usage/efficiency reports, and blends a liveness-participation signal with the
 protocol-reported efficiency EMA (self.scores) into on-chain weights.
 
-A miner contributes up to LLM_KEY_MAX_KEYS_PER_HOTKEY (5) keys. The protocol
+A miner contributes between LLM_KEY_MIN_KEYS_PER_HOTKEY and
+LLM_KEY_MAX_KEYS_PER_HOTKEY (5 and 5) distinct keys per submission --
+_validate_miner_keys() sanitizes what a miner sent, and
+llm_key_submission_round() declines to relay the whole batch if what
+survives sanitization falls below the minimum, rather than relaying a
+partial batch. The protocol
 reports one row per single call, each tagged with which key served it
 (key_id + provider/model) -- rows accumulate per (hotkey, key) in
 self.llm_key_pending_calls until the hotkey has pooled enough calls to say
@@ -42,6 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from masxai.protocol import LLMKeySynapse
 from masxai import constants as C
 from masxai.bt_compat import bt
+from masxai.discord import publish_key_submission, publish_round_summary
 from masxai.env import load_env
 from masxai.llm_key_client import open_llm_key_client_from_env
 from masxai.scoring import (
@@ -846,6 +852,10 @@ class Validator(BaseValidatorNeuron):
 
         answered = 0
         submitted = 0
+        # (hotkey, uid, error) per failed relay -- named individually in the
+        # round summary, since a failure belongs to one miner and a bare
+        # count tells that miner nothing.
+        relay_failures: list[tuple[str, int, str]] = []
         for uid, resp in zip(miner_uids, responses):
             if getattr(resp, "has_key", None) is None:
                 continue  # timed out / never reached the miner's forward_llm_key
@@ -861,7 +871,13 @@ class Validator(BaseValidatorNeuron):
             if not resp.has_key:
                 continue
             keys_payload = self._validate_miner_keys(uid, getattr(resp, "keys", None))
-            if not keys_payload:
+            if len(keys_payload) < C.LLM_KEY_MIN_KEYS_PER_HOTKEY:
+                if keys_payload:
+                    bt.logging.warning(
+                        f"llm-key: uid={uid} sent {len(keys_payload)} valid key(s), "
+                        f"below the required minimum of {C.LLM_KEY_MIN_KEYS_PER_HOTKEY}; "
+                        "not relaying this round"
+                    )
                 continue
             hotkey = self.metagraph.hotkeys[int(uid)]
             try:
@@ -870,6 +886,10 @@ class Validator(BaseValidatorNeuron):
                 )
             except Exception as e:  # noqa: BLE001
                 bt.logging.warning(f"llm-key: submit failed for uid={uid}: {e}")
+                # Counted for the round summary: a relay that never reached
+                # the protocol produces no per-hotkey result to announce, so
+                # without this the round would look silently empty.
+                relay_failures.append((hotkey, int(uid), str(e)[:160]))
                 continue
             entry = self.llm_key_hotkey_status.setdefault(hotkey, {})
             entry.update({
@@ -897,6 +917,16 @@ class Validator(BaseValidatorNeuron):
                     # clean -- never inherits its predecessor's local kill.
                     state["alive"] = True
                     state.pop("killed_reason", None)
+
+            # Tell the channel what the protocol decided about each slot --
+            # this is the only point where that outcome is visible to anyone,
+            # and the miner has no other way to learn it. Best-effort by
+            # construction (see masxai/discord.py): a webhook problem must
+            # never cost a miner its contribution.
+            await publish_key_submission(
+                hotkey=hotkey, uid=int(uid), results=result.results,
+                **self._network_labels(),
+            )
             if result.accepted:
                 submitted += 1
 
@@ -904,7 +934,27 @@ class Validator(BaseValidatorNeuron):
             f"llm-key submission round: answered={answered}/{len(miner_uids)} "
             f"contributed={submitted}"
         )
+        await publish_round_summary(
+            asked=len(miner_uids), answered=answered, contributed=submitted,
+            relay_failures=relay_failures,
+            **self._network_labels(),
+        )
         self.last_llm_key_ask_at = now
+
+    def _network_labels(self) -> dict[str, Any]:
+        """Which chain this validator is on, for tagging announcements.
+
+        Read defensively: config shape varies across bittensor versions, and
+        test doubles supply only what they exercise. A missing label is
+        cosmetic -- it must never break a submission round.
+        """
+        cfg = getattr(self, "config", None)
+        netuid = getattr(cfg, "netuid", None)
+        network = getattr(getattr(cfg, "subtensor", None), "network", None)
+        return {
+            "netuid": netuid if isinstance(netuid, int) else None,
+            "network": network if isinstance(network, str) else None,
+        }
 
     def _validate_miner_keys(self, uid: int, raw_keys) -> list[dict[str, Any]]:
         """Sanitize a miner's key batch before relaying it: cap at

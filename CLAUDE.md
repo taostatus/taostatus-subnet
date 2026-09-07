@@ -9,12 +9,25 @@ on-chain weights from how reliable and fast each miner's contributed key is.
 
 ## Current Implementation
 
-1. Miner opts in locally with up to `LLM_KEY_MAX_KEYS_PER_HOTKEY` (5) LLM
-   API keys for allowed provider/models — `MASXAI_LLM_KEYS_JSON` (a JSON
-   array; list order = slot order), or the legacy single-key
-   `MASXAI_LLM_KEY_CONTRIB_*` triple as slot 0. Duplicates of the same
-   provider/model across slots are allowed (capacity stacking); the same
-   physical key twice is not.
+1. Miner opts in locally with between `LLM_KEY_MIN_KEYS_PER_HOTKEY` and
+   `LLM_KEY_MAX_KEYS_PER_HOTKEY` (both 5, so exactly 5) distinct LLM API
+   keys for allowed provider/models — `MASXAI_LLM_KEYS_JSON` (a JSON array;
+   list order = slot order). A submission below the minimum is declined
+   entirely (miner never answers `has_key=True`; validator never relays a
+   sanitized batch below the minimum either) rather than sent as a partial
+   batch — same "decline rather than hedge" principle applied elsewhere in
+   this project. The legacy single-key `MASXAI_LLM_KEY_CONTRIB_*` triple
+   (slot 0 only) can never alone satisfy a minimum greater than 1, so it is
+   only useful today as one entry among several `MASXAI_LLM_KEYS_JSON`
+   keys. Duplicates of the same provider/model across slots are allowed
+   (capacity stacking); the same physical key twice is not — enforced only
+   at the protocol backend (SHA-256 fingerprint after decryption), since
+   NaCl SealedBox encryption is deliberately non-deterministic and neither
+   the miner's ciphertext nor the validator (which never decrypts) can ever
+   compare two submissions to detect a repeated physical key. The subnet
+   side (miner.py) only does a courtesy plaintext dedup before encrypting,
+   to avoid wasting a round on a submission guaranteed to come back
+   partially rejected.
 2. Validator periodically asks every miner for its keys via `LLMKeySynapse`
    (`masxai/protocol.py`, one `keys[]` batch per miner).
 3. Miner encrypts the raw key client-side (`masxai/llm_key_crypto.py`, NaCl
@@ -42,6 +55,11 @@ issue prediction questions of any kind.
   miner's own infrastructure is ever sent.
 - A miner never talks to the protocol backend directly and never sees its own
   key leave in plaintext.
+- A submission must contain at least `LLM_KEY_MIN_KEYS_PER_HOTKEY` (5)
+  distinct physical keys or the miner declines the round entirely (never a
+  partial batch); the protocol backend enforces the same minimum
+  (`llm_key_min_keys_per_hotkey`) as a 422 on the `keys[]` batch shape, the
+  authoritative boundary since only it ever sees plaintext to fingerprint.
 - `blacklist()` always requires a validator permit, unconditionally — this
   synapse triggers a state-changing action (a key submission relayed onward
   to the protocol), so it doesn't inherit a permissive default.
@@ -61,8 +79,8 @@ issue prediction questions of any kind.
 - Submit weights every eligible epoch, never skipping the chain call — going
   silent makes Yuma consensus treat the validator as inactive (`vtrust`
   collapses). See "Weight Setting" below.
-- A miner holds up to 5 key slots; a submission for a slot replaces that
-  slot's key. The replacement is rejected (`reason="existing_key_in_use"`)
+- A miner holds exactly 5 key slots (min and max both 5); a submission for a
+  slot replaces that slot's key. The replacement is rejected (`reason="existing_key_in_use"`)
   only while that slot's current key is checked out by an agent
   (`locked_until` in the future) — other slots are unaffected — so a swap
   can never yank a key out from under an in-flight call. Once accepted, a

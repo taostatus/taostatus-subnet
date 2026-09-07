@@ -1,11 +1,13 @@
 """
 neurons/miner.py - MASXAI miner: LLM-key contribution pipeline.
 
-A miner opts in to contribute up to LLM_KEY_MAX_KEYS_PER_HOTKEY (5) LLM API
-keys as a resource for the protocol backend. The miner never talks to the
-protocol directly and never sees a contributed key leave in plaintext -- it
-encrypts each key client-side for the protocol's published public key, and
-the validator relays only those opaque ciphertexts onward.
+A miner opts in to contribute between LLM_KEY_MIN_KEYS_PER_HOTKEY (5) and
+LLM_KEY_MAX_KEYS_PER_HOTKEY (5) distinct LLM API keys as a resource for the
+protocol backend -- fewer than the minimum and the miner declines the round
+entirely rather than contributing a partial batch. The miner never talks to
+the protocol directly and never sees a contributed key leave in plaintext --
+it encrypts each key client-side for the protocol's published public key,
+and the validator relays only those opaque ciphertexts onward.
 """
 
 import json
@@ -45,17 +47,37 @@ def _utc_now_iso() -> str:
 
 def _llm_key_contrib_configs() -> list[typing.Tuple[str, str, str]]:
     """Return the operator's configured keys as [(provider, model, api_key)],
-    capped at LLM_KEY_MAX_KEYS_PER_HOTKEY. Empty when not opted in or nothing
-    is configured completely.
+    deduplicated by physical key and required to meet
+    LLM_KEY_MIN_KEYS_PER_HOTKEY, capped at LLM_KEY_MAX_KEYS_PER_HOTKEY.
+    Empty when not opted in, nothing is configured completely, or the
+    deduplicated set doesn't meet the minimum -- a miner declines the round
+    entirely rather than contributing a partial batch (mirrors this
+    project's "decline rather than hedge" principle, applied to submission
+    volume instead of debate content).
 
     MASXAI_LLM_KEYS_JSON (a JSON array of {provider, model, api_key}) is the
     multi-key config; list order is the slot order. The legacy single-key
     MASXAI_LLM_KEY_CONTRIB_* triple is still honored as slot 0 when the JSON
-    env is unset. A malformed JSON document or entry is skipped with a
-    warning rather than crashing the miner.
+    env is unset -- note it can never alone satisfy the minimum once that's
+    >1, so it only remains useful combined with... nothing else, practically
+    it's retired by a minimum >1. A malformed JSON document or entry is
+    skipped with a warning rather than crashing the miner.
+
+    Physical-key deduplication here is a courtesy check only: this is the
+    one layer that ever sees plaintext, so it's the only place a same
+    -physical-key check can be a real string comparison rather than a
+    structural impossibility -- the validator never decrypts, and NaCl
+    SealedBox (see llm_key_crypto.py) is deliberately non-deterministic, so
+    ciphertext blobs can never be compared to catch this downstream. The
+    protocol backend is the authoritative enforcer (fingerprint-after
+    -decrypt), this just avoids wasting a whole round on a submission
+    that's guaranteed to come back partially rejected.
     """
     if not _env_flag(C.LLM_KEY_CONTRIB_ENABLED_ENV, False):
         return []
+
+    configs: list[typing.Tuple[str, str, str]] = []
+    seen_api_keys: set[str] = set()
 
     raw_json = os.getenv(C.LLM_KEYS_JSON_ENV, "").strip()
     if raw_json:
@@ -67,7 +89,6 @@ def _llm_key_contrib_configs() -> list[typing.Tuple[str, str, str]]:
         if not isinstance(entries, list):
             bt.logging.warning(f"llm-key: {C.LLM_KEYS_JSON_ENV} must be a JSON array; contributing nothing")
             return []
-        configs: list[typing.Tuple[str, str, str]] = []
         for i, entry in enumerate(entries):
             if len(configs) >= C.LLM_KEY_MAX_KEYS_PER_HOTKEY:
                 bt.logging.warning(
@@ -84,15 +105,31 @@ def _llm_key_contrib_configs() -> list[typing.Tuple[str, str, str]]:
             if not provider or not model or not api_key:
                 bt.logging.warning(f"llm-key: entry #{i} is missing provider/model/api_key; skipping it")
                 continue
+            if api_key in seen_api_keys:
+                bt.logging.warning(
+                    f"llm-key: entry #{i} is the same physical key as an earlier entry; "
+                    "skipping the duplicate (same provider/model across slots is fine, "
+                    "the same underlying key is not)"
+                )
+                continue
+            seen_api_keys.add(api_key)
             configs.append((provider, model, api_key))
-        return configs
+    else:
+        provider = os.getenv(C.LLM_KEY_CONTRIB_PROVIDER_ENV, "").strip()
+        model = os.getenv(C.LLM_KEY_CONTRIB_MODEL_ENV, "").strip()
+        api_key = os.getenv(C.LLM_KEY_CONTRIB_API_KEY_ENV, "").strip()
+        if provider and model and api_key:
+            configs.append((provider, model, api_key))
 
-    provider = os.getenv(C.LLM_KEY_CONTRIB_PROVIDER_ENV, "").strip()
-    model = os.getenv(C.LLM_KEY_CONTRIB_MODEL_ENV, "").strip()
-    api_key = os.getenv(C.LLM_KEY_CONTRIB_API_KEY_ENV, "").strip()
-    if not provider or not model or not api_key:
+    if len(configs) < C.LLM_KEY_MIN_KEYS_PER_HOTKEY:
+        if configs:
+            bt.logging.warning(
+                f"llm-key: only {len(configs)} distinct key(s) configured, below the "
+                f"required minimum of {C.LLM_KEY_MIN_KEYS_PER_HOTKEY}; declining to "
+                "contribute this round rather than submitting a partial batch"
+            )
         return []
-    return [(provider, model, api_key)]
+    return configs
 
 
 class Miner(BaseMinerNeuron):
