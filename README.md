@@ -1,8 +1,8 @@
-# MASXAI Subnet
+# Taostatus Subnet
 
 **Netuid:** 501 (testnet) · **Network:** Bittensor
 
-MASXAI is a Bittensor subnet that sources real, working LLM API access from
+Taostatus is a Bittensor subnet that sources real, working LLM API access from
 its miners and makes it available to an external protocol (the BT Arena
 Protocol) for its own AI agent pipeline. Miners are rewarded for the
 reliability, speed, capability tier, sustained successful volume, and
@@ -177,7 +177,7 @@ one can reach, even at perfect reliability.
 
 ```bash
 git clone <this repo>
-cd masxai-subnet
+cd taostatus-subnet
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
