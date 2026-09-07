@@ -66,6 +66,14 @@ LLM_KEY_MAX_KEYS_PER_HOTKEY = 5
 # ever detect a repeated physical key by comparison alone.
 LLM_KEY_MIN_KEYS_PER_HOTKEY = 5
 
+# --- Discord announcements (optional) ---
+# Unset DISCORD_WEBHOOK_URL_ENV is the kill switch: masxai/discord.py no-ops
+# and the validator never attempts a post. The channel is public, so only
+# on-chain-public data is ever sent (hotkey, provider/model, accept/reject).
+DISCORD_WEBHOOK_URL_ENV = "MASXAI_DISCORD_WEBHOOK_URL"
+DISCORD_TIMEOUT_ENV = "MASXAI_DISCORD_TIMEOUT"
+DISCORD_TIMEOUT = 5.0                  # short on purpose: never hold up a round
+
 LLM_KEY_BASE_URL_ENV = "MASXAI_LLM_KEY_BASE_URL"
 LLM_KEY_VALIDATOR_TOKEN_ENV = "MASXAI_LLM_KEY_VALIDATOR_TOKEN"
 LLM_KEY_TIMEOUT_ENV = "MASXAI_LLM_KEY_TIMEOUT"
