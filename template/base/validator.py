@@ -311,19 +311,43 @@ class BaseValidatorNeuron(BaseNeuron):
         # Compute raw_weights safely
         raw_weights = self.scores / norm
 
-        bt.logging.debug("raw_weights", raw_weights)
-        bt.logging.debug("raw_weight_uids", str(self.metagraph.uids.tolist()))
-        # Process the raw weights to final_weights via subtensor limitations.
-        (
-            processed_weight_uids,
-            processed_weights,
-        ) = process_weights_for_netuid(
-            uids=self.metagraph.uids,
-            weights=raw_weights,
-            netuid=self.config.netuid,
-            subtensor=self.subtensor,
-            metagraph=self.metagraph,
-        )
+        # Nobody has earned anything yet: no miner has a confirmed positive
+        # efficiency score (see Validator._blended_weight_array).
+        #
+        # This must not fall through to process_weights_for_netuid below,
+        # which answers an all-zero vector with "No non-zero weights
+        # returning all ones" -- a uniform split. That would hand every
+        # registered miner an equal share of the non-burn allocation purely
+        # for being registered, which is exactly what this subnet's rule
+        # forbids: weight is earned only through confirmed, reported usage
+        # of a contributed key, never by registering or by answering the ask.
+        #
+        # With no earner, the entire allocation burns.
+        # _apply_burn_allocation below already renders exactly this case --
+        # a zero miner sum burns the whole allocation -- so the zeros are
+        # passed straight through to it rather than reimplemented here.
+        no_earners = not np.any(raw_weights > 0)
+        if no_earners:
+            bt.logging.info(
+                "no miner has a confirmed usage score; burning the full "
+                "allocation rather than splitting it uniformly"
+            )
+            processed_weight_uids = np.asarray(self.metagraph.uids)
+            processed_weights = np.zeros(len(processed_weight_uids), dtype=np.float32)
+        else:
+            bt.logging.debug("raw_weights", raw_weights)
+            bt.logging.debug("raw_weight_uids", str(self.metagraph.uids.tolist()))
+            # Process the raw weights to final_weights via subtensor limitations.
+            (
+                processed_weight_uids,
+                processed_weights,
+            ) = process_weights_for_netuid(
+                uids=self.metagraph.uids,
+                weights=raw_weights,
+                netuid=self.config.netuid,
+                subtensor=self.subtensor,
+                metagraph=self.metagraph,
+            )
         bt.logging.debug("processed_weights", processed_weights)
         bt.logging.debug("processed_weight_uids", processed_weight_uids)
 
