@@ -76,6 +76,18 @@ issue prediction questions of any kind.
   `llm_key_pending_calls`, `self.scores`) so restarts do not lose in-flight
   tracking, including a low-traffic hotkey's partial progress toward the
   call-volume floor.
+- Pay only scores this pipeline produced. A persisted `self.scores` entry is
+  earnings only if an LLM-key usage report put it there — the EMA cannot tell
+  its own work from a value that arrived in the state file some other way
+  (the pre-LLM-key forecasting subnet persisted its accuracy EMA under the
+  same `"scores"` key of the same file; a uid can also change hands while the
+  validator is down). `_has_llm_key_evidence()` requires a
+  `llm_key_hotkey_status` entry for the hotkey *currently* at that uid, with
+  `last_report_at` set and at least one key not locally killed. Unbacked
+  scores are dropped at load (`_drop_unbacked_scores()`, so a later report
+  can't unlock a legacy value) and withheld from every submitted weight
+  array. It is not a recency check — staleness is
+  `_decay_stale_llm_key_scores()`'s job.
 - Submit weights every eligible epoch, never skipping the chain call — going
   silent makes Yuma consensus treat the validator as inactive (`vtrust`
   collapses). See "Weight Setting" below.
@@ -109,8 +121,10 @@ issue prediction questions of any kind.
 ## Weight Setting
 
 Weight is earned only through confirmed LLM-key efficiency — computed in
-`Validator._blended_weight_array()` (`neurons/validator.py`), which is just
-`self.scores` (nan-safe): an EMA driven by `llm_key_efficiency_score()` from
+`Validator._blended_weight_array()` (`neurons/validator.py`), which is
+`self.scores` (nan-safe), minus any uid whose score has no reported LLM-key
+usage behind it (`Validator._has_llm_key_evidence()`): an EMA driven by
+`llm_key_efficiency_score()` from
 the protocol's usage reports. `self.scores[uid]` stays `0.0` until the
 protocol has reported real, verified usage for a key it currently considers
 active — a miner earns nothing merely by answering the ask, and nothing for

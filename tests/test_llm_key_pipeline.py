@@ -962,9 +962,24 @@ def test_blended_weight_array_ignores_participation_entirely():
     assert np.array_equal(blended, np.zeros(3, dtype=np.float32))
 
 
+def _reported_usage_status(uid: int = 1, **overrides) -> dict:
+    """A hotkey status entry in the shape the report poll leaves behind: the
+    protocol has reported usage for this hotkey, on a live key. This is what
+    makes a score payable (see Validator._has_llm_key_evidence)."""
+    status = {
+        "uid": uid,
+        "last_report_at": time.time(),
+        "key_active": True,
+        "keys": {"1": {"alive": True, "provider": "openai", "model": "gpt-4o"}},
+    }
+    status.update(overrides)
+    return status
+
+
 def test_blended_weight_array_is_llm_key_efficiency_only():
     validator = _validator(None, _FakeLLMKeyDendrite())
     validator.participation_scores = {1: 1.0}
+    validator.llm_key_hotkey_status = {"miner-hotkey-1": _reported_usage_status()}
     validator.scores = np.array([0.0, 0.82, 0.0], dtype=np.float32)
 
     blended = validator._blended_weight_array()
@@ -972,8 +987,114 @@ def test_blended_weight_array_is_llm_key_efficiency_only():
     assert np.array_equal(blended, np.array([0.0, 0.82, 0.0], dtype=np.float32))
 
 
+# --- only reported usage is payable -----------------------------------------
+#
+# A positive self.scores entry is earnings only if an LLM-key report put it
+# there. The pre-LLM-key subnet persisted its forecasting accuracy EMA under
+# the same "scores" key of the same state file, so an in-place upgrade would
+# otherwise keep paying miners for work this subnet no longer measures.
+
+def test_blended_weight_array_withholds_weight_from_scores_with_no_reports():
+    validator = _validator(None, _FakeLLMKeyDendrite())
+    # Inherited from a pre-LLM-key state file: a score, and nothing that says
+    # the protocol ever reported usage for this hotkey.
+    validator.scores = np.array([0.0, 0.82, 0.41], dtype=np.float32)
+
+    blended = validator._blended_weight_array()
+
+    assert np.array_equal(blended, np.zeros(3, dtype=np.float32))
+    # Masking is submission-local: the EMA itself is untouched.
+    assert validator.scores[1] == pytest.approx(0.82, abs=1e-6)
+
+
+def test_blended_weight_array_withholds_weight_when_keys_are_on_file_but_unused():
+    # Keys accepted, no usage reported yet -- a submission alone earns nothing.
+    validator = _validator(None, _FakeLLMKeyDendrite())
+    validator.llm_key_hotkey_status = {
+        "miner-hotkey-1": {"uid": 1, "accepted": True, "status": "ACTIVE"},
+    }
+    validator.scores = np.array([0.0, 0.82, 0.0], dtype=np.float32)
+
+    assert np.array_equal(validator._blended_weight_array(), np.zeros(3, dtype=np.float32))
+
+
+def test_blended_weight_array_withholds_weight_when_the_uid_changed_hands():
+    # The score belongs to whoever held uid 1 before; the hotkey there now has
+    # earned nothing (its own status entry still points at its old uid).
+    validator = _validator(None, _FakeLLMKeyDendrite())
+    validator.llm_key_hotkey_status = {"miner-hotkey-1": _reported_usage_status(uid=2)}
+    validator.scores = np.array([0.0, 0.82, 0.0], dtype=np.float32)
+
+    assert np.array_equal(validator._blended_weight_array(), np.zeros(3, dtype=np.float32))
+
+
+def test_blended_weight_array_withholds_weight_when_every_key_is_dead():
+    validator = _validator(None, _FakeLLMKeyDendrite())
+    validator.llm_key_hotkey_status = {
+        "miner-hotkey-1": _reported_usage_status(
+            keys={"1": {"alive": False}, "2": {"alive": False}},
+        ),
+    }
+    validator.scores = np.array([0.0, 0.82, 0.0], dtype=np.float32)
+
+    assert np.array_equal(validator._blended_weight_array(), np.zeros(3, dtype=np.float32))
+
+
+def test_a_score_earned_from_real_reports_is_paid():
+    # The other half of the rule: the gate must never stand between a miner
+    # and weight it actually earned. A plain report poll leaves behind
+    # everything _has_llm_key_evidence looks for.
+    client = _FakeLLMKeyClient()
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=C.LLM_KEY_VOLUME_TARGET_CALLS, failures=0),
+        next_since="2026-08-19T00:00:00Z",
+    )
+    validator = _validator(client, _FakeLLMKeyDendrite())
+
+    asyncio.run(validator.llm_key_report_poll_round())
+
+    assert validator.scores[1] > 0.0
+    assert validator._blended_weight_array()[1] == pytest.approx(
+        float(validator.scores[1]), abs=1e-6
+    )
+
+
+def test_load_state_discards_pre_llm_key_scores(tmp_path, monkeypatch):
+    # The exact shape the forecasting validator wrote: participation plus an
+    # accuracy EMA under "scores", and no llm_key_hotkey_status at all.
+    state_file = tmp_path / "state.json"
+    monkeypatch.setenv(C.VALIDATOR_STATE_FILE_ENV, str(state_file))
+    state_file.write_text(json.dumps({
+        "participation_scores": {"1": 0.9, "2": 0.7},
+        "scores": [0.0, 0.64, 0.31],
+    }))
+    validator = _validator(_FakeLLMKeyClient(), _FakeLLMKeyDendrite())
+
+    validator.load_masxai_state()
+
+    assert np.array_equal(validator.scores, np.zeros(3, dtype=np.float32))
+    # Nothing is left behind for a later report row to unlock.
+    assert np.array_equal(validator._blended_weight_array(), np.zeros(3, dtype=np.float32))
+
+
+def test_load_state_keeps_scores_backed_by_reported_usage(tmp_path, monkeypatch):
+    state_file = tmp_path / "state.json"
+    monkeypatch.setenv(C.VALIDATOR_STATE_FILE_ENV, str(state_file))
+    state_file.write_text(json.dumps({
+        "llm_key_hotkey_status": {"miner-hotkey-1": _reported_usage_status()},
+        "scores": [0.0, 0.64, 0.0],
+    }))
+    validator = _validator(_FakeLLMKeyClient(), _FakeLLMKeyDendrite())
+
+    validator.load_masxai_state()
+
+    assert validator.scores[1] == pytest.approx(0.64, abs=1e-6)
+    assert validator._blended_weight_array()[1] == pytest.approx(0.64, abs=1e-6)
+
+
 def test_blended_weight_array_is_nan_safe():
     validator = _validator(None, _FakeLLMKeyDendrite())
+    validator.llm_key_hotkey_status = {"miner-hotkey-1": _reported_usage_status()}
     validator.scores = np.array([np.nan, 0.5, np.inf], dtype=np.float32)
 
     blended = validator._blended_weight_array()
