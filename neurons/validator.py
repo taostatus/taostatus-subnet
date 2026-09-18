@@ -3,8 +3,8 @@ neurons/validator.py - MASXAI validator: LLM-key contribution pipeline.
 
 The validator periodically asks each miner to contribute an LLM API key via
 LLMKeySynapse, relays accepted submissions to the protocol backend, polls for
-usage/efficiency reports, and blends a liveness-participation signal with the
-protocol-reported efficiency EMA (self.scores) into on-chain weights.
+usage/efficiency reports, and sets on-chain weights from the efficiency of
+the usage reported in the last completed chain epoch (self.scores).
 
 A miner contributes between LLM_KEY_MIN_KEYS_PER_HOTKEY and
 LLM_KEY_MAX_KEYS_PER_HOTKEY (5 and 5) distinct keys per submission --
@@ -13,22 +13,25 @@ llm_key_submission_round() declines to relay the whole batch if what
 survives sanitization falls below the minimum, rather than relaying a
 partial batch. The protocol
 reports one row per single call, each tagged with which key served it
-(key_id + provider/model) -- rows accumulate per (hotkey, key) in
-self.llm_key_pending_calls until the hotkey has pooled enough calls to say
-anything meaningful, then get scored as ONE pooled window: reliability/
-quality/latency/volume across all live keys' calls, with the reward-tier
-multiplier blended per call from each row's own model (see
-llm_key_report_poll_round / _maybe_flush_pending).
+(key_id + provider/model).
 
-A confirmed-bad KEY stops earning immediately, not gradually -- but only
-that key: a report row with key_active=False, a DEAD/REVOKED roster entry, a
-fatal auth/billing error category, or a per-key sub-window that trips a hard
-floor cuts exactly that key's recent traffic share out of the hotkey's score
-(_kill_hotkey_key); the hotkey hard-zeroes only when its LAST live key dies
-(_zero_llm_key_score), or when a full pooled window itself trips a floor
-(the whole fleet is failing). Gradual EMA decay is reserved for the one case
-where nothing is confirmed -- a hotkey whose reports simply went stale
-(_decay_stale_llm_key_scores), where silence isn't yet proof of a bad key.
+Emission in each chain epoch pays for the reports of the epoch before it.
+Rows accumulate per (hotkey, key) in self.llm_key_pending_calls for the
+epoch the chain is in right now. When the chain starts a new epoch
+(_roll_epoch_if_needed), that accumulator closes into
+self.llm_key_last_epoch_calls and self.scores is recomputed from it alone
+(_score_last_epoch) -- one pooled window per hotkey, reliability/quality/
+latency/volume across all its live keys' calls, reward tier blended per
+call. Every weight set during an epoch therefore pays for exactly one
+complete epoch; nothing earned earlier carries over, so a miner with no good
+report in the last epoch earns nothing in this one.
+
+A confirmed-bad KEY stops earning immediately -- but only that key: a
+report row with key_active=False, a DEAD/REVOKED roster entry, a fatal
+auth/billing error category, or a per-key sub-window that trips a hard
+floor drops exactly that key's rows (_kill_hotkey_key); its
+healthy sibling keys keep earning, and a hotkey whose every key is dead has
+nothing left to score.
 """
 
 import asyncio
@@ -57,6 +60,12 @@ from masxai.scoring import (
     sanitize_latency_ms,
     sanitize_quality_score,
 )
+
+# Pooled epoch windows score from the first good report: a miner with any
+# good report in the last epoch earns for it. The call-volume floor
+# (LLM_KEY_MIN_CALLS_FOR_SCORING) is kept only as the evidence bar for
+# killing a single key on its own sub-window (_sub_window_floor_reason).
+EPOCH_MIN_CALLS_FOR_SCORING = 1
 
 try:
     from template.base.validator import BaseValidatorNeuron
@@ -121,14 +130,19 @@ class Validator(BaseValidatorNeuron):
         self.participation_scores: dict[int, float] = {}
         # None (unconfigured) is this pipeline's kill switch, checked before
         # every submission/report-poll round. self.scores (inherited from
-        # BaseValidatorNeuron) is the persisted LLM-key efficiency EMA.
+        # BaseValidatorNeuron) is the last completed epoch's LLM-key efficiency.
         self.llm_key_client = open_llm_key_client_from_env()
         self.llm_key_hotkey_status: dict[str, dict[str, Any]] = {}
-        # Rolling per-hotkey accumulator of raw single-call reports not yet
-        # scored -- see module docstring. Persisted so a validator restart
-        # doesn't lose a low-traffic hotkey's partial progress toward the
-        # volume floor.
+        # Per-hotkey accumulator of the raw single-call reports received in
+        # the current chain epoch -- see module docstring. Persisted, with the
+        # epoch it belongs to, so a restart within the same epoch keeps it.
         self.llm_key_pending_calls: dict[str, dict[str, Any]] = {}
+        # The last completed epoch's accumulator (same shape) -- what
+        # self.scores, and so this epoch's emission, is computed from.
+        self.llm_key_last_epoch_calls: dict[str, dict[str, Any]] = {}
+        # Start block of the chain epoch llm_key_pending_calls belongs to;
+        # None until the first successful chain read.
+        self.llm_key_epoch_start_block: Optional[int] = None
         self.last_llm_key_ask_at = 0.0
         self.last_llm_key_report_poll_at = 0.0
         self.last_llm_key_report_cursor: str = ""
@@ -151,6 +165,10 @@ class Validator(BaseValidatorNeuron):
             self.llm_key_hotkey_status = {}
         if not hasattr(self, "llm_key_pending_calls"):
             self.llm_key_pending_calls = {}
+        if not hasattr(self, "llm_key_last_epoch_calls"):
+            self.llm_key_last_epoch_calls = {}
+        if not hasattr(self, "llm_key_epoch_start_block"):
+            self.llm_key_epoch_start_block = None
         state_path = _state_file_path()
         if not state_path.exists():
             bt.logging.info(f"validator state file not found: {state_path}")
@@ -174,6 +192,16 @@ class Validator(BaseValidatorNeuron):
             self.last_llm_key_ask_at = float(s.get("last_llm_key_ask_at", 0.0))
             self.last_llm_key_report_poll_at = float(s.get("last_llm_key_report_poll_at", 0.0))
             self.last_llm_key_report_cursor = str(s.get("last_llm_key_report_cursor", ""))
+            self.llm_key_last_epoch_calls = {
+                str(k): self._migrate_pending_entry(v)
+                for k, v in s.get("llm_key_last_epoch_calls", {}).items()
+                if isinstance(v, dict)
+            }
+            # Absent in state written before per-epoch scoring: left None, so
+            # the first epoch check discards that old accumulator rather than
+            # paying it out as last epoch's work.
+            epoch_start = s.get("llm_key_epoch_start_block")
+            self.llm_key_epoch_start_block = None if epoch_start is None else int(epoch_start)
             scores = s.get("scores")
             if scores is not None:
                 arr = np.array(scores, dtype=np.float32)
@@ -266,6 +294,8 @@ class Validator(BaseValidatorNeuron):
                         "last_llm_key_ask_at": self.last_llm_key_ask_at,
                         "last_llm_key_report_poll_at": self.last_llm_key_report_poll_at,
                         "last_llm_key_report_cursor": self.last_llm_key_report_cursor,
+                        "llm_key_last_epoch_calls": self.llm_key_last_epoch_calls,
+                        "llm_key_epoch_start_block": self.llm_key_epoch_start_block,
                         "scores": self.scores.tolist(),
                     },
                     f,
@@ -326,119 +356,102 @@ class Validator(BaseValidatorNeuron):
             return f"{report.provider}/{report.model}"
         return "legacy"
 
-    def _record_llm_key_score(
-        self,
-        uid: int,
-        *,
-        hotkey: str,
-        success_count: int,
-        failure_count: int,
-        avg_latency_ms: Optional[float],
-        key_active: bool,
-        quality_score: Optional[float] = None,
-        min_calls_for_scoring: Optional[int] = None,
-        quality_call_count: Optional[int] = None,
-        model_tier_weight: Optional[float] = None,
-    ) -> None:
-        """EMA-update self.scores[uid] (the persisted LLM-key efficiency EMA)
-        from one aggregated usage window -- a single raw per-call report row
-        never has enough volume to score on its own (the protocol reports
-        one row per call), so callers pass the sum across
-        self.llm_key_pending_calls's rolling accumulator (see
-        llm_key_report_poll_round), not a raw report object directly.
+    # ------------------------------------------------------------- epochs
+    def _current_epoch_start_block(self) -> Optional[int]:
+        """Start block of the chain epoch this subnet is in right now, or
+        None when it can't be read (no chain connection yet, RPC failure).
 
-        A None reward (not enough call volume yet) is skipped rather than
-        EMA'd in as a zero - a quiet key isn't a bad key.
+        Read from the chain rather than computed from tempo: the epoch
+        schedule isn't a fixed formula (owner-triggered epochs, runtime
+        changes), and blocks_since_last_step is the chain's own answer. Both
+        values are read at one block, so a block ticking between the two
+        reads can't shift the start and fake an epoch change."""
+        subtensor = getattr(self, "subtensor", None)
+        netuid = getattr(getattr(self, "config", None), "netuid", None)
+        if subtensor is None or netuid is None:
+            return None
+        try:
+            block = int(subtensor.get_current_block())
+            since = subtensor.blocks_since_last_step(netuid, block=block)
+        except Exception as e:  # noqa: BLE001
+            bt.logging.warning(f"llm-key: could not read the current epoch: {e}")
+            return None
+        if since is None:
+            return None
+        return block - int(since)
 
-        A 0.0 reward is where emission actually stops: an inactive key, or a
-        window that tripped a hard floor (majority failures / confirmed
-        low-quality output) while carrying at least the configured
-        call-volume floor of evidence, hard-zeroes the score outright
-        instead of riding the EMA down over many polls. Only an
-        under-volume force-flushed window (min_calls_for_scoring lowered to
-        1 by _maybe_flush_pending) that happens to score 0.0 still takes
-        the damped EMA path -- one bad call is not confirmation.
-        """
-        avg_latency_s = avg_latency_ms / 1000.0 if avg_latency_ms is not None else None
-        configured_min_calls = _env_int(
-            C.LLM_KEY_MIN_CALLS_FOR_SCORING_ENV, C.LLM_KEY_MIN_CALLS_FOR_SCORING
-        )
-        if min_calls_for_scoring is None:
-            min_calls_for_scoring = configured_min_calls
-        if model_tier_weight is None:
-            # Legacy fallback -- callers with a pooled multi-key window pass
-            # the per-call blended tier explicitly.
-            model_tier_weight = self._model_tier_weight(hotkey)
-        reward = llm_key_efficiency_score(
-            success_count=success_count,
-            failure_count=failure_count,
-            avg_latency_s=avg_latency_s,
-            key_active=key_active,
-            quality_score=quality_score,
-            model_tier_weight=model_tier_weight,
-            min_calls_for_scoring=min_calls_for_scoring,
-            quality_call_count=quality_call_count,
-            reliability_floor=_env_float(
-                C.LLM_KEY_RELIABILITY_HARD_FLOOR_ENV, C.LLM_KEY_RELIABILITY_HARD_FLOOR
-            ),
-            quality_floor=_env_float(
-                C.LLM_KEY_QUALITY_HARD_FLOOR_ENV, C.LLM_KEY_QUALITY_HARD_FLOOR
-            ),
-            quality_floor_min_graded=_env_int(
-                C.LLM_KEY_QUALITY_FLOOR_MIN_GRADED_ENV, C.LLM_KEY_QUALITY_FLOOR_MIN_GRADED
-            ),
-        )
-        if reward is None:
-            return
-        total_calls = success_count + failure_count
-        if reward <= 0.0 and (not key_active or total_calls >= configured_min_calls):
-            self._zero_llm_key_score(
-                uid,
-                hotkey=hotkey,
-                reason=(
-                    "protocol reported key inactive"
-                    if not key_active
-                    else f"hard floor tripped on a full window "
-                    f"({success_count} ok / {failure_count} failed, quality={quality_score})"
-                ),
-            )
-            return
-        alpha = _env_float(C.LLM_KEY_EMA_ALPHA_ENV, C.LLM_KEY_EMA_ALPHA)
-        # Scale down the EMA step for low-volume windows so a single noisy
-        # call doesn't swing self.scores at full weight. (An inactive key
-        # never reaches here -- it hard-zeroes above.)
-        confidence = min(1.0, total_calls / C.LLM_KEY_VOLUME_TARGET_CALLS)
-        floor = _env_float(C.LLM_KEY_EMA_CONFIDENCE_FLOOR_ENV, C.LLM_KEY_EMA_CONFIDENCE_FLOOR)
-        alpha *= max(floor, confidence)
-        uid = int(uid)
-        if 0 <= uid < len(self.scores):
-            self.scores[uid] = ema_update(float(self.scores[uid]), reward, alpha=alpha)
-        else:
-            bt.logging.warning(
-                f"llm-key: uid={uid} out of range for scores array (len={len(self.scores)}); "
-                f"dropping score update for hotkey={hotkey} (metagraph resize race?)"
-            )
+    def _epoch_length_blocks(self) -> Optional[int]:
+        """Nominal epoch length (tempo + 1 blocks), or None if unreadable."""
+        subtensor = getattr(self, "subtensor", None)
+        netuid = getattr(getattr(self, "config", None), "netuid", None)
+        if subtensor is None or netuid is None:
+            return None
+        try:
+            tempo = subtensor.tempo(netuid)
+        except Exception as e:  # noqa: BLE001
+            bt.logging.warning(f"llm-key: could not read tempo: {e}")
+            return None
+        return None if not tempo else int(tempo) + 1
 
-    def _zero_llm_key_score(self, uid: int, *, hotkey: str, reason: str) -> None:
-        """Immediate emission cut for a confirmed-bad key: score drops to 0.0
-        outright, so the miner earns nothing from the very next weight
-        submission. Used for every signal strong enough to be conclusive --
-        key_active=False report, DEAD/REVOKED roster status, a fatal
-        auth/billing error category, or a full scored window below a hard
-        floor. Contrast _decay_score_toward_zero, the gradual path reserved
-        for mere staleness, where silence isn't yet proof."""
-        uid = int(uid)
-        if not (0 <= uid < len(self.scores)):
-            bt.logging.warning(
-                f"llm-key: uid={uid} out of range for scores array (len={len(self.scores)}); "
-                f"dropping score zero for hotkey={hotkey} (metagraph resize race?)"
-            )
+    def _roll_epoch_if_needed(self) -> None:
+        """Close the collecting epoch when the chain has moved to a new one.
+
+        The epoch that just ended becomes the one being paid: its
+        accumulator moves to llm_key_last_epoch_calls and self.scores is
+        recomputed from it, so every weight set during the new epoch pays
+        for the complete previous epoch -- nothing earned earlier carries
+        over, and a miner with no good report in that epoch earns nothing.
+
+        The closed accumulator is only paid if it really is the immediately
+        preceding epoch. If the validator was down across more than one
+        epoch, or the state predates per-epoch scoring (no epoch recorded),
+        it is discarded instead of being paid out as last epoch's work. If
+        the epoch can't be read, nothing changes -- the accumulator keeps
+        collecting and the next successful read decides."""
+        start = self._current_epoch_start_block()
+        previous = self.llm_key_epoch_start_block
+        if start is None or start == previous:
             return
-        if float(self.scores[uid]) > 0.0:
+        epoch_length = self._epoch_length_blocks()
+        if (
+            previous is not None
+            and epoch_length is not None
+            and 0 < start - previous < epoch_length / 2
+        ):
+            # An epoch can end early (a subnet owner can trigger one). A
+            # sliver that short is not an epoch of work: keep paying the
+            # real previous epoch, and let the rows it collected carry into
+            # the epoch that just started.
             bt.logging.info(
-                f"llm-key: zeroing score for uid={uid} hotkey={hotkey} -- {reason}"
+                f"llm-key: epoch at block {previous} lasted only {start - previous} "
+                f"block(s); folding it into the epoch starting at block {start}"
             )
-        self.scores[uid] = 0.0
+            self.llm_key_epoch_start_block = start
+            return
+        # 1.5x tolerates a short owner-triggered epoch or an irregular
+        # boundary, while a gap of two whole epochs never passes.
+        contiguous = (
+            previous is not None
+            and epoch_length is not None
+            and 0 < start - previous <= 1.5 * epoch_length
+        )
+        closed = self.llm_key_pending_calls if contiguous else {}
+        if contiguous:
+            bt.logging.info(
+                f"llm-key: epoch started at block {start}; paying the epoch that began at "
+                f"block {previous} ({len(closed)} hotkey window(s))"
+            )
+        else:
+            bt.logging.info(
+                f"llm-key: epoch started at block {start}; previous recorded epoch start "
+                f"{previous} is not the immediately preceding epoch (epoch length "
+                f"{epoch_length}) -- discarding {len(self.llm_key_pending_calls)} "
+                "hotkey window(s), nothing to pay this epoch"
+            )
+        self.llm_key_last_epoch_calls = closed
+        self.llm_key_pending_calls = {}
+        self.llm_key_epoch_start_block = start
+        self._score_last_epoch()
 
     def _hotkey_key_states(self, hotkey: str) -> dict[str, dict[str, Any]]:
         """The per-key tracking map inside a hotkey's status entry, keyed by
@@ -447,112 +460,33 @@ class Validator(BaseValidatorNeuron):
         status = self.llm_key_hotkey_status.setdefault(hotkey, {})
         return status.setdefault("keys", {})
 
-    def _kill_hotkey_key(self, uid: int, hotkey: str, sub_key: str, *, reason: str) -> None:
-        """Immediate, surgical emission cut for ONE confirmed-bad key of a
-        multi-key hotkey: drop its pending rows, mark it locally dead, and
-        cut its recent traffic share out of the hotkey's score -- the
-        healthy sibling keys keep earning their part undisturbed. When the
-        last live key dies, this degenerates to the full hard zero. Safe to
-        call repeatedly (the roster re-reports DEAD every poll): a key
-        already marked dead is a no-op, so the share can never be
-        double-deducted."""
-        key_states = self._hotkey_key_states(hotkey)
-        entry = key_states.setdefault(sub_key, {})
-        if entry.get("alive") is False:
-            return  # already killed -- never deduct the share twice
-        entry["alive"] = False
-        entry["killed_reason"] = reason
-
-        # Recent-traffic share: this key's calls vs the hotkey's total,
-        # over the current pending window plus the last flushed one.
-        acc = self.llm_key_pending_calls.get(hotkey)
-        pending_subs = (acc or {}).get("keys", {})
-
-        def _calls(sub: dict) -> int:
-            return int(sub.get("success_count", 0)) + int(sub.get("failure_count", 0))
-
-        dead_calls = _calls(pending_subs.get(sub_key, {})) + int(entry.get("last_window_calls", 0))
-        total_calls = sum(_calls(sub) for sub in pending_subs.values()) + sum(
-            int(state.get("last_window_calls", 0)) for state in key_states.values()
-        )
-
-        # Its rows are moot once the key is confirmed dead.
-        if acc is not None:
-            pending_subs.pop(sub_key, None)
-            if not pending_subs:
-                self.llm_key_pending_calls.pop(hotkey, None)
-
-        live = [k for k, state in key_states.items() if state.get("alive", True)]
-        if not live:
-            self._zero_llm_key_score(uid, hotkey=hotkey, reason=f"last live key killed: {reason}")
-            return
-
-        if total_calls > 0 and dead_calls > 0:
-            share = dead_calls / total_calls
-        else:
-            # No traffic evidence either way -- assume an equal split among
-            # the keys that existed before this kill.
-            share = 1.0 / (len(live) + 1)
-        share = max(0.0, min(1.0, share))
-        uid = int(uid)
-        if 0 <= uid < len(self.scores) and float(self.scores[uid]) > 0.0:
-            old = float(self.scores[uid])
-            self.scores[uid] = old * (1.0 - share)
-            bt.logging.info(
-                f"llm-key: killed key {sub_key} of hotkey={hotkey} ({reason}); "
-                f"cut {share:.0%} recent-traffic share from uid={uid} "
-                f"({old:.4f} -> {float(self.scores[uid]):.4f}), {len(live)} live key(s) remain"
-            )
-
-    def _decay_score_toward_zero(self, uid: int) -> None:
-        """One EMA step toward a reward of 0.0 -- the gradual mechanic behind
-        the staleness-timeout decay, for the one case where nothing is
-        confirmed bad yet (reports simply stopped coming). Every
-        confirmed-bad signal hard-zeroes via _zero_llm_key_score instead."""
-        uid = int(uid)
-        if 0 <= uid < len(self.scores):
-            alpha = _env_float(C.LLM_KEY_EMA_ALPHA_ENV, C.LLM_KEY_EMA_ALPHA)
-            self.scores[uid] = ema_update(float(self.scores[uid]), 0.0, alpha=alpha)
-
-    def _decay_stale_llm_key_scores(self, now: float) -> None:
-        """A hotkey whose score is positive but hasn't had a fresh usage
-        report in LLM_KEY_STALENESS_TIMEOUT_SECONDS gets actively decayed
-        toward zero each poll, instead of freezing forever. Covers a key
-        that was rejected on resubmission, went DEAD, or was REVOKED --
-        none of which necessarily produce another report to zero it out via
-        the key_active=False path, since a rejected/revoked hotkey simply
-        stops being reported on at all. Backstop for anything
-        _poll_llm_key_roster's faster, precise signal can't see (a
-        transient outage, or an older protocol without that endpoint)."""
-        timeout = max(
-            0.0,
-            _env_float(
-                C.LLM_KEY_STALENESS_TIMEOUT_SECONDS_ENV, C.LLM_KEY_STALENESS_TIMEOUT_SECONDS
-            ),
-        )
-        for hotkey, status in self.llm_key_hotkey_status.items():
-            uid = status.get("uid")
-            if uid is None or not (0 <= int(uid) < len(self.scores)):
-                continue
-            if float(self.scores[int(uid)]) <= 0.0:
-                continue
-            last_report_at = status.get("last_report_at")
-            if last_report_at is None:
-                continue
-            if now - float(last_report_at) >= timeout:
-                self._decay_score_toward_zero(int(uid))
+    def _kill_hotkey_key(self, hotkey: str, sub_key: str, *, reason: str) -> None:
+        """Immediate, surgical cut for ONE confirmed-bad key: mark it locally
+        dead and drop its rows from both the epoch being paid and the epoch
+        being collected, so it stops earning from the next score recompute
+        while the hotkey's healthy sibling keys keep earning. A hotkey whose
+        every key is dead has nothing left to score. Safe to call repeatedly
+        (the roster re-reports DEAD every poll)."""
+        entry = self._hotkey_key_states(hotkey).setdefault(sub_key, {})
+        if entry.get("alive") is not False:
+            entry["alive"] = False
+            entry["killed_reason"] = reason
+            bt.logging.info(f"llm-key: killed key {sub_key} of hotkey={hotkey} ({reason})")
+        for windows in (self.llm_key_pending_calls, self.llm_key_last_epoch_calls):
+            acc = windows.get(hotkey)
+            if acc is not None:
+                acc.get("keys", {}).pop(sub_key, None)
+                if not acc.get("keys"):
+                    windows.pop(hotkey, None)
 
     async def _poll_llm_key_roster(self) -> None:
         """Precise, near-real-time per-key DEAD/REVOKED detection via
         GET /llm-keys/roster (one entry per key): the protocol has confirmed
-        that key is gone, so its contribution is cut immediately -- no
-        emission on a dead key for even one more epoch -- rather than
-        waiting out LLM_KEY_STALENESS_TIMEOUT_SECONDS. A hotkey's healthy
-        sibling keys are untouched; the hotkey hard-zeroes only when its
-        last live key dies. Idempotent across polls (the roster re-reports
-        DEAD forever; _kill_hotkey_key no-ops on an already-dead key).
-        Best-effort -- a failure here just falls back to the
-        staleness-timeout backstop."""
+        that key is gone, so its rows are dropped immediately rather than
+        paying out until the epoch rolls. A
+        hotkey's healthy sibling keys are untouched. Idempotent across polls
+        (the roster re-reports DEAD forever). Best-effort -- a failure here
+        just leaves the key earning until the next epoch reset at most."""
         client = self.llm_key_client
         if client is None:
             return
@@ -567,9 +501,6 @@ class Validator(BaseValidatorNeuron):
             status = self.llm_key_hotkey_status.get(entry.hotkey)
             if status is None:
                 continue
-            uid = status.get("uid")
-            if uid is None or not (0 <= int(uid) < len(self.scores)):
-                continue
             if entry.key_id is not None:
                 sub_key = str(entry.key_id)
             elif entry.provider and entry.model:
@@ -577,7 +508,6 @@ class Validator(BaseValidatorNeuron):
             else:
                 sub_key = "legacy"
             self._kill_hotkey_key(
-                int(uid),
                 entry.hotkey,
                 sub_key,
                 reason=f"roster reports key {entry.status}",
@@ -674,102 +604,106 @@ class Validator(BaseValidatorNeuron):
                 return f"per-key quality floor (avg quality {avg_quality:.2f} over {qcount} graded)"
         return None
 
-    def _maybe_flush_pending(self, uid: int, hotkey: str, now: float) -> bool:
-        """If hotkey's pooled pending window has crossed the call-volume
-        floor, or aged past the max pending-window, score it as ONE window
-        across all its live keys' calls -- with the reward tier blended per
-        call -- and clear the accumulator so the next window starts fresh
-        (non-overlapping). Returns True if a flush (and score) happened.
-
-        Before pooling, each key's own sub-window is checked against the
-        hard floors: a single junk key (all failures, or fabricated output)
-        with enough evidence is killed and excluded, so it can't hide inside
-        an otherwise healthy fleet's average forever -- the pooled floors
-        then only trip when the fleet as a whole is failing.
-
-        A force-flush past the max age passes min_calls_for_scoring=1 so
-        llm_key_efficiency_score()'s volume gate passes trivially, while
-        _record_llm_key_score's own confidence-floor alpha-scaling still
-        damps a small forced sample -- no new scoring logic needed for this
-        case."""
-        acc = self.llm_key_pending_calls.get(hotkey)
-        if acc is None:
-            return False
-        min_calls = _env_int(
-            C.LLM_KEY_MIN_CALLS_FOR_SCORING_ENV, C.LLM_KEY_MIN_CALLS_FOR_SCORING
-        )
-
-        # Per-key junk gate first (kills mutate the accumulator).
-        for sub_key, sub in list(acc.get("keys", {}).items()):
-            reason = self._sub_window_floor_reason(sub, min_calls=min_calls)
-            if reason is not None:
-                self._kill_hotkey_key(int(uid), hotkey, sub_key, reason=reason)
-        acc = self.llm_key_pending_calls.get(hotkey)
-        if acc is None or not acc.get("keys"):
-            return False  # everything this window held was killed
-        subs = acc["keys"]
-
-        success_count = sum(int(s.get("success_count", 0)) for s in subs.values())
-        failure_count = sum(int(s.get("failure_count", 0)) for s in subs.values())
+    def _pooled_window_reward(self, hotkey: str, subs: list[dict]) -> float:
+        """Efficiency reward for one hotkey's pooled epoch window: all its
+        live keys' calls scored together, the reward tier blended per call
+        (each call is worth its own model's tier, so a mixed fleet averages
+        by delivered traffic and stacked cheap keys can't borrow a top-tier
+        multiplier). Any good report counts -- no call-volume floor -- but the
+        hard floors still apply: a majority-failing or confirmed-low-quality
+        window is worth 0.0."""
+        success_count = sum(int(s.get("success_count", 0)) for s in subs)
+        failure_count = sum(int(s.get("failure_count", 0)) for s in subs)
         total = success_count + failure_count
-        max_age = max(
-            0.0,
-            _env_float(
-                C.LLM_KEY_PENDING_WINDOW_MAX_SECONDS_ENV, C.LLM_KEY_PENDING_WINDOW_MAX_SECONDS
-            ),
-        )
-        aged_out = now - float(acc.get("first_seen_at", now)) >= max_age
-        if total < min_calls and not aged_out:
-            return False
-
-        latency_sum = sum(float(s.get("latency_ms_weighted_sum", 0.0)) for s in subs.values())
-        latency_count = sum(int(s.get("latency_weighted_count", 0)) for s in subs.values())
-        quality_sum = sum(float(s.get("quality_weighted_sum", 0.0)) for s in subs.values())
-        quality_count = sum(int(s.get("quality_weighted_count", 0)) for s in subs.values())
+        latency_sum = sum(float(s.get("latency_ms_weighted_sum", 0.0)) for s in subs)
+        latency_count = sum(int(s.get("latency_weighted_count", 0)) for s in subs)
+        quality_sum = sum(float(s.get("quality_weighted_sum", 0.0)) for s in subs)
+        quality_count = sum(int(s.get("quality_weighted_count", 0)) for s in subs)
         avg_latency_ms = latency_sum / latency_count if latency_count > 0 else None
         avg_quality = quality_sum / quality_count if quality_count > 0 else None
 
-        # Per-call blended reward tier: each call is worth its own model's
-        # tier, so a mixed fleet averages by delivered traffic and stacked
-        # cheap keys can't borrow a top-tier multiplier. A migrated legacy
-        # sub-window (tier None) resolves via the submission-time fallback.
+        # A migrated legacy sub-window (tier None) resolves via the
+        # submission-time fallback.
         def _sub_tier(sub: dict) -> float:
             tier = sub.get("tier")
             return float(tier) if tier is not None else self._model_tier_weight(hotkey)
 
         blended_tier = (
             sum(
-                _sub_tier(s)
-                * (int(s.get("success_count", 0)) + int(s.get("failure_count", 0)))
-                for s in subs.values()
+                _sub_tier(s) * (int(s.get("success_count", 0)) + int(s.get("failure_count", 0)))
+                for s in subs
             )
             / total
             if total > 0
             else self._model_tier_weight(hotkey)
         )
-
-        # Remember each key's share of this window for later kill-share math.
-        key_states = self._hotkey_key_states(hotkey)
-        for sub_key, sub in subs.items():
-            state = key_states.setdefault(sub_key, {})
-            state["last_window_calls"] = int(sub.get("success_count", 0)) + int(
-                sub.get("failure_count", 0)
-            )
-
-        self._record_llm_key_score(
-            uid,
-            hotkey=hotkey,
+        reward = llm_key_efficiency_score(
             success_count=success_count,
             failure_count=failure_count,
-            avg_latency_ms=avg_latency_ms,
-            quality_score=avg_quality,
+            avg_latency_s=avg_latency_ms / 1000.0 if avg_latency_ms is not None else None,
             key_active=True,
-            min_calls_for_scoring=1 if (aged_out and total < min_calls) else min_calls,
-            quality_call_count=quality_count,
+            quality_score=avg_quality,
             model_tier_weight=blended_tier,
+            min_calls_for_scoring=EPOCH_MIN_CALLS_FOR_SCORING,
+            quality_call_count=quality_count,
+            reliability_floor=_env_float(
+                C.LLM_KEY_RELIABILITY_HARD_FLOOR_ENV, C.LLM_KEY_RELIABILITY_HARD_FLOOR
+            ),
+            quality_floor=_env_float(
+                C.LLM_KEY_QUALITY_HARD_FLOOR_ENV, C.LLM_KEY_QUALITY_HARD_FLOOR
+            ),
+            quality_floor_min_graded=_env_int(
+                C.LLM_KEY_QUALITY_FLOOR_MIN_GRADED_ENV, C.LLM_KEY_QUALITY_FLOOR_MIN_GRADED
+            ),
         )
-        self.llm_key_pending_calls.pop(hotkey, None)
-        return True
+        return float(reward or 0.0)
+
+    def _score_last_epoch(self) -> None:
+        """Recompute self.scores from the last completed epoch's reports
+        alone -- the epoch whose work the current epoch's emission pays for.
+
+        Each hotkey with rows in that epoch is scored as one pooled window
+        (see _pooled_window_reward); every uid without a good report in it
+        scores 0.0. Before pooling, each key's own sub-window is checked
+        against the hard floors: a single junk key with enough evidence is
+        killed and excluded, so it can't hide inside an otherwise healthy
+        fleet's average -- the pooled floors then only trip when the fleet
+        as a whole is failing. Keys killed since the epoch closed are
+        excluded too, so a confirmed-bad key stops earning immediately."""
+        min_calls = _env_int(
+            C.LLM_KEY_MIN_CALLS_FOR_SCORING_ENV, C.LLM_KEY_MIN_CALLS_FOR_SCORING
+        )
+        hotkeys = list(getattr(self.metagraph, "hotkeys", []))
+        scores = np.zeros(len(self.scores), dtype=np.float32)
+        windows = self.llm_key_last_epoch_calls
+        for hotkey in list(windows):
+            for sub_key, sub in list(windows[hotkey].get("keys", {}).items()):
+                reason = self._sub_window_floor_reason(sub, min_calls=min_calls)
+                if reason is not None:
+                    self._kill_hotkey_key(hotkey, sub_key, reason=reason)
+            acc = windows.get(hotkey)
+            if acc is None:
+                continue  # everything this window held was killed
+            key_states = self._hotkey_key_states(hotkey)
+            subs = [
+                sub
+                for sub_key, sub in acc.get("keys", {}).items()
+                if key_states.get(sub_key, {}).get("alive", True)
+            ]
+            if not subs:
+                continue
+            try:
+                uid = hotkeys.index(hotkey)
+            except ValueError:
+                continue  # deregistered since its rows arrived
+            if uid >= len(scores):
+                bt.logging.warning(
+                    f"llm-key: uid={uid} out of range for scores array (len={len(scores)}); "
+                    f"skipping hotkey={hotkey} (metagraph resize race?)"
+                )
+                continue
+            scores[uid] = self._pooled_window_reward(hotkey, subs)
+        self.scores = scores
 
     def _has_llm_key_evidence(self, uid: int) -> bool:
         """Has this validator seen the protocol report usage for the hotkey
@@ -786,8 +720,8 @@ class Validator(BaseValidatorNeuron):
           (a reshuffle while the validator was down leaves resync_metagraph
           nothing to compare against).
 
-        Deliberately not a recency check: a quiet key isn't a bad key, and
-        staleness is already handled by _decay_stale_llm_key_scores.
+        Deliberately not a recency check: recency is the epoch reset's job
+        (_roll_epoch_if_needed).
         """
         uid = int(uid)
         hotkeys = getattr(self.metagraph, "hotkeys", [])
@@ -811,21 +745,18 @@ class Validator(BaseValidatorNeuron):
     def _blended_weight_array(self) -> np.ndarray:
         """Weight is earned only through confirmed LLM-key efficiency.
 
-        self.scores[uid] is positive only once the protocol has reported
-        real, verified usage for a key it currently considers active -
-        merely answering the ask, or having a key that's been submitted but
-        not yet confirmed working, earns nothing here. Key validity isn't
-        something the validator can judge on its own, so it doesn't extend
-        weight on the strength of a submission alone, only on the strength of
-        reported real usage.
+        self.scores[uid] is positive only when the protocol has reported
+        real, verified usage in the last completed epoch for a key it currently
+        considers active - merely answering the ask, or having a key that's
+        been submitted but not yet confirmed working, earns nothing here. Key
+        validity isn't something the validator can judge on its own, so it
+        doesn't extend weight on the strength of a submission alone, only on
+        the strength of reported real usage.
 
         A score with no LLM-key usage behind it (see _has_llm_key_evidence)
-        is dropped from the submitted array rather than trusted: the persisted
-        EMA is the only thing standing between "earned it here" and "arrived
-        in the state file from somewhere else," and it can't tell them apart
-        on its own. The masking is local to the submission - self.scores is
-        left alone, so a miner whose reports resume is paid again from the
-        next epoch without re-earning from zero.
+        is dropped from the submitted array rather than trusted -- e.g. a
+        uid whose hotkey changed hands mid-epoch. The masking is local to the
+        submission; self.scores is left alone.
 
         participation_scores is intentionally excluded - it's tracked for
         liveness/observability only (see _record_participation), never
@@ -859,12 +790,19 @@ class Validator(BaseValidatorNeuron):
     def set_weights(self):
         """Always submit weights so the validator stays active on-chain.
 
-        The submitted array is the nan-safe LLM-key efficiency signal (see
-        _blended_weight_array); self.scores itself - the persisted,
-        report-driven efficiency EMA - is left untouched. The template's own
-        burn allocation (BURN_UID/BURN_PERCENTAGE) further reserves most of
+        First brings self.scores up to date: if the chain has moved to a new
+        epoch, the epoch that just ended becomes the one being paid; then the
+        scores are recomputed from that last completed epoch's reports alone
+        (dropping any key killed since). The submitted array is the nan-safe
+        result (see _blended_weight_array). The template's own burn
+        allocation (BURN_UID/BURN_PERCENTAGE) further reserves most of
         emission for the burn uid before anything reaches the chain.
         """
+        # Read defensively: the base class can reach here from inside
+        # super().__init__(), before this subclass has built its state.
+        if hasattr(self, "llm_key_pending_calls"):
+            self._roll_epoch_if_needed()
+            self._score_last_epoch()
         original_scores = self.scores
         self.scores = self._blended_weight_array()
         try:
@@ -1120,11 +1058,12 @@ class Validator(BaseValidatorNeuron):
             )
 
     async def llm_key_report_poll_round(self) -> None:
-        """Pull usage reports since the last cursor, fold them into each
-        hotkey's rolling accumulator, score any hotkey that's crossed the
-        volume floor, poll the roster for precise DEAD/REVOKED detection,
-        and decay any hotkey whose score has gone stale with no fresh
-        report. No-op if llm_key_client is None (unconfigured)."""
+        """Pull usage reports since the last cursor into the collecting
+        epoch's accumulator, poll the roster for precise DEAD/REVOKED
+        detection, and recompute self.scores from the last completed epoch.
+        Starts by closing the collecting epoch if the chain has moved on, so
+        rows fetched now count toward the epoch they arrive in. No-op if
+        llm_key_client is None (unconfigured)."""
         client = self.llm_key_client
         if client is None:
             return
@@ -1142,6 +1081,7 @@ class Validator(BaseValidatorNeuron):
         ):
             return
 
+        self._roll_epoch_if_needed()
         try:
             reports, next_since = await client.get_reports(
                 since=self.last_llm_key_report_cursor or None
@@ -1162,7 +1102,6 @@ class Validator(BaseValidatorNeuron):
             return
 
         processed = 0
-        flushed = 0
         for report in reports:
             try:
                 uid = self.metagraph.hotkeys.index(report.hotkey)
@@ -1181,10 +1120,9 @@ class Validator(BaseValidatorNeuron):
             if not report.key_active:
                 # Calls made while this key was still alive are moot once
                 # it's confirmed dead -- cut exactly this key's contribution
-                # immediately; the hotkey's other keys keep earning (and the
-                # hotkey hard-zeroes when this was its last live key).
+                # immediately; the hotkey's other keys keep earning.
                 self._kill_hotkey_key(
-                    uid, report.hotkey, sub_key, reason="report row marked key inactive"
+                    report.hotkey, sub_key, reason="report row marked key inactive"
                 )
             elif has_fatal_error_category(report.error_categories):
                 # The provider itself rejected this key (bad credentials /
@@ -1194,7 +1132,6 @@ class Validator(BaseValidatorNeuron):
                 # disabled), so this is the validator's own fast path to
                 # cutting a key that demonstrably doesn't work.
                 self._kill_hotkey_key(
-                    uid,
                     report.hotkey,
                     sub_key,
                     reason=(
@@ -1206,21 +1143,9 @@ class Validator(BaseValidatorNeuron):
                 self._fold_report_into_pending(report.hotkey, report, now)
             processed += 1
 
-        # Checked over every pending hotkey, not just ones with a fresh
-        # report this cycle -- otherwise a hotkey that goes quiet forever
-        # (zero further reports) would never force-flush after aging out,
-        # since it would never appear in this poll's report batch again.
-        for hotkey in list(self.llm_key_pending_calls.keys()):
-            status = self.llm_key_hotkey_status.get(hotkey) or {}
-            uid = status.get("uid")
-            if uid is None:
-                continue
-            if self._maybe_flush_pending(int(uid), hotkey, now):
-                flushed += 1
-
         await self._poll_llm_key_roster()
         self._prune_llm_key_hotkey_status(now)
-        self._decay_stale_llm_key_scores(now)
+        self._score_last_epoch()
 
         if next_since:
             self.last_llm_key_report_cursor = str(next_since)
@@ -1228,7 +1153,7 @@ class Validator(BaseValidatorNeuron):
             self.llm_key_reports_empty_since = 0.0
             bt.logging.info(
                 f"llm-key report poll: {processed}/{len(reports)} report(s) processed, "
-                f"{flushed} hotkey(s) crossed the volume floor and scored this poll"
+                f"{int(np.count_nonzero(self.scores > 0))} uid(s) earning from last epoch"
             )
         else:
             accepted = sum(1 for s in self.llm_key_hotkey_status.values() if s.get("accepted"))
