@@ -32,8 +32,8 @@ def test_llm_key_efficiency_skips_below_min_volume():
 
 def test_llm_key_efficiency_dead_key_always_zero():
     # An inactive key scores 0.0 unconditionally, even with a perfect success
-    # history and top-tier model -- the validator then hard-zeroes the EMA
-    # (see _record_llm_key_score) so emission stops immediately.
+    # history and top-tier model -- the validator also kills that key
+    # (see _kill_hotkey_key) so its rows stop earning immediately.
     assert llm_key_efficiency_score(
         success_count=100, failure_count=0, avg_latency_s=0.1, key_active=False,
         model_tier_weight=1.0,

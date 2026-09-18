@@ -11,10 +11,20 @@ Every `forward()` tick (`neurons/validator.py`):
    every miner that answered (whether or not it had a key) — for
    observability only, not for weight.
 2. Run `llm_key_report_poll_round()`: pull usage/efficiency reports since the
-   last cursor and EMA them into `self.scores`.
+   last cursor into the collecting epoch's accumulator, and recompute
+   `self.scores` from the last completed epoch.
 3. Persist state (`save_masxai_state()`).
 4. On the base template's own weight-setting cadence, `set_weights()` submits
    `self.scores` (see below), wrapped by the template's burn allocation.
+
+**Each epoch's emission pays for the previous epoch's reports.** Reports are
+collected per chain epoch. When the chain starts a new epoch (read from
+`blocks_since_last_step`, not computed from tempo), the epoch that just ended
+is closed and `self.scores` is recomputed from it alone; every weight set
+during the new epoch pays for that one complete epoch. Nothing carries over:
+a miner with no good report in the last epoch earns nothing in this one. If
+the validator was down across more than one epoch, the stale accumulator is
+discarded rather than paid.
 
 If `MASXAI_LLM_KEY_VALIDATOR_TOKEN` is unset, steps 1–2 never run — `self.scores`
 stays at zero for everyone, so the template's burn allocation (see below)
@@ -25,17 +35,18 @@ valid weight vector every epoch, it just has no miner to reward yet.
 ## Weight-setting
 
 `Validator._blended_weight_array()` returns a nan-safe copy of `self.scores`
-directly — nothing else feeds into it. A miner earns weight **only** once the
-protocol has reported real, verified usage for a key it currently considers
-active. Answering the ask, or having a key that's been submitted but not yet
+directly — nothing else feeds into it. A miner earns weight **only** while the
+protocol has reported real, verified usage in the last completed epoch for a key it
+currently considers active. Answering the ask, or having a key that's been submitted but not yet
 confirmed working, earns nothing — key validity isn't something the
 validator can judge on its own, so it never extends weight on the strength
 of a submission alone. `participation_scores` is tracked (see step 1 above)
 but deliberately excluded from this.
 
-`self.scores` is the persisted LLM-key efficiency EMA and is never mutated by
-this — `set_weights()` swaps in the nan-safe copy only for the duration of
-the on-chain submission call, then restores `self.scores`.
+`self.scores` is the last completed epoch's LLM-key efficiency.
+`set_weights()` first brings it up to date (close the epoch if the chain has
+moved on, then recompute), then swaps in the nan-safe copy only for the
+duration of the on-chain submission call.
 
 **Then burn takes most of it anyway.** Whatever `_blended_weight_array()`
 returns is wrapped by the template's own burn allocation
@@ -67,7 +78,6 @@ their score.
 | `MASXAI_LLM_KEY_VALIDATOR_TOKEN` | Validator credential for `/llm-keys/*`; unset disables the pipeline |
 | `MASXAI_LLM_KEY_SUBMISSION_INTERVAL_SECONDS` | Re-ask cadence (default 4h) |
 | `MASXAI_LLM_KEY_REPORT_POLL_INTERVAL_SECONDS` | Report poll cadence (default 10m) |
-| `MASXAI_LLM_KEY_EMA_ALPHA` | Efficiency EMA smoothing (default 0.15) |
 | `MASXAI_PARTICIPATION_EMA_ALPHA` | Participation EMA smoothing (default 0.2; observability only) |
 | `MASXAI_VALIDATOR_STATE_FILE` | Override the state-file path |
 

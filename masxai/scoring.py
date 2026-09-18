@@ -1,9 +1,9 @@
 """
 masxai/scoring.py - LLM-key contribution scoring utilities.
 
-Chain weight is driven solely by self.scores (see neurons/validator.py), an
-EMA of llm_key_efficiency_score() below, computed from raw usage reports the
-protocol backend reports back. This scores reliability, per-call output
+Chain weight is driven solely by self.scores (see neurons/validator.py):
+llm_key_efficiency_score() below, computed over the raw usage reports the
+protocol backend reported in the last completed chain epoch. This scores reliability, per-call output
 quality (self-graded by the calling agent -- see quality_score below),
 speed, real sustained call volume, and which model tier a miner brings.
 """
@@ -105,10 +105,9 @@ def llm_key_efficiency_score(
     zero."
 
     A key the protocol has marked inactive (exhausted/invalid/revoked) always
-    scores 0.0 unconditionally, regardless of tier. Whether a 0.0 reward is
-    EMA'd in or drops the score straight to zero is the caller's decision
-    (see Validator._record_llm_key_score) -- this function just says what
-    the window is worth.
+    scores 0.0 unconditionally, regardless of tier. This function just says
+    what the window is worth; the validator scores one such window per
+    hotkey per chain epoch (see Validator._score_last_epoch).
 
     avg_latency_s and quality_score are both optional and independently
     sanitized (NaN/inf/out-of-range collapse to "not reported") -- a

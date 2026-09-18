@@ -36,11 +36,11 @@ on-chain weights from how reliable and fast each miner's contributed key is.
 4. Validator forwards accepted submissions to the protocol backend
    (`masxai/llm_key_client.py`), which decrypts, validates the key actually
    works, and stores it (encrypted at rest, separately from transport).
-5. Validator polls the protocol for usage/efficiency reports, aggregates
-   them per hotkey (the protocol reports one row per single call, not a
-   pre-aggregated window — see "Weight Setting"), and folds the result into
-   `self.scores` (an EMA), setting weights via the template validator
-   machinery.
+5. Validator polls the protocol for usage/efficiency reports, collects
+   them per hotkey per chain epoch (the protocol reports one row per single
+   call, not a pre-aggregated window — see "Weight Setting"), and when an
+   epoch ends scores it into `self.scores`, which every weight set during the
+   next epoch pays out via the template validator machinery.
 
 There is no other subnet function. Forecasting, the BT-Forecast integration,
 and the local price/oracle path have all been removed — this subnet does not
@@ -73,21 +73,18 @@ issue prediction questions of any kind.
   latency); `masxai/scoring.py::llm_key_efficiency_score()` is the only place
   that formula lives.
 - Persist state (`participation_scores`, `llm_key_hotkey_status`,
-  `llm_key_pending_calls`, `self.scores`) so restarts do not lose in-flight
-  tracking, including a low-traffic hotkey's partial progress toward the
-  call-volume floor.
-- Pay only scores this pipeline produced. A persisted `self.scores` entry is
-  earnings only if an LLM-key usage report put it there — the EMA cannot tell
-  its own work from a value that arrived in the state file some other way
-  (the pre-LLM-key forecasting subnet persisted its accuracy EMA under the
-  same `"scores"` key of the same file; a uid can also change hands while the
-  validator is down). `_has_llm_key_evidence()` requires a
-  `llm_key_hotkey_status` entry for the hotkey *currently* at that uid, with
-  `last_report_at` set and at least one key not locally killed. Unbacked
-  scores are dropped at load (`_drop_unbacked_scores()`, so a later report
-  can't unlock a legacy value) and withheld from every submitted weight
-  array. It is not a recency check — staleness is
-  `_decay_stale_llm_key_scores()`'s job.
+  `llm_key_pending_calls`, `llm_key_last_epoch_calls`,
+  `llm_key_epoch_start_block`, `self.scores`) so a restart within an epoch
+  loses neither the epoch being collected nor the epoch being paid.
+- Pay only scores this pipeline produced. A `self.scores` entry is earnings
+  only if an LLM-key usage report put it there (the pre-LLM-key forecasting
+  subnet persisted its accuracy EMA under the same `"scores"` key of the same
+  file; a uid can also change hands while the validator is down).
+  `_has_llm_key_evidence()` requires a `llm_key_hotkey_status` entry for the
+  hotkey *currently* at that uid, with `last_report_at` set and at least one
+  key not locally killed. Unbacked scores are dropped at load
+  (`_drop_unbacked_scores()`) and withheld from every submitted weight array.
+  It is not a recency check — recency is the per-epoch reset's job.
 - Submit weights every eligible epoch, never skipping the chain call — going
   silent makes Yuma consensus treat the validator as inactive (`vtrust`
   collapses). See "Weight Setting" below.
@@ -105,42 +102,45 @@ issue prediction questions of any kind.
   `error_categories` entry (`LLM_KEY_FATAL_ERROR_CATEGORIES` — conclusive
   on a single row, and the validator's own fast path since the protocol's
   health check can lag or be disabled while a 401-ing key stays `ACTIVE`),
-  or a per-key sub-window that trips a hard floor, cuts exactly that key's
-  recent-traffic share out of the hotkey's score (idempotent across roster
-  re-polls) and drops its pending rows; healthy sibling keys keep earning.
-  The hotkey hard-zeroes (`Validator._zero_llm_key_score()`) when its LAST
-  live key is killed, or when a full pooled window itself trips a floor
-  (the whole fleet failing — see "Scoring"). A killed key that serves
-  successful calls again (the miner swapped in a working replacement, same
-  slot/key_id) is revived by that fresh evidence. Gradual EMA decay
-  (`Validator._decay_stale_llm_key_scores()`, after
-  `LLM_KEY_STALENESS_TIMEOUT_SECONDS`) is reserved for the one unconfirmed
-  case — reports that simply went stale (rejected resubmission with no
-  roster signal, transient outage), where silence isn't yet proof.
+  or a per-key sub-window that trips a hard floor, drops exactly that key's
+  rows from both the epoch being paid and the epoch being collected
+  (idempotent across roster re-polls), so the hotkey is re-scored on its
+  healthy sibling keys from the next recompute. A hotkey whose every key is
+  dead has nothing left to score. A killed key that serves successful calls
+  again (the miner swapped in a working replacement, same slot/key_id) is
+  revived by that fresh evidence.
 
 ## Weight Setting
 
 Weight is earned only through confirmed LLM-key efficiency — computed in
 `Validator._blended_weight_array()` (`neurons/validator.py`), which is
 `self.scores` (nan-safe), minus any uid whose score has no reported LLM-key
-usage behind it (`Validator._has_llm_key_evidence()`): an EMA driven by
-`llm_key_efficiency_score()` from
-the protocol's usage reports. `self.scores[uid]` stays `0.0` until the
-protocol has reported real, verified usage for a key it currently considers
-active — a miner earns nothing merely by answering the ask, and nothing for
+usage behind it (`Validator._has_llm_key_evidence()`): the
+`llm_key_efficiency_score()` of the last completed chain epoch's usage
+reports. A miner earns nothing merely by answering the ask, and nothing for
 a key that's been submitted but not yet confirmed working. Key validity
 isn't something the validator can judge on its own, so it never extends
 weight on the strength of a submission alone.
 
-The protocol reports one row per single call, not a pre-aggregated window.
-`Validator.llm_key_pending_calls` (persisted) accumulates raw report rows
-per hotkey — success/failure counts and weighted latency/quality sums —
-until `LLM_KEY_MIN_CALLS_FOR_SCORING` calls have landed, or the window ages
-past `LLM_KEY_PENDING_WINDOW_MAX_SECONDS` (force-flushed, confidence-floor
-damped, rather than accumulating forever). Only then is
-`_record_llm_key_score()` called and the EMA updated — scoring a single raw
-report row directly would never cross the volume floor, since the
-protocol's per-call rows always have `success_count + failure_count == 1`.
+**Emission in each chain epoch pays for the reports of the epoch before
+it.** The protocol reports one row per single call, not a pre-aggregated
+window. `Validator.llm_key_pending_calls` (persisted) collects the rows
+received in the current chain epoch, per hotkey and per key —
+success/failure counts and weighted latency/quality sums. The epoch start is
+read from the chain (`block − blocks_since_last_step`, read at one block),
+never computed from tempo. When the chain starts a new epoch
+(`Validator._roll_epoch_if_needed()`, checked at every report poll and every
+weight set), that accumulator closes into `llm_key_last_epoch_calls` and
+`self.scores` is recomputed from it alone (`_score_last_epoch()`) — so every
+weight set during an epoch pays for exactly one complete epoch, and nothing
+carries over: a miner with no good report in the last epoch earns nothing in
+this one. Scoring the still-running epoch instead would miss the calls made
+after the last weight set before each boundary, since only the weights on
+chain when an epoch ends count. The closed accumulator is paid only if it
+really is the immediately preceding epoch: a validator down across more than
+one epoch, or state that predates per-epoch scoring, discards it. An epoch
+shorter than half a tempo (e.g. owner-triggered early) is folded into the
+next one rather than replacing the epoch being paid.
 
 - **Participation** — a liveness-only EMA (`participation_scores`,
   `PARTICIPATION_EMA_ALPHA`) bumped whenever a miner answers the LLM-key ask
@@ -156,7 +156,7 @@ anything reaches miners — regardless of how much real efficiency data
 exists. The remaining share is split among miners with a positive
 `self.scores` entry, proportional to their score. `self.scores` itself is
 never overwritten by `set_weights()`'s blend — only the array submitted
-on-chain is.
+on-chain is. If no miner has a positive score, the whole allocation burns.
 
 ## Scoring
 
@@ -182,44 +182,40 @@ llm_key_efficiency_score = composite * model_tier_weight
 The two hard floors exist because the additive composite would otherwise
 let a key that isn't working keep collecting the neutral-default
 quality/latency terms plus volume credit (an all-failure window used to
-earn ~0.4). A floored window doesn't just score zero — when it carries at
-least `LLM_KEY_MIN_CALLS_FOR_SCORING` calls of evidence,
-`_record_llm_key_score()` drops the EMA straight to zero (same immediate
-cut as a dead key), so a broken or fabricating key stops earning emission
-that epoch. The quality floor needs `LLM_KEY_QUALITY_FLOOR_MIN_GRADED`
+earn ~0.4). A floored epoch window earns nothing for that epoch. The
+quality floor needs `LLM_KEY_QUALITY_FLOOR_MIN_GRADED`
 graded calls in the window before it can gate (one self-graded bad reply
 scales the quality axis instead of zeroing the key), and unmeasured
 quality (`None` → neutral 0.5) never trips it. Volume counts only
 successes — a failed call is not delivered capacity. On a multi-key
 hotkey the same floors are also applied to each key's own sub-window
 before pooling (`_sub_window_floor_reason()`): a single junk key with
-enough evidence is killed and excluded rather than hiding inside the
-fleet's average, so the pooled floors only trip when the fleet as a whole
-is failing.
+enough evidence (`LLM_KEY_MIN_CALLS_FOR_SCORING` calls on its own) is killed
+and excluded rather than hiding inside the fleet's average, so the pooled
+floors only trip when the fleet as a whole is failing.
 
 `model_tier_weight` (`masxai/constants.py::LLM_KEY_MODEL_TIER_WEIGHTS`) is
 a **per-call blend**: each usage row carries the provider/model of the key
 that served it (verified by the backend's preflight at submission), each
 call is worth its own model's tier, and the window's multiplier is the
-traffic-weighted average (`_maybe_flush_pending()`), so a mixed 5-key fleet
+traffic-weighted average (`_pooled_window_reward()`), so a mixed 5-key fleet
 blends correctly and stacked cheap keys can never borrow a top-tier
 multiplier. It scales the whole composite — a top-tier model that's
 unreliable still scores low, and a budget model that's perfectly reliable
 still scores respectably, just capped below what a top-tier model can
 reach. A multi-key hotkey is scored as ONE pooled window across all its
-live keys' calls (per-key sub-accumulators in `llm_key_pending_calls`,
-pooled at flush) — more working keys earn more only through more delivered
+live keys' calls in the epoch (per-key sub-accumulators, pooled at
+scoring) — more working keys earn more only through more delivered
 traffic (each key has its own 200-call/day budget on the backend), never
 through key count itself.
 
 A key the protocol marks inactive (exhausted/invalid/revoked) scores `0.0`
-unconditionally, regardless of tier. Below the minimum aggregated call
-volume, the window is skipped (`None`) rather than penalized — a quiet key
-isn't a bad key. `avg_latency_s`/`quality_score`/`model_tier_weight` are all
+unconditionally, regardless of tier. The pooled epoch window has no
+call-volume floor (`EPOCH_MIN_CALLS_FOR_SCORING` is 1): any good report in
+the epoch earns. `avg_latency_s`/`quality_score`/`model_tier_weight` are all
 independently NaN/inf-guarded (`masxai/scoring.py::sanitize_latency_ms()`/
 `sanitize_quality_score()`) — a malformed reading in one never disqualifies
-the others, and never poisons `self.scores` with a NaN that the EMA could
-never recover from on its own.
+the others, and never poisons `self.scores` with a NaN.
 
 ## Before Changing Protocol
 
