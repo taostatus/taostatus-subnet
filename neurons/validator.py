@@ -186,12 +186,41 @@ class Validator(BaseValidatorNeuron):
                     )
                     copy_len = min(len(arr), len(self.scores))
                     self.scores[:copy_len] = arr[:copy_len]
+            self._drop_unbacked_scores()
             bt.logging.info(
                 f"loaded state from {state_path}: "
                 f"{len(self.llm_key_hotkey_status)} hotkey(s) tracked"
             )
         except Exception as e:  # noqa: BLE001
             bt.logging.warning(f"could not load state, starting fresh: {e}")
+
+    def _drop_unbacked_scores(self) -> None:
+        """Discard any restored score with no LLM-key usage behind it (see
+        _has_llm_key_evidence).
+
+        The pre-LLM-key subnet persisted its forecasting accuracy EMA under
+        this file's same "scores" key, so an in-place upgrade silently
+        inherits it as LLM-key weight. Masking it at submission time is not
+        enough on its own: left in self.scores, that stale value would become
+        payable the moment the hotkey's first usage report arrived, paying a
+        miner at a level it never earned here. Dropping it at load means the
+        miner earns again from zero, through reported usage, like everyone
+        else.
+        """
+        dropped = {
+            uid: float(self.scores[uid])
+            for uid in range(len(self.scores))
+            if float(self.scores[uid]) > 0.0 and not self._has_llm_key_evidence(uid)
+        }
+        if not dropped:
+            return
+        for uid in dropped:
+            self.scores[uid] = 0.0
+        bt.logging.warning(
+            f"llm-key: discarded {len(dropped)} restored score(s) with no reported "
+            f"LLM-key usage behind them (pre-LLM-key state file, or a uid that "
+            f"changed hands): {dropped}"
+        )
 
     @staticmethod
     def _migrate_pending_entry(entry: dict) -> dict:
@@ -742,6 +771,43 @@ class Validator(BaseValidatorNeuron):
         self.llm_key_pending_calls.pop(hotkey, None)
         return True
 
+    def _has_llm_key_evidence(self, uid: int) -> bool:
+        """Has this validator seen the protocol report usage for the hotkey
+        that currently holds `uid`, on a key it hasn't locally killed?
+
+        A positive self.scores entry is only earnings if an LLM-key report
+        put it there. Without that evidence it's a leftover, and this subnet
+        pays nothing for leftovers:
+
+        - a pre-LLM-key state file (the forecasting subnet persisted its own
+          accuracy EMA under the same "scores" key), which would otherwise
+          keep paying miners forever for work this subnet no longer measures;
+        - a score sitting at a uid whose hotkey has since changed hands
+          (a reshuffle while the validator was down leaves resync_metagraph
+          nothing to compare against).
+
+        Deliberately not a recency check: a quiet key isn't a bad key, and
+        staleness is already handled by _decay_stale_llm_key_scores.
+        """
+        uid = int(uid)
+        hotkeys = getattr(self.metagraph, "hotkeys", [])
+        if not (0 <= uid < len(hotkeys)):
+            return False
+        # Read defensively: the base class syncs (and could set weights) inside
+        # super().__init__(), before this subclass has built its status map.
+        status = getattr(self, "llm_key_hotkey_status", {}).get(hotkeys[uid])
+        if not status:
+            return False
+        recorded_uid = status.get("uid")
+        if recorded_uid is None or int(recorded_uid) != uid:
+            return False
+        if status.get("last_report_at") is None:
+            return False  # keys may be on file, but no reported usage yet
+        key_states = status.get("keys") or {}
+        if key_states and not any(state.get("alive", True) for state in key_states.values()):
+            return False  # every key this hotkey has is confirmed dead
+        return True
+
     def _blended_weight_array(self) -> np.ndarray:
         """Weight is earned only through confirmed LLM-key efficiency.
 
@@ -753,6 +819,14 @@ class Validator(BaseValidatorNeuron):
         weight on the strength of a submission alone, only on the strength of
         reported real usage.
 
+        A score with no LLM-key usage behind it (see _has_llm_key_evidence)
+        is dropped from the submitted array rather than trusted: the persisted
+        EMA is the only thing standing between "earned it here" and "arrived
+        in the state file from somewhere else," and it can't tell them apart
+        on its own. The masking is local to the submission - self.scores is
+        left alone, so a miner whose reports resume is paid again from the
+        next epoch without re-earning from zero.
+
         participation_scores is intentionally excluded - it's tracked for
         liveness/observability only (see _record_participation), never
         blended into submitted weight.
@@ -763,12 +837,24 @@ class Validator(BaseValidatorNeuron):
         uid regardless of how much real efficiency data exists here - see
         set_weights().
         """
-        return np.nan_to_num(
+        weights = np.nan_to_num(
             np.asarray(self.scores, dtype=np.float32),
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
         )
+        unbacked = [
+            uid
+            for uid in range(len(weights))
+            if weights[uid] > 0.0 and not self._has_llm_key_evidence(uid)
+        ]
+        if unbacked:
+            bt.logging.info(
+                f"llm-key: withholding weight from {len(unbacked)} uid(s) with no "
+                f"reported LLM-key usage behind their score: {unbacked}"
+            )
+            weights[unbacked] = 0.0
+        return weights
 
     def set_weights(self):
         """Always submit weights so the validator stays active on-chain.
