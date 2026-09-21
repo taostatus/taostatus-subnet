@@ -74,10 +74,10 @@ class LLMKeyUsageReport(BaseModel):
 class LLMKeyRosterEntry(BaseModel):
     """One KEY's current status (a multi-key hotkey appears once per slot),
     from GET /llm-keys/roster -- a precise, near-real-time signal (validator
-    polls it every report-poll cycle) for DEAD/REVOKED transitions,
-    complementing the staleness-timeout backstop in
-    _decay_stale_llm_key_scores() for anything this can't see (e.g. a
-    transient outage between validator and protocol)."""
+    polls it every report-poll cycle) for DEAD/REVOKED transitions. Anything
+    this can't see (e.g. a transient outage between validator and protocol)
+    stops earning at the next epoch reset anyway, since scores never carry
+    over."""
 
     hotkey: str
     key_id: Optional[int] = None

@@ -26,7 +26,6 @@ from masxai.llm_key_client import (
     LLMKeyUsageReport,
 )
 from masxai.protocol import LLMKeySynapse
-from masxai.scoring import ema_update
 from neurons.validator import Validator
 
 
@@ -188,6 +187,62 @@ def _single_call_reports(
     return reports
 
 
+class _FakeSubtensor:
+    """Just enough chain for the validator's epoch reads: the subnet's
+    current epoch began at `epoch_start`, and each epoch is tempo + 1 blocks
+    long. Set `fail` to make every read raise, as an unreachable node would."""
+
+    def __init__(self, epoch_start: int = 0, tempo: int = 360):
+        self.epoch_start = epoch_start
+        self.tempo_blocks = tempo
+        self.fail = False
+
+    def get_current_block(self) -> int:
+        if self.fail:
+            raise ConnectionError("chain unreachable")
+        return self.epoch_start + 7
+
+    def blocks_since_last_step(self, netuid, block=None):
+        if self.fail:
+            raise ConnectionError("chain unreachable")
+        return (block if block is not None else self.get_current_block()) - self.epoch_start
+
+    def tempo(self, netuid, block=None):
+        return self.tempo_blocks
+
+
+def _advance_epoch(validator, epochs: int = 1) -> None:
+    """Move the fake chain forward `epochs` epochs and let the validator
+    notice, as it does at the start of every report poll and weight set."""
+    subtensor = validator.subtensor
+    subtensor.epoch_start += epochs * (subtensor.tempo_blocks + 1)
+    validator._roll_epoch_if_needed()
+
+
+def _poll(validator) -> None:
+    validator.last_llm_key_report_poll_at = 0.0  # bypass the poll-interval throttle
+    asyncio.run(validator.llm_key_report_poll_round())
+
+
+def _window(successes: int, failures: int = 0, *, tier: float = 1.0) -> dict:
+    """One key's sub-window, in the accumulator's own shape."""
+    calls = successes + failures
+    return {
+        "success_count": successes, "failure_count": failures,
+        "latency_ms_weighted_sum": 100.0 * calls, "latency_weighted_count": calls,
+        "quality_weighted_sum": 0.0, "quality_weighted_count": 0,
+        "tier": tier,
+    }
+
+
+def _seed_last_epoch(validator, hotkey: str, subs: dict[str, dict]) -> None:
+    """Pretend `hotkey` had these per-key windows in the last completed epoch."""
+    now = time.time()
+    validator.llm_key_last_epoch_calls[hotkey] = {
+        "keys": subs, "first_seen_at": now, "last_seen_at": now,
+    }
+
+
 def _validator(client, dendrite) -> Validator:
     validator = Validator.__new__(Validator)
     validator.metagraph = _FakeMetagraph()
@@ -196,6 +251,10 @@ def _validator(client, dendrite) -> Validator:
     validator.llm_key_client = client
     validator.llm_key_hotkey_status = {}
     validator.llm_key_pending_calls = {}
+    validator.llm_key_last_epoch_calls = {}
+    validator.config = SimpleNamespace(netuid=501)
+    validator.subtensor = _FakeSubtensor()
+    validator.llm_key_epoch_start_block = validator.subtensor.epoch_start
     validator.last_llm_key_ask_at = 0.0
     validator.last_llm_key_report_poll_at = 0.0
     validator.last_llm_key_report_cursor = ""
@@ -308,7 +367,7 @@ def test_submission_round_rejection_is_a_noop_for_a_hotkey_with_no_prior_score()
     assert validator.llm_key_hotkey_status["miner-hotkey-1"]["accepted"] is False
 
 
-def test_report_poll_round_updates_scores_for_known_hotkeys():
+def test_report_poll_round_collects_but_does_not_pay_the_running_epoch():
     client = _FakeLLMKeyClient()
     client.set_reports(
         _single_call_reports("miner-hotkey-1", successes=C.LLM_KEY_VOLUME_TARGET_CALLS, failures=0),
@@ -316,18 +375,245 @@ def test_report_poll_round_updates_scores_for_known_hotkeys():
     )
     validator = _validator(client, _FakeLLMKeyDendrite())
 
-    asyncio.run(validator.llm_key_report_poll_round())
+    _poll(validator)
 
-    assert validator.scores[1] > 0.0
+    assert validator.scores[1] == 0.0  # this epoch's work pays next epoch
+    pending = validator.llm_key_pending_calls["miner-hotkey-1"]["keys"]["1"]
+    assert pending["success_count"] == C.LLM_KEY_VOLUME_TARGET_CALLS
     assert validator.llm_key_hotkey_status["miner-hotkey-1"]["key_active"] is True
     assert validator.last_llm_key_report_cursor == "2026-08-19T00:00:00Z"
-    assert "miner-hotkey-1" not in validator.llm_key_pending_calls  # flushed after scoring
 
+
+# --- per-epoch emission -----------------------------------------------------
+#
+# Emission in each chain epoch pays for the reports of the epoch before it,
+# and nothing carries over from any earlier epoch.
+
+def test_last_epochs_reports_pay_in_the_next_epoch():
+    client = _FakeLLMKeyClient()
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=C.LLM_KEY_VOLUME_TARGET_CALLS, failures=0),
+        next_since="2026-08-19T00:00:00Z",
+    )
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
+
+    _advance_epoch(validator)
+
+    assert validator.scores[1] > 0.0
+    assert validator.scores[2] == 0.0
+    assert validator.llm_key_pending_calls == {}  # the new epoch starts collecting empty
+    assert "miner-hotkey-1" in validator.llm_key_last_epoch_calls
+
+
+def test_nothing_carries_over_into_a_later_epoch():
+    client = _FakeLLMKeyClient()
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=C.LLM_KEY_VOLUME_TARGET_CALLS, failures=0),
+        next_since="2026-08-19T00:00:00Z",
+    )
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
+    _advance_epoch(validator)
+    assert validator.scores[1] > 0.0
+
+    # A quiet epoch follows: the miner earned nothing in it, so it's paid nothing.
+    _advance_epoch(validator)
+
+    assert validator.scores[1] == 0.0
+
+
+def test_reports_count_toward_the_epoch_they_arrive_in():
+    client = _FakeLLMKeyClient()
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=10, failures=0),
+        next_since="2026-08-19T00:00:01Z",
+    )
+    _poll(validator)
+    _advance_epoch(validator)
+    client.set_reports(
+        _single_call_reports("miner-hotkey-2", successes=10, failures=0, key_id=2),
+        next_since="2026-08-19T00:00:02Z",
+    )
+    _poll(validator)
+
+    assert validator.scores[1] > 0.0 and validator.scores[2] == 0.0
+
+    _advance_epoch(validator)
+
+    assert validator.scores[1] == 0.0 and validator.scores[2] > 0.0
+
+
+def test_report_poll_round_notices_a_new_epoch_on_its_own():
+    client = _FakeLLMKeyClient()
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=10, failures=0),
+        next_since="2026-08-19T00:00:00Z",
+    )
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
+
+    validator.subtensor.epoch_start += validator.subtensor.tempo_blocks + 1
+    client.set_reports([], next_since=None)
+    _poll(validator)
+
+    assert validator.scores[1] > 0.0
+
+
+def test_a_single_good_report_earns():
+    # No call-volume floor on the pooled epoch window: any good report counts.
+    client = _FakeLLMKeyClient()
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=1, failures=0),
+        next_since="2026-08-19T00:00:00Z",
+    )
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
+
+    _advance_epoch(validator)
+
+    assert validator.scores[1] > 0.0
+
+
+def test_calls_accumulate_across_polls_within_one_epoch():
+    client = _FakeLLMKeyClient()
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    for successes, cursor in ((2, "2026-08-19T00:00:01Z"), (3, "2026-08-19T00:00:02Z")):
+        client.set_reports(
+            _single_call_reports("miner-hotkey-1", successes=successes, failures=0),
+            next_since=cursor,
+        )
+        _poll(validator)
+
+    assert validator.llm_key_pending_calls["miner-hotkey-1"]["keys"]["1"]["success_count"] == 5
+
+    _advance_epoch(validator)
+
+    assert validator.llm_key_last_epoch_calls["miner-hotkey-1"]["keys"]["1"]["success_count"] == 5
+    assert validator.scores[1] > 0.0
+
+
+def test_an_epoch_gap_discards_the_stale_window():
+    # Validator down across more than one epoch: what it collected belongs
+    # to an epoch long gone, so it is discarded rather than paid now.
+    client = _FakeLLMKeyClient()
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=10, failures=0),
+        next_since="2026-08-19T00:00:00Z",
+    )
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
+
+    _advance_epoch(validator, epochs=2)
+
+    assert validator.scores[1] == 0.0
+    assert validator.llm_key_last_epoch_calls == {}
+    assert validator.llm_key_pending_calls == {}
+
+
+def test_a_sliver_epoch_is_folded_into_the_next_one():
+    # An epoch can end early (owner-triggered). A one-block "epoch" must not
+    # replace the real epoch being paid with a near-empty one.
+    client = _FakeLLMKeyClient()
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=10, failures=0),
+        next_since="2026-08-19T00:00:01Z",
+    )
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
+    _advance_epoch(validator)
+    paid = float(validator.scores[1])
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=2, failures=0),
+        next_since="2026-08-19T00:00:02Z",
+    )
+    _poll(validator)
+
+    validator.subtensor.epoch_start += 1  # a second step, one block later
+    validator._roll_epoch_if_needed()
+
+    assert float(validator.scores[1]) == pytest.approx(paid)
+    assert validator.llm_key_epoch_start_block == validator.subtensor.epoch_start
+    # The sliver's rows carry into the new epoch rather than being lost.
+    assert validator.llm_key_pending_calls["miner-hotkey-1"]["keys"]["1"]["success_count"] == 2
+
+    _advance_epoch(validator)
+
+    assert validator.llm_key_last_epoch_calls["miner-hotkey-1"]["keys"]["1"]["success_count"] == 2
+
+
+def test_state_without_a_recorded_epoch_is_never_paid_out():
+    # State written before per-epoch scoring has no epoch on record; its
+    # accumulator can't be attributed to the last epoch, so it's discarded.
+    client = _FakeLLMKeyClient()
+    client.set_reports([], next_since=None)
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    validator.llm_key_epoch_start_block = None
+    validator.llm_key_pending_calls["miner-hotkey-1"] = {
+        "keys": {"1": _window(10)}, "first_seen_at": 0.0, "last_seen_at": 0.0,
+    }
+    validator.scores[1] = 0.8  # e.g. a restored EMA from the old scoring
+
+    _poll(validator)
+
+    assert validator.scores[1] == 0.0
+    assert validator.llm_key_last_epoch_calls == {}
+    assert validator.llm_key_pending_calls == {}
+    assert validator.llm_key_epoch_start_block == validator.subtensor.epoch_start
+
+
+def test_an_unreadable_epoch_changes_nothing():
+    client = _FakeLLMKeyClient()
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=10, failures=0),
+        next_since="2026-08-19T00:00:00Z",
+    )
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
+    validator.subtensor.epoch_start += validator.subtensor.tempo_blocks + 1
+    validator.subtensor.fail = True
+
+    validator._roll_epoch_if_needed()
+
+    assert validator.llm_key_epoch_start_block == 0
+    assert "miner-hotkey-1" in validator.llm_key_pending_calls
+
+    validator.subtensor.fail = False
+    validator._roll_epoch_if_needed()
+
+    assert validator.scores[1] > 0.0
+
+
+def test_set_weights_submits_the_last_completed_epoch(monkeypatch):
+    submitted = {}
+
+    def _capture(self):
+        submitted["scores"] = np.array(self.scores)
+
+    monkeypatch.setattr(Validator.__bases__[0], "set_weights", _capture)
+    client = _FakeLLMKeyClient()
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=10, failures=0),
+        next_since="2026-08-19T00:00:00Z",
+    )
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
+    # The chain moves on; set_weights runs before any poll notices.
+    validator.subtensor.epoch_start += validator.subtensor.tempo_blocks + 1
+
+    validator.set_weights()
+
+    assert submitted["scores"][1] > 0.0
+    assert submitted["scores"][1] == pytest.approx(float(validator.scores[1]), abs=1e-6)
+
+
+# --- scoring the epoch window -------------------------------------------------
 
 def test_report_poll_round_rewards_top_tier_model_more_than_default_tier():
     # Two hotkeys, identical usage history, different models -- the tier
-    # weight now comes from each usage ROW's own provider/model (verified by
-    # the backend at preflight), not from a submission-time lookup.
+    # weight comes from each usage ROW's own provider/model (verified by the
+    # backend at preflight), not from a submission-time lookup.
     client = _FakeLLMKeyClient()
     client.set_reports(
         _single_call_reports(
@@ -341,8 +627,9 @@ def test_report_poll_round_rewards_top_tier_model_more_than_default_tier():
         next_since="2026-08-19T00:00:00Z",
     )
     validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
 
-    asyncio.run(validator.llm_key_report_poll_round())
+    _advance_epoch(validator)
 
     assert validator.scores[1] > validator.scores[2] > 0.0
 
@@ -355,7 +642,8 @@ def test_report_poll_round_blends_tier_per_call_across_a_mixed_fleet():
         client = _FakeLLMKeyClient()
         client.set_reports(reports, next_since="2026-08-19T00:00:00Z")
         validator = _validator(client, _FakeLLMKeyDendrite())
-        asyncio.run(validator.llm_key_report_poll_round())
+        _poll(validator)
+        _advance_epoch(validator)
         return float(validator.scores[1])
 
     n = C.LLM_KEY_VOLUME_TARGET_CALLS
@@ -378,245 +666,62 @@ def test_report_poll_round_blends_tier_per_call_across_a_mixed_fleet():
     assert budget_only < mixed < top_only
 
 
-def test_report_poll_round_does_not_score_below_threshold_even_across_single_call_rows():
-    # This is the regression test for the bug that made the whole reward
-    # path inert: the protocol reports one row per call, and a report row's
-    # own success_count+failure_count is always 1 -- scoring per-row instead
-    # of aggregating meant min_calls_for_scoring could never be crossed.
+def test_report_poll_round_majority_failing_window_earns_nothing():
     client = _FakeLLMKeyClient()
     client.set_reports(
-        _single_call_reports("miner-hotkey-1", successes=C.LLM_KEY_MIN_CALLS_FOR_SCORING - 1, failures=0),
+        _single_call_reports("miner-hotkey-1", successes=1, failures=2),
         next_since="2026-08-19T00:00:00Z",
     )
     validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
 
-    asyncio.run(validator.llm_key_report_poll_round())
+    _advance_epoch(validator)
 
     assert validator.scores[1] == 0.0
-    pending = validator.llm_key_pending_calls["miner-hotkey-1"]["keys"]["1"]
-    assert pending["success_count"] == C.LLM_KEY_MIN_CALLS_FOR_SCORING - 1
-    assert pending["failure_count"] == 0
 
 
-def test_report_poll_round_scores_once_aggregated_calls_cross_threshold_within_one_poll():
+def test_report_poll_round_low_quality_window_earns_nothing():
+    # Confirmed low-quality output (enough graded calls below the quality
+    # floor) earns nothing, even though every call "succeeded".
     client = _FakeLLMKeyClient()
-    client.set_reports(
-        _single_call_reports("miner-hotkey-1", successes=C.LLM_KEY_MIN_CALLS_FOR_SCORING, failures=0),
-        next_since="2026-08-19T00:00:00Z",
-    )
-    validator = _validator(client, _FakeLLMKeyDendrite())
-
-    asyncio.run(validator.llm_key_report_poll_round())
-
-    assert validator.scores[1] > 0.0
-    assert "miner-hotkey-1" not in validator.llm_key_pending_calls
-
-
-def test_report_poll_round_accumulates_pending_calls_across_multiple_polls():
-    # The core regression test for the actual fix: low-traffic calls spread
-    # across separate polls must still add up, not reset each cycle.
-    client = _FakeLLMKeyClient()
-    validator = _validator(client, _FakeLLMKeyDendrite())
-
-    client.set_reports(
-        _single_call_reports("miner-hotkey-1", successes=2, failures=0),
-        next_since="2026-08-19T00:00:01Z",
-    )
-    asyncio.run(validator.llm_key_report_poll_round())
-    assert validator.scores[1] == 0.0
-    assert validator.llm_key_pending_calls["miner-hotkey-1"]["keys"]["1"]["success_count"] == 2
-
-    validator.last_llm_key_report_poll_at = 0.0  # bypass the poll-interval throttle
-    client.set_reports(
-        _single_call_reports("miner-hotkey-1", successes=3, failures=0),
-        next_since="2026-08-19T00:00:02Z",
-    )
-    asyncio.run(validator.llm_key_report_poll_round())
-
-    assert validator.scores[1] > 0.0
-    assert "miner-hotkey-1" not in validator.llm_key_pending_calls
-
-
-def test_report_poll_round_key_active_false_hard_zeroes_and_clears_pending():
-    # A report row marking the key inactive is conclusive -- emission stops
-    # NOW (score straight to 0.0), not over many EMA decay steps.
-    client = _FakeLLMKeyClient()
-    validator = _validator(client, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.5  # pretend it had a score already
-    validator.llm_key_pending_calls["miner-hotkey-1"] = {
-        "keys": {"1": {
-            "success_count": 3, "failure_count": 0,
-            "latency_ms_weighted_sum": 0.0, "latency_weighted_count": 0,
-            "quality_weighted_sum": 0.0, "quality_weighted_count": 0,
-            "tier": 1.0,
-        }},
-        "first_seen_at": 0.0, "last_seen_at": 0.0,
-    }
-    client.set_reports(
-        _single_call_reports("miner-hotkey-1", successes=0, failures=1, key_active=False),
-        next_since="2026-08-19T00:00:00Z",
-    )
-
-    asyncio.run(validator.llm_key_report_poll_round())
-
-    assert validator.scores[1] == 0.0
-    assert "miner-hotkey-1" not in validator.llm_key_pending_calls
-
-
-def test_report_poll_round_fatal_error_category_hard_zeroes_immediately():
-    # A single row whose error_categories says the provider rejected the key
-    # itself (bad credentials / no budget) zeroes the score on the spot --
-    # no call-volume floor, no waiting for the protocol's health check to
-    # notice (it can lag or be disabled entirely, leaving the key ACTIVE).
-    client = _FakeLLMKeyClient()
-    validator = _validator(client, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.7
-    validator.llm_key_pending_calls["miner-hotkey-1"] = {
-        "keys": {"1": {
-            "success_count": 4, "failure_count": 0,
-            "latency_ms_weighted_sum": 0.0, "latency_weighted_count": 0,
-            "quality_weighted_sum": 0.0, "quality_weighted_count": 0,
-            "tier": 1.0,
-        }},
-        "first_seen_at": 0.0, "last_seen_at": 0.0,
-    }
-    client.set_reports(
-        [LLMKeyUsageReport(
-            hotkey="miner-hotkey-1", key_id=1, provider="openai", model="gpt-4o-mini",
-            success_count=0, failure_count=1,
-            avg_latency_ms=100.0, error_categories={"invalid_key": 1},
-            key_active=True, created_at="2026-08-19T00:00:00Z",
-        )],
-        next_since="2026-08-19T00:00:00Z",
-    )
-
-    asyncio.run(validator.llm_key_report_poll_round())
-
-    assert validator.scores[1] == 0.0
-    assert "miner-hotkey-1" not in validator.llm_key_pending_calls
-
-
-def test_report_poll_round_transient_error_category_folds_normally():
-    # rate_limit / timeout are the reliability axis's job, never a kill switch.
-    client = _FakeLLMKeyClient()
-    validator = _validator(client, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.7
-    client.set_reports(
-        [LLMKeyUsageReport(
-            hotkey="miner-hotkey-1", key_id=1, provider="openai", model="gpt-4o-mini",
-            success_count=0, failure_count=1,
-            avg_latency_ms=100.0, error_categories={"rate_limit": 1},
-            key_active=True, created_at="2026-08-19T00:00:00Z",
-        )],
-        next_since="2026-08-19T00:00:00Z",
-    )
-
-    asyncio.run(validator.llm_key_report_poll_round())
-
-    assert validator.scores[1] == pytest.approx(0.7)  # below volume floor: accumulated, not scored
-    assert validator.llm_key_pending_calls["miner-hotkey-1"]["keys"]["1"]["failure_count"] == 1
-
-
-def _seed_two_key_hotkey(validator, *, pending_calls_1=0, pending_calls_2=0):
-    """A hotkey with two tracked keys (backend ids 1 and 2), optionally with
-    pending traffic split between them."""
-    validator.llm_key_hotkey_status["miner-hotkey-1"] = {
-        "uid": 1,
-        "keys": {
-            "1": {"slot": 0, "provider": "openai", "model": "gpt-4o", "alive": True},
-            "2": {"slot": 1, "provider": "openai", "model": "gpt-4o", "alive": True},
-        },
-    }
-    if pending_calls_1 or pending_calls_2:
-        keys = {}
-        for sub_key, calls in (("1", pending_calls_1), ("2", pending_calls_2)):
-            if calls:
-                keys[sub_key] = {
-                    "success_count": calls, "failure_count": 0,
-                    "latency_ms_weighted_sum": 100.0 * calls, "latency_weighted_count": calls,
-                    "quality_weighted_sum": 0.0, "quality_weighted_count": 0,
-                    "tier": 1.0,
-                }
-        now = time.time()
-        validator.llm_key_pending_calls["miner-hotkey-1"] = {
-            "keys": keys, "first_seen_at": now, "last_seen_at": now,
-        }
-
-
-def test_killing_one_key_cuts_only_its_traffic_share():
-    # A dead key on a multi-key hotkey costs exactly its recent traffic
-    # share; the sibling key's earnings survive and its pending rows stay.
-    client = _FakeLLMKeyClient()
-    validator = _validator(client, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.8
-    _seed_two_key_hotkey(validator, pending_calls_1=1, pending_calls_2=3)
     client.set_reports(
         _single_call_reports(
-            "miner-hotkey-1", successes=0, failures=1, key_active=False,
-            key_id=1, provider="openai", model="gpt-4o",
+            "miner-hotkey-1", successes=C.LLM_KEY_QUALITY_FLOOR_MIN_GRADED, failures=0,
+            quality=0.1,  # e.g. Chain-Agent's fabricated-evidence grade
         ),
         next_since="2026-08-19T00:00:00Z",
     )
-
-    asyncio.run(validator.llm_key_report_poll_round())
-
-    # dead key's share: (1 pending + 1 just-reported... the inactive row is
-    # never folded, so share = 1/4 of tracked traffic) -> 0.8 * (1 - 0.25)
-    assert validator.scores[1] == pytest.approx(0.6)
-    key_states = validator.llm_key_hotkey_status["miner-hotkey-1"]["keys"]
-    assert key_states["1"]["alive"] is False
-    assert key_states["2"]["alive"] is True
-    assert "1" not in validator.llm_key_pending_calls["miner-hotkey-1"]["keys"]
-    assert "2" in validator.llm_key_pending_calls["miner-hotkey-1"]["keys"]
-
-
-def test_killing_the_last_live_key_hard_zeroes_the_hotkey():
-    client = _FakeLLMKeyClient()
     validator = _validator(client, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.8
-    _seed_two_key_hotkey(validator)
-    client.set_reports(
-        _single_call_reports(
-            "miner-hotkey-1", successes=0, failures=1, key_active=False,
-            key_id=1, provider="openai", model="gpt-4o",
-        )
-        + _single_call_reports(
-            "miner-hotkey-1", successes=0, failures=1, key_active=False,
-            key_id=2, provider="openai", model="gpt-4o",
-        ),
-        next_since="2026-08-19T00:00:00Z",
-    )
+    _poll(validator)
 
-    asyncio.run(validator.llm_key_report_poll_round())
+    _advance_epoch(validator)
 
     assert validator.scores[1] == 0.0
 
 
-def test_roster_kill_is_idempotent_across_polls():
-    # The roster re-reports DEAD forever; the share must be deducted once.
+def test_report_poll_round_single_bad_graded_call_does_not_nuke_healthy_window():
+    # One self-graded bad reply among an otherwise clean window drags the
+    # quality axis but must not zero the key: the quality floor needs
+    # LLM_KEY_QUALITY_FLOOR_MIN_GRADED graded calls to act.
     client = _FakeLLMKeyClient()
-    client.set_roster([LLMKeyRosterEntry(
-        hotkey="miner-hotkey-1", key_id=1, slot=0,
-        provider="openai", model="gpt-4o", status="DEAD",
-    )])
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=4, failures=0, quality=None)
+        + _single_call_reports("miner-hotkey-1", successes=1, failures=0, quality=0.1),
+        next_since="2026-08-19T00:00:00Z",
+    )
     validator = _validator(client, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.8
-    _seed_two_key_hotkey(validator)
+    _poll(validator)
 
-    asyncio.run(validator._poll_llm_key_roster())
-    after_first = float(validator.scores[1])
-    asyncio.run(validator._poll_llm_key_roster())
+    _advance_epoch(validator)
 
-    assert 0.0 < after_first < 0.8  # one share cut (no traffic data -> equal-split fallback)
-    assert float(validator.scores[1]) == pytest.approx(after_first)  # second poll: no-op
+    assert validator.scores[1] > 0.0
 
 
 def test_junk_key_is_excluded_without_nuking_the_fleet():
     # One all-failures key hiding inside an otherwise healthy fleet is
-    # killed by the per-key gate at flush; the fleet still scores on its
-    # good traffic instead of hard-zeroing.
+    # killed by the per-key gate; the fleet still scores on its good
+    # traffic instead of earning nothing.
     client = _FakeLLMKeyClient()
-    validator = _validator(client, _FakeLLMKeyDendrite())
     client.set_reports(
         _single_call_reports(
             "miner-hotkey-1", successes=0, failures=C.LLM_KEY_MIN_CALLS_FOR_SCORING,
@@ -628,13 +733,146 @@ def test_junk_key_is_excluded_without_nuking_the_fleet():
         ),
         next_since="2026-08-19T00:00:00Z",
     )
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
 
-    asyncio.run(validator.llm_key_report_poll_round())
+    _advance_epoch(validator)
 
     assert validator.scores[1] > 0.0  # fleet survived on the healthy key
     key_states = validator.llm_key_hotkey_status["miner-hotkey-1"]["keys"]
     assert key_states["1"]["alive"] is False
     assert key_states["2"].get("alive", True) is True
+
+
+# --- confirmed-bad keys stop earning immediately ---------------------------
+
+def _two_key_hotkey_paid_last_epoch(client) -> Validator:
+    """miner-hotkey-1 served 1 good call on key 1 and 3 on key 2 in the last
+    completed epoch, and is being paid for them now."""
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    validator.llm_key_hotkey_status["miner-hotkey-1"] = {
+        "uid": 1,
+        "last_report_at": time.time(),
+        "keys": {
+            "1": {"slot": 0, "provider": "openai", "model": "gpt-4o", "alive": True},
+            "2": {"slot": 1, "provider": "openai", "model": "gpt-4o", "alive": True},
+        },
+    }
+    _seed_last_epoch(validator, "miner-hotkey-1", {"1": _window(1), "2": _window(3)})
+    validator._score_last_epoch()
+    assert validator.scores[1] > 0.0
+    return validator
+
+
+def test_report_row_marking_a_key_inactive_cuts_only_that_key():
+    client = _FakeLLMKeyClient()
+    validator = _two_key_hotkey_paid_last_epoch(client)
+    key2_alone = _validator(None, _FakeLLMKeyDendrite())
+    _seed_last_epoch(key2_alone, "miner-hotkey-1", {"2": _window(3)})
+    key2_alone._score_last_epoch()
+    client.set_reports(
+        _single_call_reports(
+            "miner-hotkey-1", successes=0, failures=1, key_active=False,
+            key_id=1, provider="openai", model="gpt-4o",
+        ),
+        next_since="2026-08-19T00:00:00Z",
+    )
+
+    _poll(validator)
+
+    # Paid exactly as if key 1 had never served: the sibling keeps earning.
+    assert validator.scores[1] == pytest.approx(float(key2_alone.scores[1]), abs=1e-6)
+    key_states = validator.llm_key_hotkey_status["miner-hotkey-1"]["keys"]
+    assert key_states["1"]["alive"] is False
+    assert key_states["2"]["alive"] is True
+    assert list(validator.llm_key_last_epoch_calls["miner-hotkey-1"]["keys"]) == ["2"]
+    assert "miner-hotkey-1" not in validator.llm_key_pending_calls  # the dead row isn't folded
+
+
+def test_killing_every_key_stops_the_hotkey_earning():
+    client = _FakeLLMKeyClient()
+    validator = _two_key_hotkey_paid_last_epoch(client)
+    client.set_reports(
+        _single_call_reports(
+            "miner-hotkey-1", successes=0, failures=1, key_active=False,
+            key_id=1, provider="openai", model="gpt-4o",
+        )
+        + _single_call_reports(
+            "miner-hotkey-1", successes=0, failures=1, key_active=False,
+            key_id=2, provider="openai", model="gpt-4o",
+        ),
+        next_since="2026-08-19T00:00:00Z",
+    )
+
+    _poll(validator)
+
+    assert validator.scores[1] == 0.0
+    assert "miner-hotkey-1" not in validator.llm_key_last_epoch_calls
+
+
+def test_report_poll_round_fatal_error_category_kills_the_key_immediately():
+    # A single row whose error_categories says the provider rejected the key
+    # itself (bad credentials / no budget) kills it on the spot -- no
+    # call-volume floor, no waiting for the protocol's health check to
+    # notice (it can lag or be disabled entirely, leaving the key ACTIVE).
+    client = _FakeLLMKeyClient()
+    validator = _two_key_hotkey_paid_last_epoch(client)
+    before = float(validator.scores[1])
+    client.set_reports(
+        [LLMKeyUsageReport(
+            hotkey="miner-hotkey-1", key_id=2, provider="openai", model="gpt-4o",
+            success_count=0, failure_count=1,
+            avg_latency_ms=100.0, error_categories={"invalid_key": 1},
+            key_active=True, created_at="2026-08-19T00:00:00Z",
+        )],
+        next_since="2026-08-19T00:00:00Z",
+    )
+
+    _poll(validator)
+
+    assert 0.0 < validator.scores[1] < before
+    assert validator.llm_key_hotkey_status["miner-hotkey-1"]["keys"]["2"]["alive"] is False
+    assert "miner-hotkey-1" not in validator.llm_key_pending_calls
+
+
+def test_report_poll_round_transient_error_category_folds_normally():
+    # rate_limit / timeout are the reliability axis's job, never a kill switch.
+    client = _FakeLLMKeyClient()
+    client.set_reports(
+        [LLMKeyUsageReport(
+            hotkey="miner-hotkey-1", key_id=1, provider="openai", model="gpt-4o-mini",
+            success_count=0, failure_count=1,
+            avg_latency_ms=100.0, error_categories={"rate_limit": 1},
+            key_active=True, created_at="2026-08-19T00:00:00Z",
+        )],
+        next_since="2026-08-19T00:00:00Z",
+    )
+    validator = _validator(client, _FakeLLMKeyDendrite())
+
+    _poll(validator)
+
+    assert validator.llm_key_pending_calls["miner-hotkey-1"]["keys"]["1"]["failure_count"] == 1
+    key_state = validator.llm_key_hotkey_status["miner-hotkey-1"].get("keys", {}).get("1", {})
+    assert key_state.get("alive", True) is True
+
+
+def test_roster_kill_is_idempotent_across_polls():
+    client = _FakeLLMKeyClient()
+    client.set_roster([LLMKeyRosterEntry(
+        hotkey="miner-hotkey-1", key_id=1, slot=0,
+        provider="openai", model="gpt-4o", status="DEAD",
+    )])
+    validator = _two_key_hotkey_paid_last_epoch(client)
+    before = float(validator.scores[1])
+
+    asyncio.run(validator._poll_llm_key_roster())
+    validator._score_last_epoch()
+    after_first = float(validator.scores[1])
+    asyncio.run(validator._poll_llm_key_roster())
+    validator._score_last_epoch()
+
+    assert 0.0 < after_first < before
+    assert float(validator.scores[1]) == pytest.approx(after_first)  # second poll: no-op
 
 
 def test_load_state_migrates_old_flat_pending_shape(tmp_path, monkeypatch):
@@ -659,7 +897,7 @@ def test_load_state_migrates_old_flat_pending_shape(tmp_path, monkeypatch):
     migrated = validator.llm_key_pending_calls["miner-hotkey-1"]
     assert migrated["keys"]["legacy"]["success_count"] == 3
     assert migrated["keys"]["legacy"]["failure_count"] == 1
-    assert migrated["keys"]["legacy"]["tier"] is None  # resolved at flush via legacy lookup
+    assert migrated["keys"]["legacy"]["tier"] is None  # resolved at scoring via legacy lookup
     assert migrated["first_seen_at"] == 100.0
 
 
@@ -686,109 +924,36 @@ def test_validate_miner_keys_caps_and_sanitizes_the_relay():
     assert validator._validate_miner_keys(1, None) == []
 
 
-def test_report_poll_round_majority_failing_window_hard_zeroes():
-    # Once a full window (>= the call-volume floor) shows the key failing
-    # most of its calls, the miner stops earning immediately -- the old
-    # behavior EMA-blended in a still-substantial composite built from
-    # neutral quality/latency defaults plus volume credit.
-    client = _FakeLLMKeyClient()
-    validator = _validator(client, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.8
-    client.set_reports(
-        _single_call_reports(
-            "miner-hotkey-1", successes=0, failures=C.LLM_KEY_MIN_CALLS_FOR_SCORING,
-        ),
-        next_since="2026-08-19T00:00:00Z",
-    )
-
-    asyncio.run(validator.llm_key_report_poll_round())
-
-    assert validator.scores[1] == 0.0
-    assert "miner-hotkey-1" not in validator.llm_key_pending_calls
-
-
-def test_report_poll_round_low_quality_window_hard_zeroes():
-    # Confirmed low-quality output (enough graded calls below the quality
-    # floor) cuts emission immediately, even though every call "succeeded".
-    client = _FakeLLMKeyClient()
-    validator = _validator(client, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.8
-    client.set_reports(
-        _single_call_reports(
-            "miner-hotkey-1", successes=C.LLM_KEY_MIN_CALLS_FOR_SCORING, failures=0,
-            quality=0.1,  # e.g. Chain-Agent's fabricated-evidence grade
-        ),
-        next_since="2026-08-19T00:00:00Z",
-    )
-
-    asyncio.run(validator.llm_key_report_poll_round())
-
-    assert validator.scores[1] == 0.0
-    assert "miner-hotkey-1" not in validator.llm_key_pending_calls
-
-
-def test_report_poll_round_single_bad_graded_call_does_not_nuke_healthy_window():
-    # One self-graded bad reply among an otherwise clean window drags the
-    # quality axis but must not zero the key: the quality floor needs
-    # LLM_KEY_QUALITY_FLOOR_MIN_GRADED graded calls to act.
-    client = _FakeLLMKeyClient()
-    validator = _validator(client, _FakeLLMKeyDendrite())
-    good_calls = C.LLM_KEY_MIN_CALLS_FOR_SCORING - 1
-    client.set_reports(
-        _single_call_reports("miner-hotkey-1", successes=good_calls, failures=0, quality=None)
-        + _single_call_reports("miner-hotkey-1", successes=1, failures=0, quality=0.1),
-        next_since="2026-08-19T00:00:00Z",
-    )
-
-    asyncio.run(validator.llm_key_report_poll_round())
-
-    assert validator.scores[1] > 0.0
-
-
-def test_report_poll_round_pending_window_force_flushes_after_max_age():
-    client = _FakeLLMKeyClient()
-    validator = _validator(client, _FakeLLMKeyDendrite())
-    client.set_reports(
-        _single_call_reports("miner-hotkey-1", successes=1, failures=0),
-        next_since="2026-08-19T00:00:00Z",
-    )
-    asyncio.run(validator.llm_key_report_poll_round())
-    assert validator.scores[1] == 0.0
-    assert "miner-hotkey-1" in validator.llm_key_pending_calls
-
-    # Age the pending window past the max, then re-poll with no new reports
-    # -- the force-flush must still fire even with nothing new to fold in.
-    validator.llm_key_pending_calls["miner-hotkey-1"]["first_seen_at"] -= (
-        C.LLM_KEY_PENDING_WINDOW_MAX_SECONDS + 1
-    )
-    validator.last_llm_key_report_poll_at = 0.0
-    client.set_reports([], next_since=None)
-
-    asyncio.run(validator.llm_key_report_poll_round())
-
-    assert validator.scores[1] > 0.0
-    assert "miner-hotkey-1" not in validator.llm_key_pending_calls
-
-
-def test_report_poll_round_pending_calls_survive_state_save_and_load(tmp_path, monkeypatch):
+def test_epoch_state_survives_save_and_load(tmp_path, monkeypatch):
+    # A restart within an epoch keeps both the epoch being paid and the one
+    # being collected, and which epoch that is.
     monkeypatch.setenv(C.VALIDATOR_STATE_FILE_ENV, str(tmp_path / "state.json"))
     client = _FakeLLMKeyClient()
     validator = _validator(client, _FakeLLMKeyDendrite())
     client.set_reports(
-        _single_call_reports("miner-hotkey-1", successes=2, failures=0),
-        next_since="2026-08-19T00:00:00Z",
+        _single_call_reports("miner-hotkey-1", successes=4, failures=0),
+        next_since="2026-08-19T00:00:01Z",
     )
-    asyncio.run(validator.llm_key_report_poll_round())
-    pending_before = dict(validator.llm_key_pending_calls["miner-hotkey-1"])
+    _poll(validator)
+    _advance_epoch(validator)
+    client.set_reports(
+        _single_call_reports("miner-hotkey-1", successes=2, failures=0),
+        next_since="2026-08-19T00:00:02Z",
+    )
+    _poll(validator)
+    paid = float(validator.scores[1])
 
     validator.save_masxai_state()
-
     reloaded = _validator(client, _FakeLLMKeyDendrite())
+    reloaded.subtensor = validator.subtensor
     reloaded.load_masxai_state()
+    reloaded._roll_epoch_if_needed()  # same epoch: no-op
+    reloaded._score_last_epoch()
 
-    pending_after = reloaded.llm_key_pending_calls["miner-hotkey-1"]
-    assert pending_after["keys"]["1"]["success_count"] == pending_before["keys"]["1"]["success_count"]
-    assert pending_after["keys"]["1"]["failure_count"] == pending_before["keys"]["1"]["failure_count"]
+    assert reloaded.llm_key_epoch_start_block == validator.llm_key_epoch_start_block
+    assert reloaded.llm_key_last_epoch_calls["miner-hotkey-1"]["keys"]["1"]["success_count"] == 4
+    assert reloaded.llm_key_pending_calls["miner-hotkey-1"]["keys"]["1"]["success_count"] == 2
+    assert float(reloaded.scores[1]) == pytest.approx(paid, abs=1e-6)
 
 
 def test_model_tier_weight_defaults_when_hotkey_unknown():
@@ -812,7 +977,8 @@ def test_report_poll_round_skips_unknown_hotkey_without_crashing():
     )
     validator = _validator(client, _FakeLLMKeyDendrite())
 
-    asyncio.run(validator.llm_key_report_poll_round())
+    _poll(validator)
+    _advance_epoch(validator)
 
     assert np.array_equal(validator.scores, np.zeros(3, dtype=np.float32))
     # cursor still advances so the unscoreable reports aren't refetched forever
@@ -860,72 +1026,43 @@ def test_prune_llm_key_hotkey_status_clears_missing_since_when_hotkey_reappears(
     assert "_missing_since" not in validator.llm_key_hotkey_status["miner-hotkey-1"]
 
 
-# --- _decay_stale_llm_key_scores --------------------------------------------
-
-def test_decay_stale_llm_key_scores_decays_frozen_score_toward_zero():
-    validator = _validator(None, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.8
-    validator.llm_key_hotkey_status = {"miner-hotkey-1": {"uid": 1, "last_report_at": 0.0}}
-
-    validator._decay_stale_llm_key_scores(C.LLM_KEY_STALENESS_TIMEOUT_SECONDS + 1)
-
-    expected = ema_update(0.8, 0.0, alpha=C.LLM_KEY_EMA_ALPHA)
-    assert validator.scores[1] == pytest.approx(expected)
-    assert validator.scores[1] < 0.8
-
-
-def test_decay_stale_llm_key_scores_does_not_touch_fresh_hotkeys():
-    validator = _validator(None, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.8
-    validator.llm_key_hotkey_status = {"miner-hotkey-1": {"uid": 1, "last_report_at": 999.0}}
-
-    validator._decay_stale_llm_key_scores(1000.0)  # only 1s stale, well under timeout
-
-    assert validator.scores[1] == 0.8
-
-
-def test_decay_stale_llm_key_scores_skips_zero_score_and_missing_last_report_at():
-    validator = _validator(None, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.0
-    validator.scores[2] = 0.8
-    validator.llm_key_hotkey_status = {
-        "miner-hotkey-1": {"uid": 1, "last_report_at": 0.0},  # score already 0, no-op
-        "miner-hotkey-2": {"uid": 2},  # no last_report_at at all, no-op
-    }
-
-    validator._decay_stale_llm_key_scores(C.LLM_KEY_STALENESS_TIMEOUT_SECONDS + 1)
-
-    assert validator.scores[1] == 0.0
-    assert validator.scores[2] == 0.8
-
-
 # --- _poll_llm_key_roster ----------------------------------------------------
 
-def test_poll_llm_key_roster_hard_zeroes_dead_key():
-    # DEAD on the roster is the protocol's own confirmation -- the score
-    # drops straight to zero, not one EMA step at a time, so a dead key
-    # never draws emission for even one more epoch.
+def _single_key_hotkey_paid_last_epoch(client) -> Validator:
+    validator = _validator(client, _FakeLLMKeyDendrite())
+    validator.llm_key_hotkey_status = {"miner-hotkey-1": {"uid": 1}}
+    # Roster entries without key identity map to the "legacy" bucket.
+    _seed_last_epoch(validator, "miner-hotkey-1", {"legacy": _window(3)})
+    validator.llm_key_pending_calls["miner-hotkey-1"] = {
+        "keys": {"legacy": _window(2)}, "first_seen_at": 0.0, "last_seen_at": 0.0,
+    }
+    validator._score_last_epoch()
+    assert validator.scores[1] > 0.0
+    return validator
+
+
+def test_poll_llm_key_roster_stops_a_dead_key_earning():
+    # DEAD on the roster is the protocol's own confirmation -- the key stops
+    # earning for the epoch being paid right now, not just from the next one.
     client = _FakeLLMKeyClient()
     client.set_roster([LLMKeyRosterEntry(hotkey="miner-hotkey-1", status="DEAD")])
-    validator = _validator(client, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.8
-    validator.llm_key_hotkey_status = {"miner-hotkey-1": {"uid": 1}}
-    validator.llm_key_pending_calls["miner-hotkey-1"] = {"success_count": 2}
+    validator = _single_key_hotkey_paid_last_epoch(client)
 
     asyncio.run(validator._poll_llm_key_roster())
+    validator._score_last_epoch()
 
     assert validator.scores[1] == 0.0
     assert "miner-hotkey-1" not in validator.llm_key_pending_calls  # moot once dead
+    assert "miner-hotkey-1" not in validator.llm_key_last_epoch_calls
 
 
-def test_poll_llm_key_roster_hard_zeroes_revoked_key():
+def test_poll_llm_key_roster_stops_a_revoked_key_earning():
     client = _FakeLLMKeyClient()
     client.set_roster([LLMKeyRosterEntry(hotkey="miner-hotkey-1", status="REVOKED")])
-    validator = _validator(client, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.8
-    validator.llm_key_hotkey_status = {"miner-hotkey-1": {"uid": 1}}
+    validator = _single_key_hotkey_paid_last_epoch(client)
 
     asyncio.run(validator._poll_llm_key_roster())
+    validator._score_last_epoch()
 
     assert validator.scores[1] == 0.0
 
@@ -933,13 +1070,13 @@ def test_poll_llm_key_roster_hard_zeroes_revoked_key():
 def test_poll_llm_key_roster_ignores_active_keys():
     client = _FakeLLMKeyClient()
     client.set_roster([LLMKeyRosterEntry(hotkey="miner-hotkey-1", status="ACTIVE")])
-    validator = _validator(client, _FakeLLMKeyDendrite())
-    validator.scores[1] = 0.8
-    validator.llm_key_hotkey_status = {"miner-hotkey-1": {"uid": 1}}
+    validator = _single_key_hotkey_paid_last_epoch(client)
+    before = float(validator.scores[1])
 
     asyncio.run(validator._poll_llm_key_roster())
+    validator._score_last_epoch()
 
-    assert validator.scores[1] == 0.8
+    assert float(validator.scores[1]) == pytest.approx(before)
 
 
 def test_poll_llm_key_roster_is_noop_when_client_is_none():
@@ -1003,7 +1140,7 @@ def test_blended_weight_array_withholds_weight_from_scores_with_no_reports():
     blended = validator._blended_weight_array()
 
     assert np.array_equal(blended, np.zeros(3, dtype=np.float32))
-    # Masking is submission-local: the EMA itself is untouched.
+    # Masking is submission-local: self.scores itself is untouched.
     assert validator.scores[1] == pytest.approx(0.82, abs=1e-6)
 
 
@@ -1050,8 +1187,9 @@ def test_a_score_earned_from_real_reports_is_paid():
         next_since="2026-08-19T00:00:00Z",
     )
     validator = _validator(client, _FakeLLMKeyDendrite())
+    _poll(validator)
 
-    asyncio.run(validator.llm_key_report_poll_round())
+    _advance_epoch(validator)
 
     assert validator.scores[1] > 0.0
     assert validator._blended_weight_array()[1] == pytest.approx(

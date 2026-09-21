@@ -23,7 +23,7 @@ BURN_PERCENTAGE = 0.95                # burn 95%, distribute 5% to miners with c
 # weight. A miner earns weight only through a confirmed, currently-active
 # contributed key (self.scores), never merely by answering the ask.
 PARTICIPATION_EMA_ALPHA_ENV = "MASXAI_PARTICIPATION_EMA_ALPHA"
-PARTICIPATION_EMA_ALPHA = 0.2         # moves faster than the llm_key efficiency EMA (LLM_KEY_EMA_ALPHA)
+PARTICIPATION_EMA_ALPHA = 0.2
 PARTICIPATION_REWARD = 1.0            # reward fed to the EMA for each answered ask
 
 # --- persistence ---
@@ -106,42 +106,11 @@ LLM_KEY_REPORT_POLL_FAILURE_BACKOFF_SECONDS = 30
 LLM_KEY_HOTKEY_STATUS_EVICTION_GRACE_SECONDS_ENV = "MASXAI_LLM_KEY_HOTKEY_STATUS_EVICTION_GRACE_SECONDS"
 LLM_KEY_HOTKEY_STATUS_EVICTION_GRACE_SECONDS = 24 * 60 * 60
 
-# The protocol reports one row per single call, not a pre-aggregated window
-# -- raw report rows for a hotkey accumulate in Validator.llm_key_pending_calls
-# until LLM_KEY_MIN_CALLS_FOR_SCORING is reached (see llm_key_report_poll_round).
-# A low-traffic key that never reaches that threshold on its own is
-# force-flushed (scored on whatever it has, confidence-floor-damped) after
-# this long, rather than accumulating forever. The protocol's only currently
-# -wired report source is a daily health-check ping per active key, so this
-# gives up to ~5 daily pings (the default call-volume floor) plus one full
-# extra cycle of slack before forcing a score.
-LLM_KEY_PENDING_WINDOW_MAX_SECONDS_ENV = "MASXAI_LLM_KEY_PENDING_WINDOW_MAX_SECONDS"
-LLM_KEY_PENDING_WINDOW_MAX_SECONDS = 7 * 24 * 60 * 60
-
-# A hotkey whose score is positive but hasn't had a fresh usage report in
-# this long gets actively decayed toward zero each poll (see
-# _decay_stale_llm_key_scores) instead of freezing forever -- covers a key
-# that was rejected on resubmission, went DEAD, or was REVOKED, none of
-# which necessarily produce another report to naturally zero it out via the
-# key_active=False path. Set well above the daily health-check cadence so
-# ordinary timing jitter on a healthy, low-traffic key never triggers it.
-LLM_KEY_STALENESS_TIMEOUT_SECONDS_ENV = "MASXAI_LLM_KEY_STALENESS_TIMEOUT_SECONDS"
-LLM_KEY_STALENESS_TIMEOUT_SECONDS = 48 * 60 * 60
-
 # If the validator has accepted keys on file but report polls stay empty for
 # longer than this, warn -- the protocol backend likely isn't feeding usage
 # data (see llm_key_report_poll_round()).
 LLM_KEY_REPORTS_EMPTY_WARN_SECONDS_ENV = "MASXAI_LLM_KEY_REPORTS_EMPTY_WARN_SECONDS"
 LLM_KEY_REPORTS_EMPTY_WARN_SECONDS = 6 * 60 * 60
-
-LLM_KEY_EMA_ALPHA_ENV = "MASXAI_LLM_KEY_EMA_ALPHA"
-LLM_KEY_EMA_ALPHA = 0.15
-
-# Minimum EMA-alpha multiplier applied even when a report window has very
-# few calls -- keeps a single-call window from swinging self.scores at full
-# weight while still letting it contribute some signal.
-LLM_KEY_EMA_CONFIDENCE_FLOOR_ENV = "MASXAI_LLM_KEY_EMA_CONFIDENCE_FLOOR"
-LLM_KEY_EMA_CONFIDENCE_FLOOR = 0.2
 
 # Composite = reliability_weight*reliability + quality_weight*quality
 #           + latency_weight*latency_score + volume_weight*volume_score,
@@ -156,16 +125,17 @@ LLM_KEY_QUALITY_WEIGHT = 0.2
 LLM_KEY_LATENCY_WEIGHT = 0.2
 LLM_KEY_LATENCY_CEILING_SECONDS = 5.0
 LLM_KEY_MIN_CALLS_FOR_SCORING_ENV = "MASXAI_LLM_KEY_MIN_CALLS_FOR_SCORING"
-LLM_KEY_MIN_CALLS_FOR_SCORING = 5      # below this, skip the EMA update (no signal, not a penalty)
+# Evidence bar for killing ONE key of a hotkey on its own sub-window (see
+# Validator._sub_window_floor_reason) -- a couple of bad calls is signal, not
+# a verdict. The hotkey's pooled epoch window has no such floor: any good
+# report in the last completed epoch earns.
+LLM_KEY_MIN_CALLS_FOR_SCORING = 5
 
 # Hard floors: a scored window that trips either one earns 0.0 outright --
 # the additive composite must never let a key that isn't actually working
 # (or is emitting low-quality output) keep collecting the neutral-default
-# quality/latency terms plus volume credit. On top of that, the validator
-# drops the EMA straight to zero (see _record_llm_key_score) when the
-# tripped window carries at least LLM_KEY_MIN_CALLS_FOR_SCORING calls of
-# evidence, so a confirmed-bad key stops earning emission this epoch, not
-# several EMA steps from now. Reliability at exactly the floor still scores.
+# quality/latency terms plus volume credit. Reliability at exactly the floor
+# still scores.
 LLM_KEY_RELIABILITY_HARD_FLOOR_ENV = "MASXAI_LLM_KEY_RELIABILITY_HARD_FLOOR"
 LLM_KEY_RELIABILITY_HARD_FLOOR = 0.5   # majority-failing window -> key isn't working
 LLM_KEY_QUALITY_HARD_FLOOR_ENV = "MASXAI_LLM_KEY_QUALITY_HARD_FLOOR"
@@ -200,7 +170,7 @@ LLM_KEY_FATAL_ERROR_CATEGORIES = frozenset({
 # on the protocol side, so this can't be gamed with unbounded artificial
 # call volume.
 LLM_KEY_VOLUME_WEIGHT = 0.2
-LLM_KEY_VOLUME_TARGET_CALLS = 50       # successful calls per report window considered "fully utilized"
+LLM_KEY_VOLUME_TARGET_CALLS = 50       # successful calls per epoch considered "fully utilized"
 
 # Model tier: the one real "quality" lever a miner controls (which model
 # they configure), applied as a final multiplier on the composite above so a
