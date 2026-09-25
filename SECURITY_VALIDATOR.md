@@ -32,8 +32,8 @@ Nothing here shares code or state with `neurons/validator.py`.
 - Syscall behavioural monitoring and the safety scorer.
 - Replay against a fresh target.
 
-See `gvisor_flow.md` and `gvisor_implementation_plan.md` for the full design of
-the isolated-execution phase.
+The isolated-execution phase (gVisor, target, monitoring, replay) is designed
+but not yet in this branch.
 
 ## The scope line, stated plainly
 
