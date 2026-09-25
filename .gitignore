@@ -167,3 +167,8 @@ testing/
 # MASXAI validator state (runtime artifact, do not commit)
 validator_state.json
 scripts/mock_validator_state.json
+
+# secqurityVali - local submission database
+secqurityVali.db
+secqurityVali.db-wal
+secqurityVali.db-shm

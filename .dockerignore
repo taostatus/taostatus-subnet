@@ -1,0 +1,10 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+*.db
+tests/
+docs/
+contrib/
+.circleci/
+.github/

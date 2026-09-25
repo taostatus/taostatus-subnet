@@ -1,0 +1,76 @@
+# Validator API for testing.
+#
+#   cd secqurityVali/deploy
+#   SECVAL_API_TOKEN=pick-a-token docker compose up --build
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE RUNNING IT SOMEWHERE THAT MATTERS
+#
+# This mounts the host's Docker socket into the container. Anything that can
+# talk to that socket can start a container with the host filesystem mounted,
+# which is root on the host. The container is therefore NOT a security
+# boundary here -- it is packaging, so the validator is easy to start and
+# stop.
+#
+# That is an acceptable trade on a machine you are testing on, and it is not
+# acceptable on a machine holding anything you care about. The isolation this
+# project is actually building lives in a later phase (gVisor, per-run
+# networks); until then, run this on a throwaway host.
+# ---------------------------------------------------------------------------
+
+services:
+  validator:
+    build:
+      # The build needs both secqurityVali/ and neurons/, so the context is
+      # the repository root.
+      context: ../..
+      dockerfile: secqurityVali/deploy/Dockerfile
+    container_name: secval-api
+    restart: unless-stopped
+
+    environment:
+      # No default. The API refuses to start without it, because an open
+      # endpoint here does not merely accept data -- it executes submitted
+      # images.
+      SECVAL_API_TOKEN: ${SECVAL_API_TOKEN:?set SECVAL_API_TOKEN before starting}
+
+    ports:
+      # Bound to all interfaces so another machine on your network can reach
+      # it. Change to "127.0.0.1:8899:8899" to keep it on this machine only.
+      - "8899:8899"
+
+    volumes:
+      # The host daemon. See the warning above.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Verdicts survive rebuilds.
+      - secval-data:/data
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8899/v1/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # Optional: a public HTTPS URL, so someone who is not on your network can
+  # submit. Start it with:  docker compose --profile tunnel up -d
+  #
+  # This publishes an endpoint that PULLS AND RUNS submitted Docker images to
+  # the whole internet. The bearer token is the only thing in front of it.
+  # Use it for a test, then take the stack down -- `docker compose down`.
+  # A quick tunnel's URL is random and changes every restart, which is a
+  # small mercy but not a security control.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: secval-tunnel
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    depends_on:
+      - validator
+    # Reaches the validator by service name on the compose network, so the
+    # tunnel does not depend on the published host port.
+    command: tunnel --no-autoupdate --url http://validator:8899
+
+volumes:
+  secval-data:
