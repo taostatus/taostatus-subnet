@@ -186,3 +186,22 @@ LLM_KEY_MODEL_TIER_WEIGHTS = {
     "deepseek/deepseek-chat": 0.5,
 }
 LLM_KEY_MODEL_TIER_DEFAULT_WEIGHT = 0.5   # unlisted-but-allowed provider/model
+
+# --- security-audit track (second emission path) -----------------------
+# Off by default, exactly like the LLM-key track: a miner opts in by setting
+# an image reference to submit. Empty/unset => the miner declines every
+# security round (has_agent=False), never crashes the axon.
+SECURITY_AGENT_ENABLED_ENV = "MASXAI_SECURITY_AGENT_ENABLED"
+SECURITY_AGENT_IMAGE_ENV = "MASXAI_SECURITY_AGENT_IMAGE"
+
+# Dendrite timeout when the validator asks a miner for its image reference.
+# The payload is tiny (one string), so this is short.
+SECURITY_QUERY_TIMEOUT = 15
+
+# How often the validator runs a security round, seconds.
+SECURITY_SUBMISSION_INTERVAL_SECONDS_ENV = "MASXAI_SECURITY_SUBMISSION_INTERVAL_SECONDS"
+SECURITY_SUBMISSION_INTERVAL_SECONDS = 300
+
+# Where the security validator keeps its verdict database on the host.
+SECURITY_DB_PATH_ENV = "MASXAI_SECURITY_DB_PATH"
+SECURITY_DB_PATH = "secqurityVali.db"

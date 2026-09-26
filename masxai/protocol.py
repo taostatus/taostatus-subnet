@@ -88,3 +88,57 @@ class LLMKeySynapse(bt.Synapse):
             "keys": self.keys,
             "timestamp": self.timestamp,
         }
+
+
+# ---------------------------------------------------------------------------
+# Security-audit track
+# ---------------------------------------------------------------------------
+# The second emission path (see SECURITY_VALIDATOR.md). Independent of
+# LLMKeySynapse above: a miner contributes a security-testing agent packaged as
+# a Docker image rather than an LLM key. The validator asks for the image
+# reference, then pulls and evaluates it with the secqurityVali pipeline -- the
+# validator never trusts anything the miner says about the image beyond the
+# reference itself.
+
+SECURITY_SYNAPSE_VERSION = 1
+
+
+class SecurityAgentSynapse(bt.Synapse):
+    """One ask-for-agent-image round trip.
+
+    The miner returns only a reference to a Docker image (a registry ref such
+    as ghcr.io/org/agent:0.1.0, or repo@sha256:...). Everything else about the
+    image -- whether it is really an image, whether it is safe, whether it does
+    the job -- is decided by the validator pulling and running it, never by the
+    miner's word. So this wire contract is deliberately thin: the reference is
+    the only miner-supplied field, and it is treated as untrusted input.
+
+    Request (set by validator):
+        request_id   uuid4 hex, unique per ask cycle
+        issued_at    unix seconds
+        version      security protocol version
+
+    Response (set by miner):
+        has_agent    False/None if the operator hasn't opted in this round --
+                     a miner is never forced to answer; True iff image_ref set
+        image_ref    the Docker image reference to evaluate
+        timestamp    ISO8601 generation timestamp
+    """
+
+    # ---- request ----
+    request_id: str = ""
+    issued_at: float = 0.0
+    version: int = SECURITY_SYNAPSE_VERSION
+
+    # ---- response ----
+    has_agent: Optional[bool] = pydantic.Field(default=None)
+    image_ref: str = ""
+    timestamp: str = ""
+
+    def deserialize(self) -> dict[str, Any]:
+        """Validators call this to read the miner's agent submission."""
+        return {
+            "has_agent": self.has_agent,
+            "image_ref": self.image_ref,
+            "timestamp": self.timestamp,
+        }

@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from masxai.protocol import LLMKeySynapse
+from masxai.protocol import LLMKeySynapse, SecurityAgentSynapse
 from masxai import constants as C
 from masxai.bt_compat import bt
 from masxai.env import load_env
@@ -142,6 +142,28 @@ class Miner(BaseMinerNeuron):
             f"enabled={bool(configs)} keys={len(configs)} "
             + " ".join(f"slot{i}={p}/{m}" for i, (p, m, _) in enumerate(configs))
         )
+
+        # Attach the security-audit synapse as a second route on the same axon.
+        # The base class already attached forward()/blacklist()/priority() for
+        # LLMKeySynapse; bittensor routes each synapse type to its own handler
+        # by the forward function's type annotation, so one hotkey serves both
+        # tracks. Guarded so a bittensor build without .axon (the fallback in
+        # tests) doesn't crash construction.
+        security_enabled = _env_flag(C.SECURITY_AGENT_ENABLED_ENV, False)
+        axon = getattr(self, "axon", None)
+        if axon is not None:
+            try:
+                axon.attach(
+                    forward_fn=self.forward_security,
+                    blacklist_fn=self.blacklist_security,
+                    priority_fn=self.priority_security,
+                )
+            except Exception as e:  # noqa: BLE001
+                bt.logging.warning(f"could not attach security synapse route: {e}")
+        bt.logging.info(
+            f"Security-audit contribution | enabled={security_enabled} "
+            f"image={os.getenv(C.SECURITY_AGENT_IMAGE_ENV) or '(unset)'}"
+        )
         bt.logging.info("MASXAI miner initialized.")
 
     async def forward(self, synapse: LLMKeySynapse) -> LLMKeySynapse:
@@ -197,13 +219,58 @@ class Miner(BaseMinerNeuron):
         action (a key submission relayed onward to the protocol backend) on
         every accepted response.
         """
+        return self._require_validator(synapse)
+
+    async def priority(self, synapse: LLMKeySynapse) -> float:
+        """Prioritize higher-stake callers. Standard template pattern."""
+        return self._stake_priority(synapse)
+
+    # ------------------------------------------------------------ security
+    async def forward_security(
+        self, synapse: SecurityAgentSynapse
+    ) -> SecurityAgentSynapse:
+        """Answer a request for this miner's security-agent image, or decline.
+
+        The miner returns only a reference; the validator pulls and evaluates
+        it. Never raises -- an unconfigured or misconfigured miner declines
+        (has_agent=False) rather than crashing the axon route, exactly like the
+        LLM-key path.
+        """
+        try:
+            if not _env_flag(C.SECURITY_AGENT_ENABLED_ENV, False):
+                synapse.has_agent = False
+                return synapse
+            image_ref = (os.getenv(C.SECURITY_AGENT_IMAGE_ENV) or "").strip()
+            if not image_ref:
+                synapse.has_agent = False
+                return synapse
+            synapse.image_ref = image_ref
+            synapse.has_agent = True
+            synapse.timestamp = _utc_now_iso()
+        except Exception as e:  # noqa: BLE001 — never let forward crash
+            bt.logging.warning(f"security agent submission failed, declining: {e}")
+            synapse.has_agent = False
+            synapse.image_ref = ""
+        return synapse
+
+    async def blacklist_security(
+        self, synapse: SecurityAgentSynapse
+    ) -> typing.Tuple[bool, str]:
+        """Same rule as the LLM-key path: a validator permit is always
+        required, because an accepted response makes the validator pull and
+        run an image -- a state-changing, security-sensitive action."""
+        return self._require_validator(synapse)
+
+    async def priority_security(self, synapse: SecurityAgentSynapse) -> float:
+        return self._stake_priority(synapse)
+
+    # ------------------------------------------------------ shared helpers
+    def _require_validator(self, synapse) -> typing.Tuple[bool, str]:
         if synapse.dendrite is None or synapse.dendrite.hotkey is None:
             return True, "missing dendrite/hotkey"
-
         hotkey = synapse.dendrite.hotkey
         if hotkey not in self.metagraph.hotkeys:
             return True, f"unregistered hotkey {hotkey}"
-
         uid = self.metagraph.hotkeys.index(hotkey)
         permits = getattr(self.metagraph, "validator_permit", None)
         if permits is None:
@@ -212,8 +279,7 @@ class Miner(BaseMinerNeuron):
             return True, "no validator permit"
         return False, f"accepted from uid {uid}"
 
-    async def priority(self, synapse: LLMKeySynapse) -> float:
-        """Prioritize higher-stake callers. Standard template pattern."""
+    def _stake_priority(self, synapse) -> float:
         if synapse.dendrite is None or synapse.dendrite.hotkey is None:
             return 0.0
         try:
