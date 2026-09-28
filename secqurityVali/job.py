@@ -252,9 +252,16 @@ def run_job(
         findings_raw = _read_findings(out_dir)
         behaviour_text = _read_behaviour(agent_cid)
 
+        # If the agent reported a reproduction, confirm the exploit reproduces
+        # against a FRESH target (new canary, same structure). This is what
+        # separates a working exploit from a lucky or memorised canary, and it
+        # is what upgrades the task score from "canary only" to full.
+        replay_confirmed = _maybe_replay(challenge, findings_raw)
+
         return assemble_result(
             run_id, challenge, findings_raw, behaviour_text,
             agent_exit_code=exit_code, timed_out=timed_out, duration_ms=duration_ms,
+            replay_confirmed=replay_confirmed,
         )
     except subprocess.TimeoutExpired as exc:
         return _our_fault(run_id, f"docker call timed out: {exc}")
@@ -266,6 +273,21 @@ def run_job(
             _rm_container(target_name)
             _network_remove(network)
             shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def _maybe_replay(challenge: Challenge, findings_raw: bytes) -> bool:
+    """Parse the agent's findings for a reproduction and, if present, confirm it
+    reproduces on a fresh target. Best-effort: any failure means "not
+    confirmed", never an exception."""
+    from secqurityVali.eval.findings import parse_findings_bytes
+    from secqurityVali.replay import run_replay
+    try:
+        findings = parse_findings_bytes(findings_raw)
+    except Exception:
+        return False
+    if not findings.reproduction:
+        return False
+    return run_replay(challenge, findings.reproduction)
 
 
 def _our_fault(run_id: str, message: str) -> JobResult:

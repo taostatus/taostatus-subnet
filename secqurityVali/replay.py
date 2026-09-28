@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+"""secqurityVali/replay.py - confirm a reported exploit actually reproduces.
+
+An agent that returns the canary has, at that moment, proven it read the secret.
+But did it *exploit* the flaw, or did it stumble onto the value once? Replay
+settles it: rebuild the target with the SAME structure but a FRESH canary, then
+run the agent's own reproduction recipe against it. If the new canary comes
+back, the recipe genuinely extracts whatever is in the secret table -- a working
+exploit, not a memorised string. If the agent only ever knew the old canary,
+its recipe yields nothing here and replay fails.
+
+Two important properties:
+
+  * Same schema, new canary. Only the secret value changes; the table, column,
+    endpoint and parameter stay, so a genuine payload (which references those)
+    still works, while a memorised canary no longer helps.
+  * No agent code runs. The validator itself makes the reproduction's HTTP
+    requests from the agent's structured fields -- never a miner-supplied
+    script. So replay is safe to drive directly.
+
+execute_reproduction() is the pure HTTP core (testable in-process); run_replay()
+wraps it with a fresh target container and is verified on the isolation host.
+"""
+
+import dataclasses
+import secrets
+import subprocess
+import time
+import urllib.parse
+import urllib.request
+
+from secqurityVali import constants as C
+from secqurityVali.eval.challenge import Challenge
+from secqurityVali.eval.findings import ReproStep
+from secqurityVali.targets.sqli_v1.provision import TARGET_IMAGE, TARGET_PORT, docker_env_args
+
+
+def fresh_canary_challenge(challenge: Challenge) -> Challenge:
+    """The same challenge with only the canary changed -- the target for replay.
+    A genuine exploit still works against it; a memorised canary does not."""
+    return dataclasses.replace(challenge, canary=secrets.token_hex(16))
+
+
+def execute_reproduction(
+    base_url: str,
+    steps: list[ReproStep],
+    expected_canary: str,
+    *,
+    timeout: float = 5.0,
+) -> bool:
+    """Run the agent's reproduction requests against base_url and report whether
+    the expected (fresh) canary appears in any response. Pure HTTP; runs no
+    agent code."""
+    if not steps or not expected_canary:
+        return False
+    base_url = base_url.rstrip("/")
+    for step in steps:
+        query = urllib.parse.urlencode(step.query)
+        url = f"{base_url}{step.path}"
+        try:
+            if step.method == "POST":
+                req = urllib.request.Request(url, data=query.encode(), method="POST")
+                body = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
+            else:
+                full = f"{url}?{query}" if query else url
+                body = urllib.request.urlopen(full, timeout=timeout).read().decode("utf-8", "replace")
+        except Exception:
+            continue
+        if expected_canary in body:
+            return True
+    return False
+
+
+def run_replay(
+    challenge: Challenge,
+    steps: list[ReproStep],
+    *,
+    host_port: int = 0,
+    timeout_s: int = 30,
+) -> bool:
+    """Confirm the reproduction against a freshly provisioned target.
+
+    Starts a new target container with the same structure but a fresh canary,
+    published to localhost, runs the reproduction, and tears the target down.
+    No agent runs here, so the target does not need the monitored runtime -- it
+    is our own code serving structured HTTP the validator sends.
+
+    Returns True only if the fresh canary was reproduced. Never raises.
+    """
+    if not steps:
+        return False
+
+    replay_challenge = fresh_canary_challenge(challenge)
+    name = "secval-replay-" + secrets.token_hex(6)
+    port = host_port or _free_port()
+
+    try:
+        run = subprocess.run(
+            ["docker", "run", "-d", "--name", name,
+             "-p", f"127.0.0.1:{port}:{TARGET_PORT}",
+             "--runtime", C.JOB_TARGET_RUNTIME,
+             *docker_env_args(replay_challenge), TARGET_IMAGE],
+            capture_output=True, text=True, timeout=C.DOCKER_CLI_TIMEOUT_S,
+        )
+        if run.returncode != 0:
+            return False
+        time.sleep(2)  # let the target bind its port
+        return execute_reproduction(
+            f"http://127.0.0.1:{port}", steps, replay_challenge.canary
+        )
+    except Exception:
+        return False
+    finally:
+        subprocess.run(["docker", "rm", "--force", "--volumes", name],
+                       capture_output=True, timeout=C.DOCKER_CLI_TIMEOUT_S)
+
+
+def _free_port() -> int:
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
