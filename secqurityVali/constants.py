@@ -151,3 +151,30 @@ API_WORKERS = 1
 # Largest request body accepted. The body is a small JSON object; anything
 # larger is not a submission.
 API_MAX_BODY_BYTES = 64 * 1024
+
+# --- job orchestration (the isolated evaluation run) --------------------
+# The per-job private network is --internal: containers on it reach each other
+# but have no route to the internet or the host.
+JOB_NETWORK_PREFIX = "secval-job-"
+JOB_TARGET_NAME_PREFIX = "secval-tgt-"
+JOB_AGENT_NAME_PREFIX = "secval-agt-"
+
+# The agent runs under the monitored gVisor runtime (strace -> behaviour log);
+# the target under plain gVisor. Both are configurable for hosts that name the
+# runtimes differently or want to disable monitoring.
+JOB_AGENT_RUNTIME_ENV = "MASXAI_JOB_AGENT_RUNTIME"
+JOB_AGENT_RUNTIME = os.getenv(JOB_AGENT_RUNTIME_ENV, "runsc-monitor")
+JOB_TARGET_RUNTIME_ENV = "MASXAI_JOB_TARGET_RUNTIME"
+JOB_TARGET_RUNTIME = os.getenv(JOB_TARGET_RUNTIME_ENV, "runsc")
+
+# Where the monitored runtime writes its per-container strace logs.
+JOB_MON_LOG_ROOT_ENV = "RUNSC_MON_LOG_ROOT"
+JOB_MON_LOG_ROOT = os.getenv(JOB_MON_LOG_ROOT_ENV, "/tmp/runsc-mon")
+
+# Wall clock for the whole agent run. Longer than the plain dry run: a real
+# agent probes many endpoints and enumerates a schema.
+JOB_AGENT_TIMEOUT_S = 180
+
+# The findings file the agent must write, mounted from a per-run host dir.
+JOB_OUTPUT_MOUNT = "/out"
+JOB_FINDINGS_NAME = "findings.json"
