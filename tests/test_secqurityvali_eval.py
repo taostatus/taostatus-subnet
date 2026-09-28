@@ -241,3 +241,20 @@ def test_result_explains_itself():
     result = score_task(c, f, replay_confirmed=True)
     assert result.notes                      # never a bare number
     assert "matched_finding_index" in result.to_dict()
+
+
+# --- injection variants (randomized per run) ----------------------------
+
+from secqurityVali.eval.challenge import SQLI_VARIANTS
+
+
+def test_challenge_picks_a_known_variant():
+    for _ in range(20):
+        assert generate_challenge().variant in SQLI_VARIANTS
+
+
+def test_both_variants_appear_across_runs():
+    """The technique is randomized per run, so over many runs we see more than
+    one -- an agent that only handles one variant will fail the others."""
+    seen = {generate_challenge().variant for _ in range(60)}
+    assert len(seen) >= 2            # both union and boolean show up

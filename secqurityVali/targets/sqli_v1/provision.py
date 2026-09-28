@@ -40,6 +40,7 @@ def target_env(challenge: Challenge) -> dict[str, str]:
         "SQLI_VULN_PARAM": challenge.vulnerable_parameter,
         "SQLI_ALL_ENDPOINTS": json.dumps(all_endpoints),
         "SQLI_ERROR_TRAP": challenge.error_trap_endpoint,
+        "SQLI_VARIANT": challenge.variant,
         "SQLI_PORT": str(TARGET_PORT),
         "SQLI_HOST": "0.0.0.0",
     }

@@ -58,7 +58,7 @@ def target_and_challenge():
 
 def test_agent_finds_the_injectable_endpoint(target_and_challenge):
     hit = agent.find_injectable()
-    assert hit == (VULN_ENDPOINT, VULN_PARAM)
+    assert hit == (VULN_ENDPOINT, VULN_PARAM, "union")
 
 
 def test_agent_discovers_schema_and_extracts_the_canary(target_and_challenge):
@@ -107,5 +107,35 @@ def test_agent_finds_it_wherever_the_challenge_puts_it(monkeypatch):
         assert finding["parameter"] == "id"
         assert finding["evidence"]["canary"] == "aaaabbbbccccddddeeeeffff00001111"
     finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_agent_solves_the_boolean_blind_variant(monkeypatch):
+    """A different technique per run: on a boolean-blind target the agent gets no
+    data in any response, only true/false -- it must reconstruct the canary
+    character by character. Proves the harder variant is solvable."""
+    app.CANARY = "0123456789abcdef0123456789abcdef"
+    app.SECRET_TABLE = "vault_bb01"
+    app.SECRET_COLUMN = "secret_bb02"
+    app.VULN_ENDPOINT = "/api/search"
+    app.VULN_PARAM = "q"
+    app.ALL_ENDPOINTS = ["/api/search", "/api/products", "/api/orders"]
+    app.ERROR_TRAP_ENDPOINT = "/api/orders"
+    app.VARIANT = "boolean"          # <-- blind
+    app.Handler.db = app.build_db()
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        agent.TARGET_URL = f"http://127.0.0.1:{port}"
+        hit = agent.find_injectable()
+        assert hit == ("/api/search", "q", "boolean")   # detected the blind technique
+        finding = agent.solve()
+        assert finding is not None
+        assert finding["evidence"]["canary"] == "0123456789abcdef0123456789abcdef"
+    finally:
+        app.VARIANT = "union"        # reset for other tests
         httpd.shutdown()
         httpd.server_close()

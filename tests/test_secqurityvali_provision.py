@@ -59,3 +59,9 @@ def test_the_agent_never_gets_the_answer():
     assert c.canary in env.values()   # present for the target...
     # ...and the whole point of the sandbox is the agent can't read the
     # target's process env; it can only reach the target over HTTP.
+
+
+def test_env_carries_the_variant():
+    from secqurityVali.targets.sqli_v1.provision import target_env
+    c = generate_challenge()
+    assert target_env(c)["SQLI_VARIANT"] == c.variant
