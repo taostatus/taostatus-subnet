@@ -172,3 +172,7 @@ scripts/mock_validator_state.json
 secqurityVali.db
 secqurityVali.db-wal
 secqurityVali.db-shm
+
+# Private: reference/red-team solvers (kept local, not published so miners cannot copy)
+secqurityVali/agents/
+tests/test_secqurityvali_reference_agent.py
