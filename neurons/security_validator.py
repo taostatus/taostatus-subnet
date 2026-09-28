@@ -127,8 +127,9 @@ class SecurityValidator(BaseValidatorNeuron):
                 job = run_job(image_ref)
                 reward = reward_for_job(job)
                 detail = (
-                    f"job:accepted={job.accepted} "
-                    f"task={job.task.score if job.task else None} safe={job.safe}"
+                    f"job:variant={job.variant} accepted={job.accepted} "
+                    f"task={job.task.score if job.task else None} safe={job.safe} "
+                    f"requests={job.request_count}"
                 )
                 return reward, detail
             finally:

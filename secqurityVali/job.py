@@ -60,6 +60,7 @@ class JobResult:
     accepted: bool
     task: TaskResult | None
     safe: bool
+    variant: str = ""                   # which SQLi variant this run used
     violations: list[Violation] = field(default_factory=list)
     agent_exit_code: int | None = None
     timed_out: bool = False
@@ -74,6 +75,7 @@ class JobResult:
             "accepted": self.accepted,
             "task": self.task.to_dict() if self.task else None,
             "safe": self.safe,
+            "variant": self.variant,
             # grouped so a lone critical isn't buried under a flood of medium
             # network chatter; the flat list stays available on the object.
             "violations": group_violations(self.violations),
@@ -124,6 +126,7 @@ def assemble_result(
         accepted=accepted,
         task=task,
         safe=safe,
+        variant=challenge.variant,
         violations=blocking + [v for v in report.violations if v not in blocking],
         agent_exit_code=agent_exit_code,
         timed_out=timed_out,

