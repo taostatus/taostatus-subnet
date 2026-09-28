@@ -143,3 +143,20 @@ def test_any_high_or_critical_rejects():
     safe, blocking = safety_verdict(analyze(log))
     assert safe is False
     assert blocking[0].kind == "docker-socket"
+
+
+# --- grouping (report noise) -------------------------------------------
+
+from secqurityVali.behavior import group_violations, Violation, SEV_MEDIUM
+
+
+def test_group_collapses_repeats_and_orders_by_severity():
+    vs = (
+        [Violation(SEV_MEDIUM, "network-connect", "sendto attempt")] * 100
+        + [Violation(SEV_CRITICAL, "docker-socket", "openat of /var/run/docker.sock")]
+    )
+    grouped = group_violations(vs)
+    assert grouped[0]["severity"] == SEV_CRITICAL       # critical first
+    assert grouped[0]["kind"] == "docker-socket"
+    net = [g for g in grouped if g["kind"] == "network-connect"][0]
+    assert net["count"] == 100                          # 100 collapsed into one row

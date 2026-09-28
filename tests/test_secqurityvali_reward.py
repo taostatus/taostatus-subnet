@@ -66,3 +66,31 @@ def test_round_drops_validator_faults_and_keeps_the_rest():
 def test_empty_round():
     rewards, skipped = rewards_for_round({})
     assert rewards == {} and skipped == []
+
+
+# --- reward_for_job (the graded successor) ------------------------------
+
+import types
+from secqurityVali.reward import reward_for_job
+
+
+def _job(*, error=None, safe=True, task_score=None):
+    task = types.SimpleNamespace(score=task_score) if task_score is not None else None
+    return types.SimpleNamespace(error=error, safe=safe, task=task)
+
+
+def test_job_reward_is_the_task_score_when_safe():
+    assert reward_for_job(_job(safe=True, task_score=1.0)) == 1.0
+    assert reward_for_job(_job(safe=True, task_score=0.5)) == 0.5
+
+
+def test_job_unsafe_scores_zero_even_with_a_task():
+    assert reward_for_job(_job(safe=False, task_score=1.0)) == 0.0
+
+
+def test_job_malformed_findings_scores_zero():
+    assert reward_for_job(_job(safe=True, task_score=None)) == 0.0
+
+
+def test_job_orchestration_error_is_not_scored():
+    assert reward_for_job(_job(error="docker exploded", safe=True, task_score=1.0)) is None

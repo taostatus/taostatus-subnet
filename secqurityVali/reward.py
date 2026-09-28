@@ -38,6 +38,29 @@ def reward_for_verdict(verdict: Verdict) -> float | None:
     return REWARD_PASS if verdict.accepted else REWARD_FAIL
 
 
+def reward_for_job(job) -> float | None:
+    """Map a full evaluation (JobResult) to a reward.
+
+    This is the graded successor to reward_for_verdict: instead of binary
+    pass/fail it returns the task score (0.5 canary, 0.8 replayed, 1.0 located),
+    already gated by safety.
+
+    Returns:
+        None            the run failed on our side (orchestration error) --
+                        retryable, not scored against the miner
+        0.0             misbehaved (safety veto) or produced no valid findings
+        task.score      a safe run's graded task score
+    """
+    if getattr(job, "error", None):
+        return None                       # our fault, retryable
+    if not getattr(job, "safe", False):
+        return 0.0                        # a blocking safety violation vetoes everything
+    task = getattr(job, "task", None)
+    if task is None:
+        return 0.0                        # malformed / unparseable findings
+    return float(task.score)
+
+
 def rewards_for_round(
     results: dict[int, Verdict],
 ) -> tuple[dict[int, float], list[int]]:

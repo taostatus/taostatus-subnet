@@ -48,9 +48,12 @@ def main() -> int:
     if result.task:
         print(f"task score : {result.task.score}  (canary_found={result.task.canary_found}, "
               f"located={result.task.located}, false_positives={result.task.false_positives})")
-    print(f"safe       : {result.safe}  ({len(result.violations)} violation(s))")
-    for v in result.violations:
-        print(f"   - [{v.severity}] {v.kind}: {v.detail}")
+    from secqurityVali.behavior import group_violations
+    grouped = group_violations(result.violations)
+    print(f"safe       : {result.safe}  ({len(result.violations)} event(s), "
+          f"{len(grouped)} kind(s))")
+    for g in grouped:
+        print(f"   - [{g['severity']}] {g['kind']} x{g['count']}: {g['example']}")
     return 0 if result.accepted else 1
 
 

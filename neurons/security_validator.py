@@ -34,8 +34,9 @@ from masxai.bt_compat import bt
 from masxai.env import load_env
 from secqurityVali import db
 from secqurityVali.docker_ops import docker_available
+from secqurityVali.job import run_job
 from secqurityVali.pipeline import check_and_record
-from secqurityVali.reward import rewards_for_round
+from secqurityVali.reward import reward_for_job, reward_for_verdict
 
 try:
     from template.base.validator import BaseValidatorNeuron
@@ -99,15 +100,37 @@ class SecurityValidator(BaseValidatorNeuron):
         return uids
 
     async def _evaluate(self, image_ref: str, miner_id: str):
-        """Run the (blocking) pipeline off the event loop.
+        """Evaluate one miner image off the event loop, returning a reward.
 
-        docker pull + run can take minutes; doing it inline would freeze the
-        validator's async loop and every other coroutine with it.
+        Two stages: intake (is it a valid, non-duplicate image?) via the
+        submission pipeline, then -- only if intake accepts -- the full isolated
+        job (sandboxed run against the target, task + safety scoring). Docker
+        work can take minutes, so it runs in a thread; doing it inline would
+        freeze the validator's async loop.
+
+        Returns (reward, detail): reward is a float, or None meaning "our fault,
+        do not score" (a Docker/orchestration failure, retryable).
         """
         def work():
             conn = db.connect(self.db_path)
             try:
-                return check_and_record(conn, image_ref, miner_id, from_registry=True)
+                # 1. intake: valid image? not a duplicate? (records + dedupes)
+                _row, verdict, _ms = check_and_record(
+                    conn, image_ref, miner_id, from_registry=True, skip_dry_run=True
+                )
+                if not verdict.accepted:
+                    # a bad or duplicate image is the miner's verdict; a docker
+                    # outage during intake is our fault (reward_for_verdict -> None)
+                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}"
+
+                # 2. full evaluation: sandboxed run, task + safety scoring
+                job = run_job(image_ref)
+                reward = reward_for_job(job)
+                detail = (
+                    f"job:accepted={job.accepted} "
+                    f"task={job.task.score if job.task else None} safe={job.safe}"
+                )
+                return reward, detail
             finally:
                 conn.close()
 
@@ -141,7 +164,8 @@ class SecurityValidator(BaseValidatorNeuron):
             timeout=C.SECURITY_QUERY_TIMEOUT,
         )
 
-        results = {}          # uid -> Verdict
+        rewards: dict[int, float] = {}
+        skipped: list[int] = []
         answered = 0
         for uid, resp in zip(miner_uids, responses):
             if getattr(resp, "has_agent", None) is None:
@@ -154,17 +178,19 @@ class SecurityValidator(BaseValidatorNeuron):
                 continue
             hotkey = self.metagraph.hotkeys[int(uid)]
             try:
-                _row_id, verdict, elapsed_ms = await self._evaluate(image_ref, hotkey)
+                reward, detail = await self._evaluate(image_ref, hotkey)
             except Exception as e:  # noqa: BLE001 - never let one miner break the round
                 bt.logging.warning(f"security-validator: uid={uid} evaluation errored: {e}")
                 continue
-            results[int(uid)] = verdict
+            if reward is None:
+                # our fault (docker/orchestration) -- retryable, not the miner's
+                skipped.append(int(uid))
+            else:
+                rewards[int(uid)] = reward
             bt.logging.info(
-                f"security-validator: uid={uid} {verdict.status.value} "
-                f"({verdict.stage_reached.value}) in {elapsed_ms} ms ref={image_ref}"
+                f"security-validator: uid={uid} reward={reward} ({detail}) ref={image_ref}"
             )
 
-        rewards, skipped = rewards_for_round(results)
         if skipped:
             bt.logging.info(
                 f"security-validator: skipped {len(skipped)} uid(s) scored as our "

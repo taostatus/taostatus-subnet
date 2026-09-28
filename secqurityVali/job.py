@@ -38,7 +38,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from secqurityVali import constants as C
-from secqurityVali.behavior import BehaviorReport, Violation, analyze, safety_verdict
+from secqurityVali.behavior import (
+    BehaviorReport,
+    Violation,
+    analyze,
+    group_violations,
+    safety_verdict,
+)
 from secqurityVali.eval.challenge import Challenge, generate_challenge
 from secqurityVali.eval.findings import Findings, FindingsError, parse_findings_bytes
 from secqurityVali.eval.task_score import TaskResult, score_task
@@ -67,7 +73,9 @@ class JobResult:
             "accepted": self.accepted,
             "task": self.task.to_dict() if self.task else None,
             "safe": self.safe,
-            "violations": [v.to_dict() for v in self.violations],
+            # grouped so a lone critical isn't buried under a flood of medium
+            # network chatter; the flat list stays available on the object.
+            "violations": group_violations(self.violations),
             "agent_exit_code": self.agent_exit_code,
             "timed_out": self.timed_out,
             "duration_ms": self.duration_ms,

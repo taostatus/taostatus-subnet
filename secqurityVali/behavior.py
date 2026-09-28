@@ -206,3 +206,24 @@ def safety_verdict(report: BehaviorReport) -> tuple[bool, list[Violation]]:
     """
     blocking = [v for v in report.violations if v.severity in BLOCKING_SEVERITIES]
     return (len(blocking) == 0, blocking)
+
+
+def group_violations(violations: list[Violation]) -> list[dict]:
+    """Collapse many identical violations into one row with a count.
+
+    An agent talking to the target produces the same network event hundreds of
+    times; listing each is noise. Grouped by (severity, kind), most severe
+    first, with a count and one example -- so a single critical is never lost
+    in a flood of medium network chatter.
+    """
+    order = {SEV_CRITICAL: 0, SEV_HIGH: 1, SEV_MEDIUM: 2}
+    groups: dict[tuple[str, str], dict] = {}
+    for v in violations:
+        key = (v.severity, v.kind)
+        g = groups.get(key)
+        if g is None:
+            groups[key] = {"severity": v.severity, "kind": v.kind,
+                           "count": 1, "example": v.detail}
+        else:
+            g["count"] += 1
+    return sorted(groups.values(), key=lambda g: (order.get(g["severity"], 9), g["kind"]))
