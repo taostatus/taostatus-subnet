@@ -58,7 +58,7 @@ def target_and_challenge():
 
 def test_agent_finds_the_injectable_endpoint(target_and_challenge):
     hit = agent.find_injectable()
-    assert hit == (VULN_ENDPOINT, VULN_PARAM, "union")
+    assert hit == (VULN_ENDPOINT, VULN_PARAM, "union", "string")
 
 
 def test_agent_discovers_schema_and_extracts_the_canary(target_and_challenge):
@@ -131,11 +131,42 @@ def test_agent_solves_the_boolean_blind_variant(monkeypatch):
     try:
         agent.TARGET_URL = f"http://127.0.0.1:{port}"
         hit = agent.find_injectable()
-        assert hit == ("/api/search", "q", "boolean")   # detected the blind technique
+        assert hit == ("/api/search", "q", "boolean", "string")   # blind technique, string context
         finding = agent.solve()
         assert finding is not None
         assert finding["evidence"]["canary"] == "0123456789abcdef0123456789abcdef"
     finally:
         app.VARIANT = "union"        # reset for other tests
+        httpd.shutdown()
+        httpd.server_close()
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("variant", ["union", "union_numeric", "boolean", "boolean_numeric"])
+def test_agent_solves_every_variant(variant):
+    """Technique (union/boolean) x context (string/numeric) -- the agent detects
+    which it faces and solves all four."""
+    app.CANARY = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    app.SECRET_TABLE = "vault_v4a1"
+    app.SECRET_COLUMN = "secret_v4b2"
+    app.VULN_ENDPOINT = "/api/lookup"
+    app.VULN_PARAM = "id"
+    app.ALL_ENDPOINTS = ["/api/lookup", "/api/products", "/api/orders"]
+    app.ERROR_TRAP_ENDPOINT = "/api/orders"
+    app.VARIANT = variant
+    app.Handler.db = app.build_db()
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        agent.TARGET_URL = f"http://127.0.0.1:{port}"
+        finding = agent.solve()
+        assert finding is not None, f"agent failed to solve variant {variant}"
+        assert finding["evidence"]["canary"] == "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    finally:
+        app.VARIANT = "union"
         httpd.shutdown()
         httpd.server_close()

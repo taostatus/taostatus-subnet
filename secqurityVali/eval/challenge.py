@@ -72,7 +72,12 @@ INJECTION_TYPE = "sql_injection"
 #               must be reconstructed character by character (blind)
 # Error-based and time-based need a richer database (MySQL/Postgres) than the
 # SQLite target, so they are deferred; the design here takes any variant name.
-SQLI_VARIANTS = ("union", "boolean")
+SQLI_VARIANTS = (
+    "union",            # union technique, string context   (name LIKE '%...%')
+    "union_numeric",    # union technique, numeric context  (id = ...)
+    "boolean",          # boolean-blind,   string context   (name = '...')
+    "boolean_numeric",  # boolean-blind,   numeric context  (id = ...)
+)
 
 
 def _suffix() -> str:
