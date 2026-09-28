@@ -70,6 +70,21 @@ def test_network_is_denied_by_default_not_by_configuration():
     assert "none" in create_args("agent:v1")
 
 
+def test_gvisor_runtime_is_requested_when_configured():
+    """The dry run is only a real boundary under gVisor -- if --runtime drops,
+    an agent runs on the host kernel."""
+    args = create_args("agent:v1", {"runtime": "runsc"})
+    assert "--runtime" in args
+    assert args[args.index("--runtime") + 1] == "runsc"
+
+
+def test_runtime_can_be_omitted_for_local_dev():
+    """An empty runtime falls back to the daemon default (no runsc on dev)."""
+    args = create_args("agent:v1", {"runtime": ""})
+    assert "--runtime" not in args
+    assert args[-1] == "agent:v1"
+
+
 def test_limits_are_overridable_for_the_future_target_network():
     args = create_args("agent:v1", {"network": "secval-target", "memory": "256m"})
     assert "secval-target" in args

@@ -83,8 +83,16 @@ def create_args(ref: str, limits: dict | None = None) -> list[str]:
     exactly the kind of regression that stays invisible otherwise.
     """
     settings = limits or {}
-    return [
-        "create",
+    args = ["create"]
+
+    # The isolation runtime. gVisor (runsc) is what makes the dry run an actual
+    # boundary rather than just resource limits; an empty runtime falls back to
+    # the daemon default (local dev only). Placed first so it is unmissable.
+    runtime = settings.get("runtime", C.DRY_RUN_RUNTIME)
+    if runtime:
+        args += ["--runtime", runtime]
+
+    args += [
         # Default-deny egress.
         "--network", settings.get("network", C.DRY_RUN_NETWORK),
         "--memory", settings.get("memory", C.DRY_RUN_MEMORY),
@@ -103,6 +111,7 @@ def create_args(ref: str, limits: dict | None = None) -> list[str]:
         "--label", C.DRY_RUN_LABEL,
         ref,
     ]
+    return args
 
 
 def _create_container(

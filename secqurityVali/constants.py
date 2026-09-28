@@ -8,6 +8,8 @@ surface to override, and so a test can tighten one without crafting a 2 GB
 fixture.
 """
 
+import os
+
 # --- stage: file -------------------------------------------------------
 # Largest submission tarball we will even hash. A legitimate agent image is
 # far smaller; this exists so a miner can't tie up the validator on a 500 GB
@@ -97,6 +99,15 @@ DRY_RUN_NOFILE_ULIMIT = "1024:1024"
 # No network at all for now. When the benchmark target exists this becomes a
 # dedicated bridge with the target as the only reachable address -- the flag
 # changes, the default-deny does not.
+# The container runtime for the dry run. gVisor (runsc) is the whole point of
+# the isolation: the dry run is only a real adversarial boundary under runsc,
+# where the agent's syscalls hit gVisor's user-space kernel instead of the
+# host's. Default on, because production must be isolated by default; set
+# MASXAI_SANDBOX_RUNTIME="" to fall back to the default runtime for local dev
+# on a machine without runsc (Windows/macOS Docker Desktop).
+SANDBOX_RUNTIME_ENV = "MASXAI_SANDBOX_RUNTIME"
+DRY_RUN_RUNTIME = os.getenv(SANDBOX_RUNTIME_ENV, "runsc")
+
 DRY_RUN_NETWORK = "none"
 
 # Read-only root with one small writable scratch area, so an agent that needs
