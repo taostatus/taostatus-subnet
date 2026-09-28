@@ -19,6 +19,7 @@ Run it on the isolation host, not a machine you care about.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -89,11 +90,11 @@ def build_image(name: str, cmd: str, workdir: Path) -> str:
     """Build a busybox image whose entrypoint runs `cmd`."""
     tag = IMAGE_PREFIX + name
     dockerfile = workdir / f"Dockerfile.{name}"
-    # busybox has wget, nslookup and a shell built in, and is tiny.
-    dockerfile.write_text(
-        "FROM busybox\n"
-        f'ENTRYPOINT ["sh", "-c", {cmd!r}]\n'
-    )
+    # busybox has wget, nslookup and a shell built in, and is tiny. The
+    # ENTRYPOINT must be valid JSON (double quotes) for Docker's exec form --
+    # json.dumps guarantees that and escapes the command correctly.
+    entry = json.dumps(["sh", "-c", cmd])
+    dockerfile.write_text(f"FROM busybox\nENTRYPOINT {entry}\n")
     subprocess.run(
         ["docker", "build", "-q", "-f", str(dockerfile), "-t", tag, str(workdir)],
         check=True, capture_output=True, text=True,
