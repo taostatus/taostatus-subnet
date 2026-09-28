@@ -64,6 +64,7 @@ class JobResult:
     agent_exit_code: int | None = None
     timed_out: bool = False
     duration_ms: int = 0
+    request_count: int = 0              # requests the agent made to the target (efficiency)
     parse_error: str | None = None
     error: str | None = None            # our fault (docker/orchestration), not the miner's
 
@@ -79,6 +80,7 @@ class JobResult:
             "agent_exit_code": self.agent_exit_code,
             "timed_out": self.timed_out,
             "duration_ms": self.duration_ms,
+            "request_count": self.request_count,
             "parse_error": self.parse_error,
             "error": self.error,
         }
@@ -265,12 +267,15 @@ def run_job(
         # separates a working exploit from a lucky or memorised canary, and it
         # is what upgrades the task score from "canary only" to full.
         replay_confirmed = _maybe_replay(challenge, findings_raw)
+        request_count = _read_request_count(target_name)
 
-        return assemble_result(
+        result = assemble_result(
             run_id, challenge, findings_raw, behaviour_text,
             agent_exit_code=exit_code, timed_out=timed_out, duration_ms=duration_ms,
             replay_confirmed=replay_confirmed,
         )
+        result.request_count = request_count
+        return result
     except subprocess.TimeoutExpired as exc:
         return _our_fault(run_id, f"docker call timed out: {exc}")
     except Exception as exc:  # noqa: BLE001 - orchestration must not crash the caller
@@ -316,6 +321,21 @@ def _read_findings(out_dir: str) -> bytes:
         return path.read_bytes()[: 1 * 1024 * 1024 + 1]
     except OSError:
         return b""
+
+
+def _read_request_count(target_name: str) -> int:
+    """The number of requests the agent made to the target, read from the
+    target's stdout (`REQUESTS:<n>` lines). The max seen is the total."""
+    res = _run(["logs", target_name], timeout=C.DOCKER_CLI_TIMEOUT_S)
+    highest = 0
+    for line in ((res.stdout or "") + (res.stderr or "")).splitlines():
+        line = line.strip()
+        if line.startswith("REQUESTS:"):
+            try:
+                highest = max(highest, int(line.split(":", 1)[1]))
+            except ValueError:
+                pass
+    return highest
 
 
 def _read_behaviour(agent_cid: str) -> str:
