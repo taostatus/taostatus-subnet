@@ -45,6 +45,11 @@ def parse_args():
     p.add_argument("--network", default="test")
     p.add_argument("--timeout", type=int, default=15, help="dendrite timeout, seconds")
     p.add_argument("--db", default="secqurityVali.db")
+    p.add_argument("--full", action="store_true",
+                   help="run the full isolated job (task+safety score) on offered images, "
+                        "not just intake")
+    p.add_argument("--uids", default="",
+                   help="comma-separated uids to probe (default: all serving miners)")
     return p.parse_args()
 
 
@@ -78,10 +83,14 @@ async def main() -> int:
         uid for uid in range(n)
         if mg.axons[uid].is_serving and mg.hotkeys[uid] != me
     ]
+    if args.uids:
+        wanted = {int(x) for x in args.uids.split(",") if x.strip()}
+        uids = [u for u in uids if u in wanted]
     if not uids:
         print("no serving miners to probe.")
         return 1
-    print(f"probing {len(uids)} serving miner(s): uids {uids}")
+    print(f"probing {len(uids)} serving miner(s): uids {uids}"
+          + ("  [FULL job evaluation]" if args.full else "  [intake only]"))
 
     dendrite = bt.Dendrite(wallet=wallet)
     synapse = SecurityAgentSynapse(request_id=uuid.uuid4().hex, issued_at=time.time())
@@ -118,23 +127,35 @@ async def main() -> int:
         print(f"uid {uid:>3}: OFFERED {image_ref} -> evaluating ...")
         hotkey = mg.hotkeys[uid]
         try:
-            _row, verdict, ms = check_and_record(conn, image_ref, hotkey, from_registry=True)
+            if args.full:
+                # full isolated evaluation: sandboxed run against the target,
+                # task + safety scoring
+                from secqurityVali.job import run_job
+                job = run_job(image_ref)
+                if job.error:
+                    print(f"        our fault (retryable): {job.error}")
+                    continue
+                if job.accepted:
+                    accepted += 1
+                task = job.task.score if job.task else None
+                print(f"        {'ACCEPTED' if job.accepted else 'REJECTED'} | "
+                      f"task={task} safe={job.safe} requests={job.request_count}")
+                for g in __import__("secqurityVali.behavior", fromlist=["group_violations"]).group_violations(job.violations):
+                    print(f"          - [{g['severity']}] {g['kind']} x{g['count']}")
+            else:
+                _row, verdict, ms = check_and_record(conn, image_ref, hotkey, from_registry=True)
+                if verdict.accepted:
+                    accepted += 1
+                print(
+                    f"        {verdict.status.value.upper()} "
+                    f"({verdict.stage_reached.value}) in {ms} ms"
+                    + (f" | reason={verdict.reject_reason.value}" if verdict.reject_reason else "")
+                )
+                if verdict.image_ref:
+                    print(f"        pinned: {verdict.image_ref}")
         except Exception as e:  # noqa: BLE001
             print(f"        evaluation errored: {e}")
             continue
-        if verdict.accepted:
-            accepted += 1
-        print(
-            f"        {verdict.status.value.upper()} "
-            f"({verdict.stage_reached.value}) in {ms} ms"
-            + (f" | reason={verdict.reject_reason.value}" if verdict.reject_reason else "")
-        )
-        if verdict.image_ref:
-            print(f"        pinned: {verdict.image_ref}")
-        if verdict.log_excerpt:
-            first = verdict.log_excerpt.strip().splitlines()[:1]
-            if first:
-                print(f"        output: {first[0][:120]}")
 
     print(
         f"\nsummary: probed={len(uids)} answered={answered} "
