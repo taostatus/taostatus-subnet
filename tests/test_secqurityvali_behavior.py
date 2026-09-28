@@ -55,18 +55,34 @@ def test_cloud_metadata_connect_is_critical():
     assert report.violations[0].kind == "cloud-metadata"
 
 
-def test_internet_socket_is_high():
-    log = 'I0928 10:00:00.0 1 strace.go:572] [ 1: 1] wget E socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)'
+def test_internet_socket_is_recorded_but_not_blocking():
+    """Generic network use is MEDIUM: the agent must talk to the target, and the
+    --internal job network blocks every other destination anyway."""
+    from secqurityVali.behavior import SEV_MEDIUM, safety_verdict
+    log = 'I0928 10:00:00.0 1 strace.go:572] [ 1: 1] python E socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)'
     report = analyze(log)
-    assert report.violations[0].severity == SEV_HIGH
+    assert report.violations[0].severity == SEV_MEDIUM
     assert report.violations[0].kind == "network-socket"
+    safe, blocking = safety_verdict(report)
+    assert safe is True and blocking == []   # does not reject
 
 
-def test_outbound_connect_is_high():
-    log = 'I0928 10:00:00.0 1 strace.go:572] [ 1: 1] agent E connect(3, {Family: AF_INET, Addr: 1.1.1.1, Port: 443}, 16)'
+def test_outbound_connect_is_recorded_but_not_blocking():
+    from secqurityVali.behavior import SEV_MEDIUM, safety_verdict
+    log = 'I0928 10:00:00.0 1 strace.go:572] [ 1: 1] python E connect(3, {Family: AF_INET, Addr: 1.1.1.1, Port: 443}, 16)'
     report = analyze(log)
     assert report.violations[0].kind == "network-connect"
-    assert report.violations[0].severity == SEV_HIGH
+    assert report.violations[0].severity == SEV_MEDIUM
+    assert safety_verdict(report)[0] is True   # legitimate target traffic is fine
+
+
+def test_cloud_metadata_still_rejects_despite_network_being_allowed():
+    """The specific forbidden destination is still CRITICAL even though generic
+    network use is allowed."""
+    from secqurityVali.behavior import safety_verdict
+    log = 'I0928 10:00:00.0 1 strace.go:572] [ 1: 1] agent E connect(3, {Family: AF_INET, Addr: 169.254.169.254, Port: 80}, 16)'
+    report = analyze(log)
+    assert safety_verdict(report)[0] is False
 
 
 def test_suspicious_exec_is_high():

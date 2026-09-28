@@ -198,6 +198,13 @@ def run_job(
     target_name = C.JOB_TARGET_NAME_PREFIX + short
     agent_name = C.JOB_AGENT_NAME_PREFIX + short
     out_dir = tempfile.mkdtemp(prefix="secval-out-")
+    # The agent runs as a non-root uid inside the container; make the mounted
+    # output dir world-writable so it can write findings.json regardless of
+    # which uid the image uses.
+    try:
+        os.chmod(out_dir, 0o777)
+    except OSError:
+        pass
     started = time.monotonic()
     agent_cid = ""
 
