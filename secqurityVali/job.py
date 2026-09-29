@@ -60,6 +60,7 @@ class JobResult:
     accepted: bool
     task: TaskResult | None
     safe: bool
+    category: str = ""                   # the vulnerability class (see category_scores.py)
     variant: str = ""                   # which SQLi variant this run used
     violations: list[Violation] = field(default_factory=list)
     agent_exit_code: int | None = None
@@ -75,6 +76,7 @@ class JobResult:
             "accepted": self.accepted,
             "task": self.task.to_dict() if self.task else None,
             "safe": self.safe,
+            "category": self.category,
             "variant": self.variant,
             # grouped so a lone critical isn't buried under a flood of medium
             # network chatter; the flat list stays available on the object.
@@ -126,6 +128,7 @@ def assemble_result(
         accepted=accepted,
         task=task,
         safe=safe,
+        category=challenge.category,
         variant=challenge.variant,
         violations=blocking + [v for v in report.violations if v not in blocking],
         agent_exit_code=agent_exit_code,

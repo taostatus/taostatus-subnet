@@ -15,7 +15,7 @@ cd /home/aman/taostatus-subnet
 export MASXAI_SECURITY_AGENT_ENABLED=true
 export MASXAI_SECURITY_AGENT_IMAGE=ghcr.io/adtao26/secval-ref-agent:v1
 
-exec sg docker -c '/home/aman/taostatus-subnet/.venv/bin/python neurons/miner.py \
+exec sg docker -c '/home/aman/taostatus-subnet/.venv/bin/python neurons/security_miner.py \
   --netuid 501 --subtensor.network test \
   --subtensor.chain_endpoint wss://test.finney.opentensor.ai:443 \
   --wallet.name aman-test --wallet.hotkey miner1 \

@@ -214,6 +214,21 @@ SECURITY_DB_PATH = "secqurityVali.db"
 SECURITY_VALIDATOR_KEY_FILE_ENV = "MASXAI_SECURITY_VALIDATOR_KEY_FILE"
 SECURITY_VALIDATOR_KEY_FILE = "security_validator_key.json"
 
+# --- security-track per-category capability scoring --------------------
+# The vulnerability categories the benchmark currently issues. A miner is scored
+# per category and its overall score is the MEAN across these, so an untested or
+# failed category holds the mean down -- breadth is what earns. Add a category
+# here when a new target type (XSS, SSRF, ...) is introduced. Today: SQLi only,
+# so the aggregate equals the SQLi score until more are added.
+SECURITY_ACTIVE_CATEGORIES = ("sqli",)
+
+# Where the per-miner, per-category EMA matrix is persisted (see
+# secqurityVali/category_scores.py), and the EMA weight on each new observation.
+SECURITY_CATEGORY_SCORES_FILE_ENV = "MASXAI_SECURITY_CATEGORY_SCORES_FILE"
+SECURITY_CATEGORY_SCORES_FILE = "security_category_scores.json"
+SECURITY_CATEGORY_EMA_ALPHA_ENV = "MASXAI_SECURITY_CATEGORY_EMA_ALPHA"
+SECURITY_CATEGORY_EMA_ALPHA = 0.5
+
 # Bound on the encrypted blob the validator will download from a miner. A blob
 # is a docker-save tarball plus SealedBox overhead; larger than the image cap is
 # not a real agent, and an unbounded download is a denial of service the miner

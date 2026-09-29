@@ -7,9 +7,11 @@ evaluation produced (with a None reward -- our fault -- left unscored).
 """
 
 import asyncio
+import tempfile
 import types
 
 import neurons.security_validator as sv
+from secqurityVali.category_scores import CategoryScores
 
 
 class FakeAxon:
@@ -40,14 +42,19 @@ def make_validator(responses, reward_by_ref):
     # keypair state the ask carries; a real validator sets these in __init__.
     v._pubkey_b64 = "test-pubkey-b64"
     v._pubkey_id = "testpubid"
+    # per-category capability matrix (single active category here, so the
+    # aggregate equals the run's raw score -- first observation seeds the cell).
+    v._active_categories = ("sqli",)
+    v._cat_scores = CategoryScores(alpha=0.5)
+    v._cat_scores_path = tempfile.mktemp(suffix=".json")
 
     async def fake_dendrite(axons, synapse, deserialize, timeout):
         return responses
     v.dendrite = fake_dendrite
 
-    # _evaluate now returns (reward, detail); reward None means "our fault"
+    # _evaluate returns (reward, detail, category); reward None means "our fault"
     async def fake_evaluate(image_ref, miner_id):
-        return (reward_by_ref[image_ref], "faked")
+        return (reward_by_ref[image_ref], "faked", "sqli")
     v._evaluate = fake_evaluate
 
     v.captured = None
@@ -81,7 +88,7 @@ def test_encrypted_blob_path_is_scored():
     called = {}
     async def fake_blob(blob_url, cipher_sha, miner_id):
         called["args"] = (blob_url, cipher_sha, miner_id)
-        return (0.8, "faked-blob")
+        return (0.8, "faked-blob", "sqli")
     v._evaluate_blob = fake_blob
 
     asyncio.run(v.security_round())
@@ -99,6 +106,17 @@ def test_round_scores_each_miner_by_its_reward():
 
     scored = dict(zip(v.captured[1], v.captured[0]))
     assert scored == {1: 1.0, 2: 0.0}
+
+
+def test_score_is_aggregate_across_active_categories():
+    # With two active categories and only sqli solved, the score is the mean
+    # across both (sqli=1.0, xss untested=0) -> 0.5. This is what stops a
+    # one-trick agent from looking like an all-rounder.
+    responses = [resp(True, "ghcr.io/a:1")]
+    v = make_validator(responses, {"ghcr.io/a:1": 1.0})
+    v._active_categories = ("sqli", "xss")
+    asyncio.run(v.security_round())
+    assert dict(zip(v.captured[1], v.captured[0])) == {1: 0.5}
 
 
 def test_declining_miner_is_not_scored():

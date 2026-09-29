@@ -1,5 +1,10 @@
 """
-neurons/miner.py - MASXAI miner: LLM-key contribution pipeline.
+neurons/miner.py - MASXAI LLM-key miner (mechanism 0).
+
+The LLM-key half of the subnet's two mechanisms. The security track has its own
+separate miner (neurons/security_miner.py, mechanism 1); this one serves only the
+LLM-key synapse. A miner participates in one mechanism, not both -- which is why
+the two are distinct processes with distinct hotkeys.
 
 A miner opts in to contribute between LLM_KEY_MIN_KEYS_PER_HOTKEY (5) and
 LLM_KEY_MAX_KEYS_PER_HOTKEY (5) distinct LLM API keys as a resource for the
@@ -19,13 +24,11 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from masxai.protocol import LLMKeySynapse, SecurityAgentSynapse
+from masxai.protocol import LLMKeySynapse
 from masxai import constants as C
 from masxai.bt_compat import bt
 from masxai.env import load_env
 from masxai.llm_key_crypto import encrypt_for_protocol
-from masxai.agent_crypto import AgentCryptoError, encrypt_agent
-from masxai.agent_blob import AgentBlobError, BlobServer, save_image_tar, sha256_hex
 
 # Provided by the bittensor-subnet-template fork:
 try:
@@ -140,100 +143,11 @@ class Miner(BaseMinerNeuron):
         super().__init__(config=config)
         configs = _llm_key_contrib_configs()
         bt.logging.info(
-            "LLM-key contribution | "
+            "LLM-key contribution (mechanism 0) | "
             f"enabled={bool(configs)} keys={len(configs)} "
             + " ".join(f"slot{i}={p}/{m}" for i, (p, m, _) in enumerate(configs))
         )
-
-        # Attach the security-audit synapse as a second route on the same axon.
-        # The base class already attached forward()/blacklist()/priority() for
-        # LLMKeySynapse; bittensor routes each synapse type to its own handler
-        # by the forward function's type annotation, so one hotkey serves both
-        # tracks. Guarded so a bittensor build without .axon (the fallback in
-        # tests) doesn't crash construction.
-        security_enabled = _env_flag(C.SECURITY_AGENT_ENABLED_ENV, False)
-        axon = getattr(self, "axon", None)
-        if axon is not None:
-            try:
-                axon.attach(
-                    forward_fn=self.forward_security,
-                    blacklist_fn=self.blacklist_security,
-                    priority_fn=self.priority_security,
-                )
-            except Exception as e:  # noqa: BLE001
-                bt.logging.warning(f"could not attach security synapse route: {e}")
-
-        # Encrypted-blob transport state. The blob server hosts the encrypted
-        # agent tarball so the validator can download it; caches avoid redoing
-        # the heavy docker-save/encrypt on every ask.
-        self._blob_server: BlobServer | None = None
-        self._agent_tar: bytes | None = None
-        self._agent_tar_image: str | None = None
-        self._agent_blobs: dict[tuple[str, str], tuple[str, str]] = {}
-        if security_enabled:
-            self._start_blob_server()
-
-        bt.logging.info(
-            f"Security-audit contribution | enabled={security_enabled} "
-            f"image={os.getenv(C.SECURITY_AGENT_IMAGE_ENV) or '(unset)'} "
-            f"blob_server={'up' if self._blob_server else 'off'}"
-        )
-        bt.logging.info("MASXAI miner initialized.")
-
-    def _blob_host(self) -> str | None:
-        """The address the validator will use to reach our blob server: an
-        explicit override, else our advertised axon external IP."""
-        host = (os.getenv(C.SECURITY_BLOB_HOST_ENV) or "").strip()
-        if host:
-            return host
-        axon = getattr(self, "axon", None)
-        for obj in (axon, getattr(self, "config", None) and self.config.axon):
-            ip = getattr(obj, "external_ip", None) if obj is not None else None
-            if ip and str(ip) not in ("", "0.0.0.0", "[::]"):
-                return str(ip)
-        return None
-
-    def _start_blob_server(self) -> None:
-        host = self._blob_host()
-        if not host:
-            bt.logging.warning(
-                "security: could not determine an external host for the blob "
-                f"server; set {C.SECURITY_BLOB_HOST_ENV}. Falling back to "
-                "image_ref (plaintext) if configured."
-            )
-            return
-        port = int(os.getenv(C.SECURITY_BLOB_PORT_ENV, C.SECURITY_BLOB_PORT))
-        try:
-            self._blob_server = BlobServer(host, port)
-            bt.logging.info(f"security: blob server hosting at http://{host}:{port}/")
-        except Exception as e:  # noqa: BLE001 - a bound port must not kill the miner
-            bt.logging.warning(f"security: could not start blob server on {port}: {e}")
-
-    def _agent_blob_for(
-        self, image_ref: str, pubkey_b64: str, pubkey_id: str
-    ) -> tuple[str, str]:
-        """Return (blob_url, ciphertext_sha256) for `image_ref` encrypted to
-        `pubkey_b64`, doing the docker-save and encryption at most once per
-        (image, key) pair. Raises on failure; the caller declines the round."""
-        # Save (and cache) the tarball; re-save if the configured image changed.
-        if self._agent_tar is None or self._agent_tar_image != image_ref:
-            self._agent_tar = save_image_tar(image_ref)
-            self._agent_tar_image = image_ref
-            self._agent_blobs.clear()  # tar changed -> old ciphertexts are stale
-        tar = self._agent_tar
-        tar_sha = sha256_hex(tar)
-
-        cache_key = (pubkey_b64, tar_sha)
-        cached = self._agent_blobs.get(cache_key)
-        if cached is not None:
-            return cached
-
-        blob = encrypt_agent(tar, pubkey_b64)
-        cipher_sha = sha256_hex(blob)
-        name = f"{(pubkey_id or 'k')[:16]}-{tar_sha[:12]}.enc"
-        url = self._blob_server.publish(blob, name)  # type: ignore[union-attr]
-        self._agent_blobs[cache_key] = (url, cipher_sha)
-        return url, cipher_sha
+        bt.logging.info("MASXAI LLM-key miner initialized.")
 
     async def forward(self, synapse: LLMKeySynapse) -> LLMKeySynapse:
         """Answer a request to contribute LLM keys, or decline cleanly.
@@ -292,71 +206,6 @@ class Miner(BaseMinerNeuron):
 
     async def priority(self, synapse: LLMKeySynapse) -> float:
         """Prioritize higher-stake callers. Standard template pattern."""
-        return self._stake_priority(synapse)
-
-    # ------------------------------------------------------------ security
-    async def forward_security(
-        self, synapse: SecurityAgentSynapse
-    ) -> SecurityAgentSynapse:
-        """Answer a request for this miner's security-agent image, or decline.
-
-        Primary path (v2): the miner encrypts a docker-save tarball of its agent
-        for the validator's public key (carried in the request) and returns a
-        URL to the opaque ciphertext, so a peer that fetches it learns nothing.
-        Fallback: when the validator sent no key (a v1 validator) or the blob
-        server could not start, the miner returns a plaintext image_ref if one
-        is configured. Never raises -- any failure declines (has_agent=False)
-        rather than crashing the axon route, exactly like the LLM-key path.
-        """
-        try:
-            if not _env_flag(C.SECURITY_AGENT_ENABLED_ENV, False):
-                synapse.has_agent = False
-                return synapse
-            image_ref = (os.getenv(C.SECURITY_AGENT_IMAGE_ENV) or "").strip()
-            if not image_ref:
-                synapse.has_agent = False
-                return synapse
-
-            pubkey = (synapse.validator_pubkey_b64 or "").strip()
-            if pubkey and self._blob_server is not None:
-                # encrypted path: host an opaque blob the validator can decrypt
-                blob_url, cipher_sha = self._agent_blob_for(
-                    image_ref, pubkey, synapse.pubkey_id
-                )
-                synapse.blob_url = blob_url
-                synapse.ciphertext_sha256 = cipher_sha
-                synapse.blob_encoding = "nacl-sealedbox-v1"
-                synapse.pubkey_id_used = synapse.pubkey_id
-                synapse.has_agent = True
-            else:
-                # fallback: plaintext registry reference (only if it is one; a
-                # local-only image name would be useless to the validator)
-                synapse.image_ref = image_ref
-                synapse.has_agent = True
-                if not pubkey:
-                    bt.logging.debug("security: validator sent no pubkey; using image_ref fallback")
-                else:
-                    bt.logging.warning("security: blob server unavailable; using image_ref fallback")
-            synapse.timestamp = _utc_now_iso()
-        except (AgentBlobError, AgentCryptoError) as e:
-            bt.logging.warning(f"security: could not prepare encrypted agent, declining: {e}")
-            synapse.has_agent = False
-        except Exception as e:  # noqa: BLE001 — never let forward crash
-            bt.logging.warning(f"security agent submission failed, declining: {e}")
-            synapse.has_agent = False
-            synapse.blob_url = ""
-            synapse.image_ref = ""
-        return synapse
-
-    async def blacklist_security(
-        self, synapse: SecurityAgentSynapse
-    ) -> typing.Tuple[bool, str]:
-        """Same rule as the LLM-key path: a validator permit is always
-        required, because an accepted response makes the validator pull and
-        run an image -- a state-changing, security-sensitive action."""
-        return self._require_validator(synapse)
-
-    async def priority_security(self, synapse: SecurityAgentSynapse) -> float:
         return self._stake_priority(synapse)
 
     # ------------------------------------------------------ shared helpers

@@ -43,6 +43,7 @@ from masxai.agent_crypto import (
 from masxai.bt_compat import bt
 from masxai.env import load_env
 from secqurityVali import db, docker_ops
+from secqurityVali.category_scores import CategoryScores
 from secqurityVali.docker_ops import docker_available
 from secqurityVali.job import run_job
 from secqurityVali.pipeline import check_and_record
@@ -77,6 +78,18 @@ class SecurityValidator(BaseValidatorNeuron):
         # The SealedBox keypair miners encrypt their agents for. Persisted, so a
         # restart can still decrypt a blob a miner encrypted for the last ask.
         self._load_or_create_keypair()
+
+        # Per-miner, per-category capability matrix. A run tests one random
+        # category; this remembers each miner's EMA per category so the score
+        # reflects breadth, not whichever category a single run drew.
+        self._active_categories = tuple(C.SECURITY_ACTIVE_CATEGORIES)
+        self._cat_scores_path = os.getenv(
+            C.SECURITY_CATEGORY_SCORES_FILE_ENV, C.SECURITY_CATEGORY_SCORES_FILE
+        )
+        self._cat_scores = CategoryScores.load(
+            self._cat_scores_path,
+            alpha=_env_float(C.SECURITY_CATEGORY_EMA_ALPHA_ENV, C.SECURITY_CATEGORY_EMA_ALPHA),
+        )
 
         self.last_security_round_at = 0.0
         if not docker_available():
@@ -166,8 +179,9 @@ class SecurityValidator(BaseValidatorNeuron):
                 )
                 if not verdict.accepted:
                     # a bad or duplicate image is the miner's verdict; a docker
-                    # outage during intake is our fault (reward_for_verdict -> None)
-                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}"
+                    # outage during intake is our fault (reward_for_verdict -> None).
+                    # No job ran, so there is no category to file this under.
+                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}", None
 
                 # 2. full evaluation: sandboxed run, task + safety scoring
                 job = run_job(image_ref)
@@ -177,7 +191,7 @@ class SecurityValidator(BaseValidatorNeuron):
                     f"task={job.task.score if job.task else None} safe={job.safe} "
                     f"requests={job.request_count}"
                 )
-                return reward, detail
+                return reward, detail, (job.category or None)
             finally:
                 conn.close()
 
@@ -201,13 +215,13 @@ class SecurityValidator(BaseValidatorNeuron):
                 try:
                     blob = self._download_blob(blob_url)
                 except Exception as e:  # noqa: BLE001 - network/host issue, retryable
-                    return None, f"download_failed:{type(e).__name__}"
+                    return None, f"download_failed:{type(e).__name__}", None
                 if ciphertext_sha256 and hashlib.sha256(blob).hexdigest() != ciphertext_sha256:
-                    return None, "sha256_mismatch"  # truncated/corrupt -> retry
+                    return None, "sha256_mismatch", None  # truncated/corrupt -> retry
                 try:
                     tar = decrypt_agent(blob, self._priv_b64)
                 except AgentCryptoError:
-                    return 0.0, "decrypt_failed"  # miner's fault, deterministic
+                    return 0.0, "decrypt_failed", None  # miner's fault, deterministic
 
                 fd, tar_path = tempfile.mkstemp(prefix="secval-agent-", suffix=".tar")
                 with os.fdopen(fd, "wb") as fh:
@@ -218,7 +232,7 @@ class SecurityValidator(BaseValidatorNeuron):
                     conn, tar_path, miner_id, from_registry=False, skip_dry_run=True
                 )
                 if not verdict.accepted:
-                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}"
+                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}", None
 
                 # 2. load the validated image for a runnable ref, then evaluate
                 image_ref = docker_ops.load_image(tar_path)
@@ -229,7 +243,7 @@ class SecurityValidator(BaseValidatorNeuron):
                     f"task={job.task.score if job.task else None} safe={job.safe} "
                     f"requests={job.request_count}"
                 )
-                return reward, detail
+                return reward, detail, (job.category or None)
             finally:
                 if image_ref:
                     docker_ops.remove_image(image_ref)
@@ -309,11 +323,11 @@ class SecurityValidator(BaseValidatorNeuron):
                 if blob_url:
                     # primary path: encrypted blob, opaque to peers
                     cipher_sha = (getattr(resp, "ciphertext_sha256", "") or "").strip()
-                    reward, detail = await self._evaluate_blob(blob_url, cipher_sha, hotkey)
+                    reward, detail, category = await self._evaluate_blob(blob_url, cipher_sha, hotkey)
                     submitted = blob_url
                 elif image_ref:
                     # fallback path: plaintext registry reference
-                    reward, detail = await self._evaluate(image_ref, hotkey)
+                    reward, detail, category = await self._evaluate(image_ref, hotkey)
                     submitted = image_ref
                 else:
                     continue  # answered has_agent=True but sent nothing usable
@@ -323,11 +337,28 @@ class SecurityValidator(BaseValidatorNeuron):
             if reward is None:
                 # our fault (docker/orchestration) -- retryable, not the miner's
                 skipped.append(int(uid))
-            else:
-                rewards[int(uid)] = reward
+                bt.logging.info(
+                    f"security-validator: uid={uid} reward=None ({detail}) src={submitted}"
+                )
+                continue
+            # Fold this run into the miner's per-category memory, then score on
+            # the aggregate across ALL active categories -- so the miner is judged
+            # on breadth, not on whichever single category this run happened to
+            # draw. A run with no category (a submission-level failure) still
+            # scores on the miner's standing aggregate.
+            if category is not None:
+                self._cat_scores.update(hotkey, category, reward)
+            agg = self._cat_scores.aggregate(hotkey, self._active_categories)
+            rewards[int(uid)] = agg
             bt.logging.info(
-                f"security-validator: uid={uid} reward={reward} ({detail}) src={submitted}"
+                f"security-validator: uid={uid} raw={reward} cat={category} "
+                f"agg={agg:.3f} ({detail}) src={submitted}"
             )
+
+        if rewards or skipped:
+            # persist the matrix (best-effort) after folding in this round
+            self._cat_scores.prune(set(self.metagraph.hotkeys))
+            self._cat_scores.save(self._cat_scores_path)
 
         if skipped:
             bt.logging.info(
@@ -344,17 +375,24 @@ class SecurityValidator(BaseValidatorNeuron):
         self.last_security_round_at = now
 
     def _update_from_rewards(self, rewards: dict[int, float]) -> None:
-        """Feed this round's rewards into self.scores via the base class.
+        """Write this round's aggregate scores into self.scores directly.
 
-        Isolated so the numpy dependency stays on the real validator host and
-        the round logic above it can be tested without it.
+        Each value here is already the per-category aggregate (which carries its
+        own EMA history), so it is SET, not run through the base class's
+        round-over-round EMA -- a second smoothing would lag and blindly re-blend
+        across categories, undoing the per-category memory. This mirrors the
+        LLM-key validator, which likewise recomputes self.scores from its own
+        accumulator rather than via update_scores(). Isolated so the numpy
+        dependency stays on the real validator host.
         """
         import numpy as np  # local: only needed on the real validator host
 
-        uids = list(rewards.keys())
-        self.update_scores(
-            np.array([rewards[u] for u in uids], dtype=np.float32), uids
-        )
+        scores = getattr(self, "scores", None)
+        if scores is None:
+            return
+        for uid, value in rewards.items():
+            if 0 <= int(uid) < len(scores):
+                scores[int(uid)] = np.float32(value)
 
     async def forward(self):
         """One validator step. The base class paces this by epoch and sets

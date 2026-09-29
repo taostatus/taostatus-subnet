@@ -65,6 +65,13 @@ _CANDIDATE_ENDPOINTS = (
 
 INJECTION_TYPE = "sql_injection"
 
+# The broad vulnerability CLASS this challenge belongs to. The validator tracks
+# a miner's capability per category (see category_scores.py), so a miner is
+# judged on breadth across classes, not on whichever single class a run drew.
+# Today only SQL injection exists; a new target type (XSS, SSRF, ...) introduces
+# a new category here and in SECURITY_ACTIVE_CATEGORIES.
+CATEGORY_SQLI = "sqli"
+
 # The injection VARIANTS -- genuinely different techniques within SQL injection,
 # randomized per run so an agent that only knows one is not fully capable:
 #   union    -- the injection returns extra rows directly (fast to extract)
@@ -110,6 +117,11 @@ class Challenge:
     vulnerable_parameter: str
 
     injection_type: str = INJECTION_TYPE
+
+    # The vulnerability class (see CATEGORY_SQLI). The validator scores a miner
+    # per category and aggregates across them, so this is what a run's result is
+    # filed under. A variant (below) is a technique WITHIN this category.
+    category: str = CATEGORY_SQLI
 
     # Which injection technique this run uses (see SQLI_VARIANTS). The surface
     # (canary, names, endpoint) already varies per run; the variant varies the
