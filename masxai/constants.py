@@ -205,3 +205,27 @@ SECURITY_SUBMISSION_INTERVAL_SECONDS = 300
 # Where the security validator keeps its verdict database on the host.
 SECURITY_DB_PATH_ENV = "MASXAI_SECURITY_DB_PATH"
 SECURITY_DB_PATH = "secqurityVali.db"
+
+# --- security-track agent encryption (v2 transport) --------------------
+# The validator's SealedBox keypair. The private half is persisted here so a
+# restart can still decrypt blobs miners encrypted for the previous ask; the
+# public half is derived from it and sent in every ask. Generated on first run
+# if the file is absent. Treat this file like any other validator secret.
+SECURITY_VALIDATOR_KEY_FILE_ENV = "MASXAI_SECURITY_VALIDATOR_KEY_FILE"
+SECURITY_VALIDATOR_KEY_FILE = "security_validator_key.json"
+
+# Bound on the encrypted blob the validator will download from a miner. A blob
+# is a docker-save tarball plus SealedBox overhead; larger than the image cap is
+# not a real agent, and an unbounded download is a denial of service the miner
+# controls. Kept a little above MAX_FILE_SIZE_BYTES to allow for overhead.
+SECURITY_BLOB_MAX_BYTES = 2 * 1024**3 + 16 * 1024**2  # ~2 GiB + slack
+SECURITY_BLOB_DOWNLOAD_TIMEOUT_S = 900
+
+# --- miner side: how the miner hosts its encrypted blob ----------------
+# The miner serves the encrypted tarball from a tiny built-in static file
+# server so no external registry or bucket is needed. BLOB_HOST is the
+# host/IP the validator can reach it at (defaults to the miner's advertised
+# axon external IP when unset); BLOB_PORT is the port that server binds.
+SECURITY_BLOB_HOST_ENV = "MASXAI_SECURITY_BLOB_HOST"
+SECURITY_BLOB_PORT_ENV = "MASXAI_SECURITY_BLOB_PORT"
+SECURITY_BLOB_PORT = 8912

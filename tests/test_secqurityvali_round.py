@@ -37,6 +37,9 @@ def make_validator(responses, reward_by_ref):
     v.config = types.SimpleNamespace(netuid=501)
     v.last_security_round_at = 0.0
     v.db_path = ":memory:"
+    # keypair state the ask carries; a real validator sets these in __init__.
+    v._pubkey_b64 = "test-pubkey-b64"
+    v._pubkey_id = "testpubid"
 
     async def fake_dendrite(axons, synapse, deserialize, timeout):
         return responses
@@ -58,6 +61,33 @@ def make_validator(responses, reward_by_ref):
 
 def resp(has_agent, image_ref=""):
     return types.SimpleNamespace(has_agent=has_agent, image_ref=image_ref)
+
+
+def resp_blob(has_agent, blob_url="", ciphertext_sha256="sha"):
+    """A v2 encrypted-blob response (no plaintext image_ref)."""
+    return types.SimpleNamespace(
+        has_agent=has_agent,
+        blob_url=blob_url,
+        ciphertext_sha256=ciphertext_sha256,
+        image_ref="",
+    )
+
+
+def test_encrypted_blob_path_is_scored():
+    # A response carrying a blob_url routes to _evaluate_blob, not _evaluate.
+    responses = [resp_blob(True, "http://miner-1/agent.enc")]
+    v = make_validator(responses, {})
+
+    called = {}
+    async def fake_blob(blob_url, cipher_sha, miner_id):
+        called["args"] = (blob_url, cipher_sha, miner_id)
+        return (0.8, "faked-blob")
+    v._evaluate_blob = fake_blob
+
+    asyncio.run(v.security_round())
+
+    assert called["args"] == ("http://miner-1/agent.enc", "sha", "miner-1")
+    assert dict(zip(v.captured[1], v.captured[0])) == {1: 0.8}
 
 
 def test_round_scores_each_miner_by_its_reward():

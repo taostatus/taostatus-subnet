@@ -21,18 +21,28 @@ mechanisms, only the set_weights target changes.
 """
 
 import asyncio
+import hashlib
+import json
 import os
 import sys
+import tempfile
 import time
+import urllib.request
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from masxai.protocol import SecurityAgentSynapse
 from masxai import constants as C
+from masxai.agent_crypto import (
+    AgentCryptoError,
+    decrypt_agent,
+    generate_keypair,
+    public_key_b64,
+)
 from masxai.bt_compat import bt
 from masxai.env import load_env
-from secqurityVali import db
+from secqurityVali import db, docker_ops
 from secqurityVali.docker_ops import docker_available
 from secqurityVali.job import run_job
 from secqurityVali.pipeline import check_and_record
@@ -64,6 +74,10 @@ class SecurityValidator(BaseValidatorNeuron):
         # shareable across threads).
         db.connect(self.db_path).close()
 
+        # The SealedBox keypair miners encrypt their agents for. Persisted, so a
+        # restart can still decrypt a blob a miner encrypted for the last ask.
+        self._load_or_create_keypair()
+
         self.last_security_round_at = 0.0
         if not docker_available():
             bt.logging.warning(
@@ -72,8 +86,40 @@ class SecurityValidator(BaseValidatorNeuron):
             )
         bt.logging.info(
             f"Security validator initialized | db={self.db_path} "
+            f"pubkey_id={self._pubkey_id} "
             f"netuid={getattr(self.config, 'netuid', '?')}"
         )
+
+    def _load_or_create_keypair(self) -> None:
+        """Load the persisted SealedBox private key, or mint and store one.
+
+        The private half stays on disk (this file); the public half and a short
+        id derived from it are sent to miners in every ask. The id lets a miner
+        (and our own logs) notice a key rotation.
+        """
+        path = os.getenv(C.SECURITY_VALIDATOR_KEY_FILE_ENV, C.SECURITY_VALIDATOR_KEY_FILE)
+        priv_b64 = None
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    priv_b64 = json.load(fh).get("private_key_b64")
+            except Exception as e:  # noqa: BLE001 - corrupt file -> regenerate
+                bt.logging.warning(f"security: could not read key file {path}: {e}; regenerating")
+        if not priv_b64:
+            priv_b64, _ = generate_keypair()
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump({"private_key_b64": priv_b64}, fh)
+                try:
+                    os.chmod(path, 0o600)  # best effort; no-op on Windows
+                except OSError:
+                    pass
+                bt.logging.info(f"security: generated a new validator keypair at {path}")
+            except Exception as e:  # noqa: BLE001
+                bt.logging.warning(f"security: could not persist key file {path}: {e}")
+        self._priv_b64 = priv_b64
+        self._pubkey_b64 = public_key_b64(priv_b64)
+        self._pubkey_id = hashlib.sha256(self._pubkey_b64.encode()).hexdigest()[:16]
 
     def get_miner_uids(self) -> list[int]:
         """Every registered neuron serving an axon, excluding self and (unless
@@ -137,6 +183,83 @@ class SecurityValidator(BaseValidatorNeuron):
 
         return await asyncio.to_thread(work)
 
+    async def _evaluate_blob(self, blob_url: str, ciphertext_sha256: str, miner_id: str):
+        """Download, verify, decrypt and evaluate an encrypted agent blob.
+
+        The decrypted tarball goes through the same STRONG tarball intake as a
+        file submission (FILE -> STRUCTURE -> LOAD -> INSPECT), then the full
+        isolated job. Returns (reward, detail); reward None means our own
+        (retryable) fault. A failed or corrupt download is our fault; a blob
+        that will not decrypt for our key is the miner's (they must encrypt for
+        the key we advertised), so that scores 0.
+        """
+        def work():
+            tar_path = None
+            image_ref = None
+            conn = db.connect(self.db_path)
+            try:
+                try:
+                    blob = self._download_blob(blob_url)
+                except Exception as e:  # noqa: BLE001 - network/host issue, retryable
+                    return None, f"download_failed:{type(e).__name__}"
+                if ciphertext_sha256 and hashlib.sha256(blob).hexdigest() != ciphertext_sha256:
+                    return None, "sha256_mismatch"  # truncated/corrupt -> retry
+                try:
+                    tar = decrypt_agent(blob, self._priv_b64)
+                except AgentCryptoError:
+                    return 0.0, "decrypt_failed"  # miner's fault, deterministic
+
+                fd, tar_path = tempfile.mkstemp(prefix="secval-agent-", suffix=".tar")
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(tar)
+
+                # 1. intake over the strong tarball front door (+ dedupe/record)
+                _row, verdict, _ms = check_and_record(
+                    conn, tar_path, miner_id, from_registry=False, skip_dry_run=True
+                )
+                if not verdict.accepted:
+                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}"
+
+                # 2. load the validated image for a runnable ref, then evaluate
+                image_ref = docker_ops.load_image(tar_path)
+                job = run_job(image_ref)
+                reward = reward_for_job(job)
+                detail = (
+                    f"job:variant={job.variant} accepted={job.accepted} "
+                    f"task={job.task.score if job.task else None} safe={job.safe} "
+                    f"requests={job.request_count}"
+                )
+                return reward, detail
+            finally:
+                if image_ref:
+                    docker_ops.remove_image(image_ref)
+                if tar_path and os.path.exists(tar_path):
+                    try:
+                        os.remove(tar_path)
+                    except OSError:
+                        pass
+                conn.close()
+
+        return await asyncio.to_thread(work)
+
+    def _download_blob(self, url: str) -> bytes:
+        """Download an encrypted blob, bounded in size and time. Raises on any
+        problem so the caller scores it as our own (retryable) fault."""
+        max_bytes = C.SECURITY_BLOB_MAX_BYTES
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=C.SECURITY_BLOB_DOWNLOAD_TIMEOUT_S) as resp:
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"blob exceeds {max_bytes} bytes")
+                chunks.append(chunk)
+        return b"".join(chunks)
+
     async def security_round(self) -> None:
         """Ask every eligible miner for its agent image, evaluate each, and
         fold the results into self.scores."""
@@ -156,7 +279,12 @@ class SecurityValidator(BaseValidatorNeuron):
             self.last_security_round_at = now
             return
 
-        synapse = SecurityAgentSynapse(request_id=uuid.uuid4().hex, issued_at=now)
+        synapse = SecurityAgentSynapse(
+            request_id=uuid.uuid4().hex,
+            issued_at=now,
+            validator_pubkey_b64=self._pubkey_b64,
+            pubkey_id=self._pubkey_id,
+        )
         axons = [self.metagraph.axons[uid] for uid in miner_uids]
         responses = await self.dendrite(
             axons=axons,
@@ -174,12 +302,21 @@ class SecurityValidator(BaseValidatorNeuron):
             answered += 1
             if not getattr(resp, "has_agent", False):
                 continue      # miner declined this round
-            image_ref = (getattr(resp, "image_ref", "") or "").strip()
-            if not image_ref:
-                continue
             hotkey = self.metagraph.hotkeys[int(uid)]
+            blob_url = (getattr(resp, "blob_url", "") or "").strip()
+            image_ref = (getattr(resp, "image_ref", "") or "").strip()
             try:
-                reward, detail = await self._evaluate(image_ref, hotkey)
+                if blob_url:
+                    # primary path: encrypted blob, opaque to peers
+                    cipher_sha = (getattr(resp, "ciphertext_sha256", "") or "").strip()
+                    reward, detail = await self._evaluate_blob(blob_url, cipher_sha, hotkey)
+                    submitted = blob_url
+                elif image_ref:
+                    # fallback path: plaintext registry reference
+                    reward, detail = await self._evaluate(image_ref, hotkey)
+                    submitted = image_ref
+                else:
+                    continue  # answered has_agent=True but sent nothing usable
             except Exception as e:  # noqa: BLE001 - never let one miner break the round
                 bt.logging.warning(f"security-validator: uid={uid} evaluation errored: {e}")
                 continue
@@ -189,7 +326,7 @@ class SecurityValidator(BaseValidatorNeuron):
             else:
                 rewards[int(uid)] = reward
             bt.logging.info(
-                f"security-validator: uid={uid} reward={reward} ({detail}) ref={image_ref}"
+                f"security-validator: uid={uid} reward={reward} ({detail}) src={submitted}"
             )
 
         if skipped:
