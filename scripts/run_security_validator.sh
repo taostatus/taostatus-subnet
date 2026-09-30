@@ -15,10 +15,13 @@ set -euo pipefail
 cd /home/aman/taostatus-subnet
 
 export MASXAI_QUERY_VALIDATOR_UIDS=true
+# Testnet 501's metagraph has no uid 25 (the mainnet burn uid), so point the
+# burn at a valid uid here -- otherwise burn allocation fails and set_weights is
+# skipped, and nothing reaches the chain.
+export MASXAI_BURN_UID=0
 
 exec sg docker -c '/home/aman/taostatus-subnet/.venv/bin/python neurons/security_validator.py \
   --netuid 501 --subtensor.network test \
   --subtensor.chain_endpoint wss://test.finney.opentensor.ai:443 \
   --wallet.name aman-test --wallet.hotkey validator1 \
-  --neuron.disable_set_weights True \
   --logging.debug'

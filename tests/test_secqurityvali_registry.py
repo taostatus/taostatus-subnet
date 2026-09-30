@@ -14,7 +14,7 @@ import pytest
 
 from secqurityVali import api as api_mod
 from secqurityVali import db
-from secqurityVali.models import SOURCE_REGISTRY, RejectReason, Stage, Status
+from secqurityVali.models import SOURCE_REGISTRY, RejectReason, Stage, StageFailure, Status
 from secqurityVali.pipeline import check_and_record, check_registry_submission
 from secqurityVali.registry import (
     assert_submittable_ref,
@@ -40,10 +40,17 @@ INSPECT_OK = json.dumps({
 
 
 def fake_docker(*, pull_rc=0, pull_err="", repo_digests=DIGEST_REF,
-                inspect=INSPECT_OK, exit_code="0", calls=None):
+                inspect=INSPECT_OK, exit_code="0", calls=None, manifest=None):
     def run(args, timeout):
         if calls is not None:
             calls.append(args[0] if args[0] != "image" else f"image {args[1]}")
+        if args[:2] == ["manifest", "inspect"]:
+            ref_arg = args[2] if len(args) > 2 else ""
+            if isinstance(manifest, dict):
+                # an index for the tag ref, a sub-manifest for the @digest ref
+                body = manifest.get("sub") if "@" in ref_arg else manifest.get("index")
+                return subprocess.CompletedProcess(args, 0, body or "", "")
+            return subprocess.CompletedProcess(args, 0, manifest or "", "")
         if args[0] == "pull":
             return subprocess.CompletedProcess(args, pull_rc, "", pull_err)
         if args[:2] == ["image", "inspect"]:
@@ -122,6 +129,43 @@ def test_other_pull_failures_stay_generic():
     with pytest.raises(Exception) as err:
         pull_image(TAG_REF, runner=runner)
     assert err.value.reason is RejectReason.PULL_FAILED
+
+
+# --- F5: pre-pull manifest size bound ----------------------------------
+
+def test_pull_refuses_oversized_manifest():
+    """A single manifest declaring more than the cap is rejected BEFORE the
+    daemon pulls anything."""
+    big = json.dumps({"config": {"size": 1000}, "layers": [{"size": 5 * 1024**3}]})
+    with pytest.raises(StageFailure) as err:
+        pull_image(TAG_REF, runner=fake_docker(manifest=big))
+    assert err.value.reason is RejectReason.IMAGE_TOO_LARGE
+
+
+def test_pull_allows_within_cap_manifest():
+    small = json.dumps({"config": {"size": 1000}, "layers": [{"size": 40 * 1024 * 1024}]})
+    pulled = pull_image(TAG_REF, runner=fake_docker(manifest=small))
+    assert pulled.digest_ref == DIGEST_REF
+
+
+def test_pull_resolves_multiarch_index_and_refuses_oversized():
+    """A multi-arch index is resolved to the amd64/linux sub-manifest, whose
+    layer sizes are then checked."""
+    index = json.dumps({"manifests": [
+        {"digest": "sha256:" + "a" * 64,
+         "platform": {"architecture": "amd64", "os": "linux"}},
+    ]})
+    sub = json.dumps({"layers": [{"size": 5 * 1024**3}]})
+    with pytest.raises(StageFailure) as err:
+        pull_image(TAG_REF, runner=fake_docker(manifest={"index": index, "sub": sub}))
+    assert err.value.reason is RejectReason.IMAGE_TOO_LARGE
+
+
+def test_pull_proceeds_when_manifest_unreadable():
+    """If the size can't be read (manifest inspect returns nothing), the pull
+    still proceeds -- the post-pull INSPECT cap is the backstop."""
+    pulled = pull_image(TAG_REF, runner=fake_docker(manifest=None))
+    assert pulled.digest_ref == DIGEST_REF
 
 
 # --- the registry pipeline ---------------------------------------------

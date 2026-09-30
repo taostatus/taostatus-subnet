@@ -47,6 +47,11 @@ def make_validator(responses, reward_by_ref):
     v._active_categories = ("sqli",)
     v._cat_scores = CategoryScores(alpha=0.5)
     v._cat_scores_path = tempfile.mktemp(suffix=".json")
+    v._freshness_s = 1e9         # effectively fresh forever for these tests
+    # background-round state (a real validator sets these in __init__)
+    v._round_task = None
+    v._round_budget_s = 1e9      # effectively unbounded for tests
+    v._forward_pace_s = 0.0
 
     async def fake_dendrite(axons, synapse, deserialize, timeout):
         return responses
@@ -147,3 +152,63 @@ def test_no_answers_scores_nothing():
     v = make_validator(responses, {})
     asyncio.run(v.security_round())
     assert v.captured is None
+
+
+# --- F3: evaluation runs off the weight-set path -----------------------
+
+def test_idle_miner_score_decays_to_zero():
+    """F4: a miner scored in a past round but no longer producing fresh evidence
+    has its score recomputed to 0 once its category cell goes stale -- it does
+    not keep earning forever."""
+    responses = [resp(None), resp(None)]        # nobody answers this round
+    v = make_validator(responses, {})
+    v._cat_scores.update("miner-1", "sqli", 1.0, now=0.0)  # an OLD solve (t=0)
+    v._freshness_s = 100.0                        # 100s window; now() >> 100 -> stale
+    asyncio.run(v.security_round())
+    assert dict(zip(v.captured[1], v.captured[0])) == {1: 0.0}
+
+
+def test_forward_does_not_block_on_a_slow_round():
+    """forward() must return promptly and run the round in the background, so a
+    slow evaluation never delays the base class's weight-setting (vtrust)."""
+    v = make_validator([], {})
+    v._round_task = None
+    v._forward_pace_s = 0.0
+    events = []
+
+    async def slow_round():
+        events.append("start")
+        await asyncio.sleep(0.5)
+        events.append("end")
+    v.security_round = slow_round
+
+    async def drive():
+        await v.forward()                  # returns promptly; round still in flight
+        assert v._round_task is not None
+        assert not v._round_task.done()    # forward did NOT wait for the round
+        assert events == ["start"]         # started, not finished
+        await v._round_task                # let the background round finish
+        assert events == ["start", "end"]
+    asyncio.run(drive())
+
+
+def test_forward_does_not_start_overlapping_rounds():
+    """While a round is still running, forward() must not start a second one."""
+    v = make_validator([], {})
+    v._round_task = None
+    v._forward_pace_s = 0.0
+    calls = []
+
+    async def slow_round():
+        calls.append(1)
+        await asyncio.sleep(0.5)
+    v.security_round = slow_round
+
+    async def drive():
+        await v.forward()
+        first = v._round_task
+        await v.forward()                  # round still running -> reuse, no new task
+        assert v._round_task is first
+        assert len(calls) == 1
+        await v._round_task
+    asyncio.run(drive())

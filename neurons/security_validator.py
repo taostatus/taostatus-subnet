@@ -90,8 +90,21 @@ class SecurityValidator(BaseValidatorNeuron):
             self._cat_scores_path,
             alpha=_env_float(C.SECURITY_CATEGORY_EMA_ALPHA_ENV, C.SECURITY_CATEGORY_EMA_ALPHA),
         )
+        # Freshness window (F4): a category score older than this stops counting,
+        # so an idle miner's score decays to 0 instead of paying forever.
+        self._freshness_s = _env_float(
+            C.SECURITY_CATEGORY_FRESHNESS_SECONDS_ENV, C.SECURITY_CATEGORY_FRESHNESS_SECONDS
+        )
 
         self.last_security_round_at = 0.0
+        # Evaluation runs as a background task so it never blocks weight-setting
+        # (F3). Only one round runs at a time; a round's eval loop is bounded by
+        # _round_budget_s. _forward_pace_s just paces how often forward() checks.
+        self._round_task = None
+        self._round_budget_s = _env_float(
+            C.SECURITY_ROUND_BUDGET_SECONDS_ENV, C.SECURITY_ROUND_BUDGET_SECONDS
+        )
+        self._forward_pace_s = 5.0
         if not docker_available():
             bt.logging.warning(
                 "security-validator: docker daemon is not reachable -- rounds will "
@@ -310,7 +323,19 @@ class SecurityValidator(BaseValidatorNeuron):
         rewards: dict[int, float] = {}
         skipped: list[int] = []
         answered = 0
+        budget_reached = False
+        round_started = time.monotonic()
         for uid, resp in zip(miner_uids, responses):
+            # Bound the round: once the budget is spent, defer the rest to the
+            # next round rather than letting one round run unbounded. (The round
+            # is already off the weight-set path; this just stops pile-ups.)
+            if time.monotonic() - round_started > self._round_budget_s:
+                budget_reached = True
+                bt.logging.info(
+                    f"security-validator: round budget {self._round_budget_s:.0f}s reached; "
+                    "deferring remaining miners to the next round"
+                )
+                break
             if getattr(resp, "has_agent", None) is None:
                 continue      # timed out / never reached the miner
             answered += 1
@@ -348,7 +373,9 @@ class SecurityValidator(BaseValidatorNeuron):
             # scores on the miner's standing aggregate.
             if category is not None:
                 self._cat_scores.update(hotkey, category, reward)
-            agg = self._cat_scores.aggregate(hotkey, self._active_categories)
+            agg = self._cat_scores.aggregate(
+                hotkey, self._active_categories, now=now, freshness_s=self._freshness_s
+            )
             rewards[int(uid)] = agg
             bt.logging.info(
                 f"security-validator: uid={uid} raw={reward} cat={category} "
@@ -365,14 +392,39 @@ class SecurityValidator(BaseValidatorNeuron):
                 f"security-validator: skipped {len(skipped)} uid(s) scored as our "
                 f"own fault (retryable), not the miner's: {skipped}"
             )
-        if rewards:
-            self._update_from_rewards(rewards)
+
+        # Score EVERY miner from the freshness-filtered matrix -- not only those
+        # evaluated this round -- so an idle/offline miner whose cells went stale
+        # decays to 0 instead of earning forever (F4), while a recently-scored
+        # miner keeps its score until its window lapses.
+        score_map = self._recompute_all_scores(now)
+        if score_map:
+            self._update_from_rewards(score_map)
 
         bt.logging.info(
             f"security-validator round | asked={len(miner_uids)} answered={answered} "
-            f"scored={len(rewards)} skipped={len(skipped)}"
+            f"scored={len(rewards)} skipped={len(skipped)} "
+            f"budget_reached={budget_reached}"
         )
         self.last_security_round_at = now
+
+    def _recompute_all_scores(self, now: float) -> dict[int, float]:
+        """{uid: score} for every miner that has category history, each the
+        freshness-filtered aggregate of its matrix. Recomputing from the matrix
+        (not just this round's answers) is what lets a previously-scored miner
+        that has gone idle decay to 0 as its cells go stale (F4), instead of its
+        old score being frozen because it is no longer evaluated. Miners with no
+        history are untouched (they stay at the base class's 0)."""
+        hk_to_uid = {hk: i for i, hk in enumerate(self.metagraph.hotkeys)}
+        out: dict[int, float] = {}
+        for hotkey in list(self._cat_scores.cells.keys()):
+            uid = hk_to_uid.get(hotkey)
+            if uid is None:
+                continue  # hotkey no longer in the metagraph
+            out[uid] = self._cat_scores.aggregate(
+                hotkey, self._active_categories, now=now, freshness_s=self._freshness_s
+            )
+        return out
 
     def _update_from_rewards(self, rewards: dict[int, float]) -> None:
         """Write this round's aggregate scores into self.scores directly.
@@ -395,15 +447,34 @@ class SecurityValidator(BaseValidatorNeuron):
                 scores[int(uid)] = np.float32(value)
 
     async def forward(self):
-        """One validator step. The base class paces this by epoch and sets
-        weights from self.scores; this only fills the scores in."""
-        lock = getattr(self, "lock", None)
-        if lock is None:
-            lock = asyncio.Lock()
-            self.lock = lock
-        async with lock:
+        """One validator step. Starts an evaluation round in the BACKGROUND (if
+        one isn't already running) and returns promptly, so evaluation never
+        blocks the base class's weight-setting loop -- a validator that goes
+        silent on chain has its vtrust collapse (F3). The base class reads
+        self.scores, which the background round fills in, and sets weights on its
+        own schedule regardless of how long evaluation takes.
+        """
+        task = getattr(self, "_round_task", None)
+        if task is not None and task.done():
+            # Surface (don't swallow) a crash from the finished round, then clear.
+            if not task.cancelled() and task.exception() is not None:
+                bt.logging.warning(
+                    f"security-validator: previous round errored: {task.exception()}"
+                )
+            task = None
+        if task is None:
+            self._round_task = asyncio.create_task(self._run_round_guarded())
+        # Pace how often we check; the round itself runs independently. Kept small
+        # so weight-setting stays responsive, never the length of a round.
+        await asyncio.sleep(getattr(self, "_forward_pace_s", 5.0))
+
+    async def _run_round_guarded(self) -> None:
+        """Run one security_round off the weight-set path. Never raises -- a
+        failed round must not take the loop (or the background task) down."""
+        try:
             await self.security_round()
-        await asyncio.sleep(5)
+        except Exception as e:  # noqa: BLE001 - a round must never crash the validator
+            bt.logging.warning(f"security-validator: round failed: {e}")
 
 
 if __name__ == "__main__":

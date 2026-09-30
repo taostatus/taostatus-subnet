@@ -135,6 +135,13 @@ CONTAINER_ID_PATTERN = r"^[0-9a-f]{12,64}$"
 # trickles bytes forever is a denial of service.
 REGISTRY_PULL_TIMEOUT_S = 900
 
+# Bound on the compressed download a registry submission may pull. Read from the
+# image manifest BEFORE pulling (docker manifest inspect), so an oversized image
+# is refused without ever handing its bytes to the root daemon (F5). Best-effort:
+# if the size can't be read (an unusual manifest, or manifest inspect fails), the
+# pull proceeds and the post-pull INSPECT size cap (MAX_IMAGE_SIZE_BYTES) applies.
+REGISTRY_MAX_MANIFEST_BYTES = 2 * 1024**3   # 2 GiB compressed
+
 # --- validator API -----------------------------------------------------
 API_HOST = "127.0.0.1"
 API_PORT = 8080
@@ -178,3 +185,11 @@ JOB_AGENT_TIMEOUT_S = 180
 # The findings file the agent must write, mounted from a per-run host dir.
 JOB_OUTPUT_MOUNT = "/out"
 JOB_FINDINGS_NAME = "findings.json"
+
+# The agent controls /out, so reading its findings must never let it hang the
+# validator (a FIFO read blocks forever), follow a symlink out of the mount, or
+# exhaust memory. The read is regular-file-only, non-blocking, and capped at
+# JOB_FINDINGS_MAX_BYTES; if the agent filled the whole mount past
+# JOB_OUT_DIR_MAX_BYTES we refuse it outright.
+JOB_FINDINGS_MAX_BYTES = 1 * 1024 * 1024        # 1 MiB -- larger is not a real findings doc
+JOB_OUT_DIR_MAX_BYTES = 16 * 1024 * 1024        # 16 MiB total in /out before it's treated as abuse

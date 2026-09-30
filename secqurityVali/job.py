@@ -30,6 +30,7 @@ exfiltrate. Teardown runs on every path, so no job leaves state behind.
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -39,6 +40,7 @@ from pathlib import Path
 
 from secqurityVali import constants as C
 from secqurityVali.behavior import (
+    SEV_CRITICAL,
     BehaviorReport,
     Violation,
     analyze,
@@ -102,6 +104,7 @@ def assemble_result(
     timed_out: bool,
     duration_ms: int = 0,
     replay_confirmed: bool = False,
+    behaviour_available: bool = True,
 ) -> JobResult:
     """Turn the raw evidence a run produced into a scored JobResult. Pure: no
     docker, no clock. This is where task and safety are combined, and it is the
@@ -110,6 +113,21 @@ def assemble_result(
     # Safety first: it can veto everything.
     report: BehaviorReport = analyze(behaviour_text or "")
     safe, blocking = safety_verdict(report)
+
+    # Fail CLOSED: the safety verdict is only trustworthy if we actually have the
+    # behaviour evidence. If a run happened but produced no strace log (missing,
+    # unreadable, or empty), we cannot certify it was safe -- and "no evidence"
+    # must never read as "safe" for a security gate. Treat it as a critical
+    # violation so the run is vetoed, rather than silently passing.
+    if not behaviour_available:
+        blocking = [
+            Violation(
+                severity=SEV_CRITICAL,
+                kind="monitoring-unavailable",
+                detail="no behaviour log for this run; cannot certify safety (fail-closed)",
+            )
+        ] + blocking
+        safe = False
 
     # Task: parse the agent's findings (untrusted) and score against the key.
     task: TaskResult | None = None
@@ -267,6 +285,10 @@ def run_job(
 
         findings_raw = _read_findings(out_dir)
         behaviour_text = _read_behaviour(agent_cid)
+        # The agent started (we have its id and it ran to wait/kill above), so it
+        # must have produced strace output. An empty log here means monitoring
+        # didn't capture this run -- we cannot certify safety, so fail closed.
+        behaviour_available = bool(behaviour_text.strip())
 
         # If the agent reported a reproduction, confirm the exploit reproduces
         # against a FRESH target (new canary, same structure). This is what
@@ -279,6 +301,7 @@ def run_job(
             run_id, challenge, findings_raw, behaviour_text,
             agent_exit_code=exit_code, timed_out=timed_out, duration_ms=duration_ms,
             replay_confirmed=replay_confirmed,
+            behaviour_available=behaviour_available,
         )
         result.request_count = request_count
         return result
@@ -322,11 +345,63 @@ def _exit_code(name: str) -> int | None:
 
 
 def _read_findings(out_dir: str) -> bytes:
-    path = Path(out_dir) / C.JOB_FINDINGS_NAME
+    """Read the agent's findings.json defensively.
+
+    The agent owns this file, so it must not be able to hang the validator or
+    exhaust it:
+      * a FIFO read blocks forever -> open non-blocking and require a regular file
+      * a symlink can point anywhere -> O_NOFOLLOW rejects it
+      * an unbounded file exhausts memory -> read at most JOB_FINDINGS_MAX_BYTES
+      * a filled mount exhausts disk -> refuse if /out exceeds JOB_OUT_DIR_MAX_BYTES
+    Any failure yields b"" (treated as "no findings"), never an exception or hang.
+    """
+    if _dir_size_over(out_dir, C.JOB_OUT_DIR_MAX_BYTES):
+        return b""
+    path = os.path.join(out_dir, C.JOB_FINDINGS_NAME)
+    # O_NONBLOCK: opening a FIFO returns immediately instead of blocking on a
+    # writer. O_NOFOLLOW: a symlink at this path fails the open. Both are absent
+    # on Windows (getattr -> 0), where the dev tests exercise the other paths.
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        return path.read_bytes()[: 1 * 1024 * 1024 + 1]
+        fd = os.open(path, flags)
+    except OSError:
+        return b""  # missing, a symlink (O_NOFOLLOW), or a FIFO with no writer
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return b""  # FIFO / dir / socket / device -> not a real findings file
+        chunks: list[bytes] = []
+        remaining = C.JOB_FINDINGS_MAX_BYTES
+        while remaining > 0:
+            block = os.read(fd, remaining)
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        return b"".join(chunks)
     except OSError:
         return b""
+    finally:
+        os.close(fd)
+
+
+def _dir_size_over(path: str, cap: int) -> bool:
+    """True if the total size of regular files under `path` exceeds `cap`. Stops
+    early once passed; never opens a file, so a FIFO in the tree can't block it."""
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    st = os.lstat(os.path.join(root, name))
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode):
+                    total += st.st_size
+                    if total > cap:
+                        return True
+    except OSError:
+        pass
+    return False
 
 
 def _read_request_count(target_name: str) -> int:

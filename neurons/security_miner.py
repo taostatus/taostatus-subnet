@@ -39,7 +39,7 @@ from masxai.agent_blob import AgentBlobError, BlobServer, save_image_tar, sha256
 try:
     from template.base.miner import BaseMinerNeuron
 except Exception:
-    class BaseMinerNeuron:  # type: ignore[no-redef]
+    class BaseMinerNeuron: 
         def __init__(self, *_, **__):
             raise RuntimeError("BaseMinerNeuron requires a working bittensor install")
 

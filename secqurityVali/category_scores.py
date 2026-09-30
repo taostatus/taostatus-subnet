@@ -62,18 +62,30 @@ class CategoryScores:
         cell = self.cells.get(hotkey, {}).get(category)
         return None if cell is None else float(cell["score"])
 
-    def aggregate(self, hotkey: str, categories) -> float:
+    def aggregate(self, hotkey: str, categories, *, now: float | None = None,
+                  freshness_s: float | None = None) -> float:
         """The miner's overall score: the MEAN across `categories`, where a
         category with no record counts as 0. Breadth is rewarded -- solving more
-        categories raises the mean; a category left unsolved holds it down."""
+        categories raises the mean; a category left unsolved holds it down.
+
+        With `freshness_s`, a cell older than that window also counts as 0 (stale):
+        a miner must keep its categories refreshed to keep earning, so a one-time
+        solve cannot pay forever (F4). `now` defaults to the wall clock.
+        """
         cats = list(categories)
         if not cats:
             return 0.0
         total = 0.0
         for cat in cats:
-            s = self.category_score(hotkey, cat)
-            if s is not None:
-                total += s
+            cell = self.cells.get(hotkey, {}).get(cat)
+            if cell is None:
+                continue
+            if freshness_s is not None:
+                if now is None:
+                    now = time.time()
+                if now - float(cell["updated_at"]) > freshness_s:
+                    continue  # stale evidence -> counts as 0
+            total += float(cell["score"])
         return total / len(cats)
 
     def prune(self, valid_hotkeys) -> None:

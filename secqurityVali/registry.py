@@ -22,6 +22,7 @@ Two things this module does insist on:
     accepted record that points at something nobody checked.
 """
 
+import json
 import re
 from dataclasses import dataclass
 
@@ -114,6 +115,74 @@ def _repo_digest_of(
     return None
 
 
+def _manifest_json(ref: str, *, runner: DockerRunner | None) -> dict | None:
+    """`docker manifest inspect <ref>` parsed to a dict, or None on any failure.
+    Reads registry metadata only -- it does not pull the image."""
+    result = run_docker(
+        ["manifest", "inspect", ref],
+        runner=runner,
+        timeout=C.DOCKER_CLI_TIMEOUT_S,
+        timeout_reason=RejectReason.PULL_FAILED,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout or "")
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _repo_of(ref: str) -> str:
+    """The repository part of a reference, without a tag or digest -- so a
+    platform sub-manifest can be addressed as <repo>@<digest>."""
+    if "@" in ref:
+        return ref.split("@", 1)[0]
+    slash = ref.rfind("/")
+    tail = ref[slash + 1:]
+    if ":" in tail:                       # a tag, not a registry :port
+        return ref[:slash + 1] + tail.split(":", 1)[0]
+    return ref
+
+
+def _layers_total(manifest: dict) -> int | None:
+    """Sum of compressed layer sizes (+ config) in a single image manifest."""
+    layers = manifest.get("layers")
+    if not isinstance(layers, list):
+        return None
+    total = sum(int(l.get("size", 0)) for l in layers if isinstance(l, dict))
+    cfg = manifest.get("config")
+    if isinstance(cfg, dict):
+        total += int(cfg.get("size", 0))
+    return total
+
+
+def _manifest_total_size(ref: str, *, runner: DockerRunner | None) -> int | None:
+    """Best-effort compressed download size for `ref`, WITHOUT pulling it.
+    Resolves a multi-arch index to the amd64/linux sub-manifest. Returns None if
+    it cannot be determined (then the caller lets the pull proceed and relies on
+    the post-pull INSPECT size cap)."""
+    data = _manifest_json(ref, runner=runner)
+    if data is None:
+        return None
+    direct = _layers_total(data)          # a single manifest already lists layers
+    if direct is not None:
+        return direct
+    manifests = data.get("manifests")     # otherwise it is an index -> resolve
+    if not isinstance(manifests, list):
+        return None
+    digest = None
+    for m in manifests:
+        plat = (m.get("platform") or {}) if isinstance(m, dict) else {}
+        if plat.get("architecture") == C.EXPECTED_ARCH and plat.get("os") == C.EXPECTED_OS:
+            digest = m.get("digest")
+            break
+    if not digest:
+        return None
+    sub = _manifest_json(f"{_repo_of(ref)}@{digest}", runner=runner)
+    return _layers_total(sub) if sub else None
+
+
 def pull_image(
     ref: str,
     *,
@@ -128,6 +197,18 @@ def pull_image(
     moves afterwards, our record still names what we checked.
     """
     assert_submittable_ref(ref)
+
+    # Bound the download BEFORE the daemon fetches anything: read the manifest
+    # (metadata only) and refuse an image that declares more than the cap, so the
+    # registry path can't hand an unbounded pull to the root daemon (F5). Best
+    # -effort -- an unreadable size falls through to the post-pull INSPECT cap.
+    declared = _manifest_total_size(ref, runner=runner)
+    if declared is not None and declared > C.REGISTRY_MAX_MANIFEST_BYTES:
+        raise StageFailure(
+            RejectReason.IMAGE_TOO_LARGE,
+            f"manifest declares {declared} bytes, over the "
+            f"{C.REGISTRY_MAX_MANIFEST_BYTES}-byte pull cap",
+        )
 
     result = run_docker(
         ["pull", "--quiet", ref],
