@@ -138,6 +138,12 @@ def _llm_key_contrib_configs() -> list[typing.Tuple[str, str, str]]:
 
 
 class Miner(BaseMinerNeuron):
+    # Mechanism 0 (LLM-key). Miners are not registered per mechanism -- the UID
+    # is subnet-wide -- so this only selects which mechanism's metagraph view
+    # the miner reads. It earns on mechanism 0 because the LLM-key validator
+    # weights it there.
+    mechid = C.LLM_KEY_MECHID
+
     def __init__(self, config=None):
         load_env()
         super().__init__(config=config)

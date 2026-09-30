@@ -12,9 +12,10 @@ the burn allocation -- live in the template base class. This file only connects
 the two, and its one piece of real logic (verdict -> reward) is the pure,
 tested helper in secqurityVali/reward.py.
 
-Runs the security track on the same subnet as the LLM-key validator. For now
-that is a single blended weight vector; if the subnet later gains multiple
-mechanisms, only the set_weights target changes.
+Runs the security track as mechanism 1 of the same subnet as the LLM-key
+validator (mechanism 0). It sets weights on its own mechanism's matrix only, so
+the two validators can share one staked hotkey without overwriting each other.
+See MECHANISMS.md.
 
     python neurons/security_validator.py --netuid 501 --subtensor.network test \
         --wallet.name <coldkey> --wallet.hotkey <hotkey>
@@ -65,6 +66,10 @@ def _env_float(name: str, default: float) -> float:
 
 
 class SecurityValidator(BaseValidatorNeuron):
+    # Mechanism 1: the security track. Its weights go to mechanism 1's matrix
+    # and never overwrite the LLM-key validator's mechanism-0 weights.
+    mechid = C.SECURITY_MECHID
+
     def __init__(self, config=None):
         load_env()
         super().__init__(config=config)
