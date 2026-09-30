@@ -121,6 +121,10 @@ def _state_file_path() -> Path:
 
 
 class Validator(BaseValidatorNeuron):
+    # Mechanism 0: the LLM-key track. Weights set here never touch the
+    # security track's matrix (mechanism 1).
+    mechid = C.LLM_KEY_MECHID
+
     def __init__(self, config=None):
         load_env()
         super().__init__(config=config)

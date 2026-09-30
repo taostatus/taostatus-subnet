@@ -8,6 +8,18 @@ NETUID = 501
 NETWORK = "test"
 SUBTENSOR_ENDPOINT = "wss://test.finney.opentensor.ai:443"
 
+# --- subnet mechanisms ---
+# The subnet runs two mechanisms (see MECHANISMS.md). UIDs, registration,
+# stake and validator permits are shared subnet-wide; each mechanism has its
+# own weight matrix, its own Yuma consensus and its own share of emission.
+#   0 -- LLM-key contribution  (neurons/validator.py + neurons/miner.py)
+#   1 -- security-audit agents (neurons/security_validator.py + neurons/security_miner.py)
+# Each neuron class pins its mechid from here; it is deliberately not a CLI
+# flag, so a validator can never set one track's scores on the other's matrix.
+LLM_KEY_MECHID = 0
+SECURITY_MECHID = 1
+MECHANISM_COUNT = 2
+
 # --- query / scoring ---
 QUERY_VALIDATOR_UIDS_ENV = "MASXAI_QUERY_VALIDATOR_UIDS"
 EMA_ALPHA = 0.1                       # generic default smoothing alpha for ema_update()

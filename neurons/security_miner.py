@@ -3,11 +3,10 @@ neurons/security_miner.py - MASXAI security-track miner (mechanism 1).
 
 The security half of the subnet's two mechanisms. It is a SEPARATE miner from
 the LLM-key miner (neurons/miner.py, mechanism 0): a distinct process with its
-own hotkey, registered on the security mechanism, serving only the security
-synapse. Keeping the two miners apart mirrors the two validators
-(neurons/validator.py for LLM-key, neurons/security_validator.py for security)
-and matches how a dual-mechanism subnet is operated -- a miner participates in
-one mechanism, not both.
+own hotkey, serving only the security synapse. Registration is subnet-wide, not
+per mechanism -- the hotkey's UID exists on both mechanisms -- but it only earns
+on mechanism 1, because only the security validator weights it there. A hotkey
+advertises one axon endpoint, which is why the two miners use two hotkeys.
 
 What it does: when a validator asks (SecurityAgentSynapse), it returns its
 security-testing agent as an ENCRYPTED docker image. The agent is `docker save`d,
@@ -62,6 +61,11 @@ class SecurityMiner(BaseMinerNeuron):
     it (and blacklist/priority) as this miner's only route -- it serves the
     security synapse and nothing else.
     """
+
+    # Mechanism 1 (security). There is no per-mechanism registration: this
+    # hotkey's UID exists on every mechanism of the subnet. It earns on
+    # mechanism 1 because only the security validator weights it there.
+    mechid = C.SECURITY_MECHID
 
     def __init__(self, config=None):
         load_env()

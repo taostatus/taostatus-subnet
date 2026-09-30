@@ -41,6 +41,18 @@ def is_cuda_available():
     return "cpu"
 
 
+def neuron_dir_name(name: str, mechid: int) -> str:
+    """The per-neuron directory name under netuid<N>/.
+
+    Mechanism 0 keeps the historical name so existing state and logs stay where
+    operators expect them. Any other mechanism gets a suffix, because the two
+    validators normally share one wallet/hotkey and would otherwise write the
+    same state.npz and events log.
+    """
+    mechid = int(mechid or 0)
+    return name if mechid == 0 else f"{name}_mech{mechid}"
+
+
 def check_config(cls, config: "bt.Config"):
     r"""Checks/validates the config namespace object."""
     bt.logging.check_config(config)
@@ -51,7 +63,7 @@ def check_config(cls, config: "bt.Config"):
             config.wallet.name,
             config.wallet.hotkey,
             config.netuid,
-            config.neuron.name,
+            neuron_dir_name(config.neuron.name, getattr(cls, "mechid", 0)),
         )
     )
     print("full path:", full_path)
