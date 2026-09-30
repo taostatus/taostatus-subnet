@@ -167,3 +167,17 @@ testing/
 # MASXAI validator state (runtime artifact, do not commit)
 validator_state.json
 scripts/mock_validator_state.json
+
+# secqurityVali - local submission database
+secqurityVali.db
+secqurityVali.db-wal
+secqurityVali.db-shm
+
+# Private: reference/red-team solvers (kept local, not published so miners cannot copy)
+secqurityVali/agents/
+tests/test_secqurityvali_reference_agent.py
+
+# Security review + fix plan (working notes, kept local, not committed)
+SECURITY_REVIEW_SHORT.md
+SECURITY_REVIEW_feat-security-validator.md
+SECURITY_FIXES_PLAN.md

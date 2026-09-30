@@ -2,6 +2,8 @@
 masxai/constants.py - subnet constants.
 """
 
+import os
+
 NETUID = 501
 NETWORK = "test"
 SUBTENSOR_ENDPOINT = "wss://test.finney.opentensor.ai:443"
@@ -15,8 +17,12 @@ EMA_ALPHA = 0.1                       # generic default smoothing alpha for ema_
 # Validator._blended_weight_array()); the template's own burn allocation
 # then reserves BURN_PERCENTAGE of emission for BURN_UID unconditionally,
 # regardless of how much real efficiency data exists.
-BURN_UID = 25                         # receives reserved burn allocation
-BURN_PERCENTAGE = 0.95                # burn 95%, distribute 5% to miners with confirmed usage
+# Env-overridable so a network whose metagraph has no uid 25 (e.g. testnet 501,
+# which only has ~15 uids) can point the burn at a valid uid -- otherwise
+# _apply_burn_allocation raises "BURN_UID not present" and set_weights is skipped
+# entirely, so nothing ever reaches the chain. Mainnet keeps the 25/0.95 default.
+BURN_UID = int(os.getenv("MASXAI_BURN_UID", "25"))          # receives reserved burn allocation
+BURN_PERCENTAGE = float(os.getenv("MASXAI_BURN_PERCENTAGE", "0.95"))  # burn 95%, 5% to scored miners
 
 # Liveness participation: tracked for observability only (is a miner's
 # software online and responsive) - never blended into submitted chain
@@ -186,3 +192,76 @@ LLM_KEY_MODEL_TIER_WEIGHTS = {
     "deepseek/deepseek-chat": 0.5,
 }
 LLM_KEY_MODEL_TIER_DEFAULT_WEIGHT = 0.5   # unlisted-but-allowed provider/model
+
+# --- security-audit track (second emission path) -----------------------
+# Off by default, exactly like the LLM-key track: a miner opts in by setting
+# an image reference to submit. Empty/unset => the miner declines every
+# security round (has_agent=False), never crashes the axon.
+SECURITY_AGENT_ENABLED_ENV = "MASXAI_SECURITY_AGENT_ENABLED"
+SECURITY_AGENT_IMAGE_ENV = "MASXAI_SECURITY_AGENT_IMAGE"
+
+# Dendrite timeout when the validator asks a miner for its image reference.
+# The payload is tiny (one string), so this is short.
+SECURITY_QUERY_TIMEOUT = 15
+
+# How often the validator runs a security round, seconds.
+SECURITY_SUBMISSION_INTERVAL_SECONDS_ENV = "MASXAI_SECURITY_SUBMISSION_INTERVAL_SECONDS"
+SECURITY_SUBMISSION_INTERVAL_SECONDS = 300
+
+# A round runs in the BACKGROUND so evaluation never blocks the base class's
+# weight-setting loop (a silent validator loses vtrust -- F3). This bounds how
+# long one round's eval loop runs before deferring the remaining miners to the
+# next round, so rounds can't pile up.
+SECURITY_ROUND_BUDGET_SECONDS_ENV = "MASXAI_SECURITY_ROUND_BUDGET_SECONDS"
+SECURITY_ROUND_BUDGET_SECONDS = 240
+
+# Where the security validator keeps its verdict database on the host.
+SECURITY_DB_PATH_ENV = "MASXAI_SECURITY_DB_PATH"
+SECURITY_DB_PATH = "secqurityVali.db"
+
+# --- security-track agent encryption (v2 transport) --------------------
+# The validator's SealedBox keypair. The private half is persisted here so a
+# restart can still decrypt blobs miners encrypted for the previous ask; the
+# public half is derived from it and sent in every ask. Generated on first run
+# if the file is absent. Treat this file like any other validator secret.
+SECURITY_VALIDATOR_KEY_FILE_ENV = "MASXAI_SECURITY_VALIDATOR_KEY_FILE"
+SECURITY_VALIDATOR_KEY_FILE = "security_validator_key.json"
+
+# --- security-track per-category capability scoring --------------------
+# The vulnerability categories the benchmark currently issues. A miner is scored
+# per category and its overall score is the MEAN across these, so an untested or
+# failed category holds the mean down -- breadth is what earns. Add a category
+# here when a new target type (XSS, SSRF, ...) is introduced. Today: SQLi only,
+# so the aggregate equals the SQLi score until more are added.
+SECURITY_ACTIVE_CATEGORIES = ("sqli",)
+
+# Where the per-miner, per-category EMA matrix is persisted (see
+# secqurityVali/category_scores.py), and the EMA weight on each new observation.
+SECURITY_CATEGORY_SCORES_FILE_ENV = "MASXAI_SECURITY_CATEGORY_SCORES_FILE"
+SECURITY_CATEGORY_SCORES_FILE = "security_category_scores.json"
+SECURITY_CATEGORY_EMA_ALPHA_ENV = "MASXAI_SECURITY_CATEGORY_EMA_ALPHA"
+SECURITY_CATEGORY_EMA_ALPHA = 0.5
+
+# Freshness/decay (F4): a category score only counts while it was refreshed
+# within this window. A miner re-evaluated every round keeps its score current;
+# one that stops working (or goes offline) has its cells go stale and its score
+# fall to 0 -- so a one-time solve cannot pay forever. Rounds re-evaluate every
+# answering miner (~every submission interval), so this is several rounds long.
+SECURITY_CATEGORY_FRESHNESS_SECONDS_ENV = "MASXAI_SECURITY_CATEGORY_FRESHNESS_SECONDS"
+SECURITY_CATEGORY_FRESHNESS_SECONDS = 1800   # 30 minutes
+
+# Bound on the encrypted blob the validator will download from a miner. A blob
+# is a docker-save tarball plus SealedBox overhead; larger than the image cap is
+# not a real agent, and an unbounded download is a denial of service the miner
+# controls. Kept a little above MAX_FILE_SIZE_BYTES to allow for overhead.
+SECURITY_BLOB_MAX_BYTES = 2 * 1024**3 + 16 * 1024**2  # ~2 GiB + slack
+SECURITY_BLOB_DOWNLOAD_TIMEOUT_S = 900
+
+# --- miner side: how the miner hosts its encrypted blob ----------------
+# The miner serves the encrypted tarball from a tiny built-in static file
+# server so no external registry or bucket is needed. BLOB_HOST is the
+# host/IP the validator can reach it at (defaults to the miner's advertised
+# axon external IP when unset); BLOB_PORT is the port that server binds.
+SECURITY_BLOB_HOST_ENV = "MASXAI_SECURITY_BLOB_HOST"
+SECURITY_BLOB_PORT_ENV = "MASXAI_SECURITY_BLOB_PORT"
+SECURITY_BLOB_PORT = 8912

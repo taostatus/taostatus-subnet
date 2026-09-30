@@ -1,5 +1,10 @@
 """
-neurons/miner.py - MASXAI miner: LLM-key contribution pipeline.
+neurons/miner.py - MASXAI LLM-key miner (mechanism 0).
+
+The LLM-key half of the subnet's two mechanisms. The security track has its own
+separate miner (neurons/security_miner.py, mechanism 1); this one serves only the
+LLM-key synapse. A miner participates in one mechanism, not both -- which is why
+the two are distinct processes with distinct hotkeys.
 
 A miner opts in to contribute between LLM_KEY_MIN_KEYS_PER_HOTKEY (5) and
 LLM_KEY_MAX_KEYS_PER_HOTKEY (5) distinct LLM API keys as a resource for the
@@ -138,11 +143,11 @@ class Miner(BaseMinerNeuron):
         super().__init__(config=config)
         configs = _llm_key_contrib_configs()
         bt.logging.info(
-            "LLM-key contribution | "
+            "LLM-key contribution (mechanism 0) | "
             f"enabled={bool(configs)} keys={len(configs)} "
             + " ".join(f"slot{i}={p}/{m}" for i, (p, m, _) in enumerate(configs))
         )
-        bt.logging.info("MASXAI miner initialized.")
+        bt.logging.info("MASXAI LLM-key miner initialized.")
 
     async def forward(self, synapse: LLMKeySynapse) -> LLMKeySynapse:
         """Answer a request to contribute LLM keys, or decline cleanly.
@@ -197,13 +202,19 @@ class Miner(BaseMinerNeuron):
         action (a key submission relayed onward to the protocol backend) on
         every accepted response.
         """
+        return self._require_validator(synapse)
+
+    async def priority(self, synapse: LLMKeySynapse) -> float:
+        """Prioritize higher-stake callers. Standard template pattern."""
+        return self._stake_priority(synapse)
+
+    # ------------------------------------------------------ shared helpers
+    def _require_validator(self, synapse) -> typing.Tuple[bool, str]:
         if synapse.dendrite is None or synapse.dendrite.hotkey is None:
             return True, "missing dendrite/hotkey"
-
         hotkey = synapse.dendrite.hotkey
         if hotkey not in self.metagraph.hotkeys:
             return True, f"unregistered hotkey {hotkey}"
-
         uid = self.metagraph.hotkeys.index(hotkey)
         permits = getattr(self.metagraph, "validator_permit", None)
         if permits is None:
@@ -212,8 +223,7 @@ class Miner(BaseMinerNeuron):
             return True, "no validator permit"
         return False, f"accepted from uid {uid}"
 
-    async def priority(self, synapse: LLMKeySynapse) -> float:
-        """Prioritize higher-stake callers. Standard template pattern."""
+    def _stake_priority(self, synapse) -> float:
         if synapse.dendrite is None or synapse.dendrite.hotkey is None:
             return 0.0
         try:
