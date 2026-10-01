@@ -71,6 +71,11 @@ class JobResult:
     request_count: int = 0              # requests the agent made to the target (efficiency)
     parse_error: str | None = None
     error: str | None = None            # our fault (docker/orchestration), not the miner's
+    # The agent's self-reported identity from findings.json (`agent.name` /
+    # `agent.version`). Miner-controlled text: display metadata for the
+    # marketplace listing, never used in scoring.
+    agent_name: str = ""
+    agent_version: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -80,6 +85,8 @@ class JobResult:
             "safe": self.safe,
             "category": self.category,
             "variant": self.variant,
+            "agent_name": self.agent_name,
+            "agent_version": self.agent_version,
             # grouped so a lone critical isn't buried under a flood of medium
             # network chatter; the flat list stays available on the object.
             "violations": group_violations(self.violations),
@@ -132,9 +139,11 @@ def assemble_result(
     # Task: parse the agent's findings (untrusted) and score against the key.
     task: TaskResult | None = None
     parse_error: str | None = None
+    agent_name = agent_version = ""
     try:
         findings: Findings = parse_findings_bytes(findings_raw, expected_run_id=run_id)
         task = score_task(challenge, findings, replay_confirmed=replay_confirmed)
+        agent_name, agent_version = findings.agent_name, findings.agent_version
     except FindingsError as exc:
         parse_error = str(exc)
 
@@ -153,6 +162,8 @@ def assemble_result(
         timed_out=timed_out,
         duration_ms=duration_ms,
         parse_error=parse_error,
+        agent_name=agent_name,
+        agent_version=agent_version,
     )
 
 

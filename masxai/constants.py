@@ -277,3 +277,34 @@ SECURITY_BLOB_DOWNLOAD_TIMEOUT_S = 900
 SECURITY_BLOB_HOST_ENV = "MASXAI_SECURITY_BLOB_HOST"
 SECURITY_BLOB_PORT_ENV = "MASXAI_SECURITY_BLOB_PORT"
 SECURITY_BLOB_PORT = 8912
+
+# --- security-track marketplace publishing -----------------------------
+# The security validator publishes METADATA AND SCORES of qualifying agents to
+# the marketplace backend (BACKEND_FLOW.md): never the agent's code, image,
+# blob URL or any reference that would let a peer fetch it. Unset base URL or
+# token is the kill switch, exactly like the LLM-key client and the Discord
+# notifier: masxai/marketplace_client.py's factory returns None and the
+# validator never calls the backend.
+MARKETPLACE_BASE_URL_ENV = "MASXAI_MARKETPLACE_BASE_URL"
+MARKETPLACE_TOKEN_ENV = "MASXAI_MARKETPLACE_TOKEN"
+MARKETPLACE_AGENTS_PATH = "/api/internal/agents"      # POST, bearer token, upsert by agent id
+MARKETPLACE_TIMEOUT_ENV = "MASXAI_MARKETPLACE_TIMEOUT_SECONDS"
+MARKETPLACE_TIMEOUT = 10.0                             # short: a push must never hold up a round
+MARKETPLACE_MAX_RETRIES = 3                            # on 429 / 5xx / network error
+
+# An agent ENTERS the marketplace when its miner's cross-category aggregate --
+# the same freshness-filtered mean that feeds weights -- reaches this score.
+# The aggregate is an EMA, so after any imperfect run it approaches 1.0 but
+# never lands on it exactly; the tolerance lets a miner that has recovered with
+# a run of perfect evaluations count as 1.0 instead of being locked out.
+# Once listed, every later evaluation of that agent is pushed too, so the
+# marketplace shows its real trajectory rather than freezing at the entry score.
+MARKETPLACE_MIN_SCORE_ENV = "MASXAI_MARKETPLACE_MIN_SCORE"
+MARKETPLACE_MIN_SCORE = 1.0
+MARKETPLACE_SCORE_TOLERANCE_ENV = "MASXAI_MARKETPLACE_SCORE_TOLERANCE"
+MARKETPLACE_SCORE_TOLERANCE = 1e-3
+
+# Where the validator remembers which agent ids it has already listed, so a
+# restart keeps pushing their follow-up evaluations.
+MARKETPLACE_LISTED_FILE_ENV = "MASXAI_MARKETPLACE_LISTED_FILE"
+MARKETPLACE_LISTED_FILE = "security_marketplace_listed.json"

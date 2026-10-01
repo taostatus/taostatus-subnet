@@ -123,3 +123,32 @@ Three pillars, all needed, all in place for the SQLi grading:
 (reusing the existing per-epoch machinery) — the two are deliberately separate.
 
 See `secqurityVali/README.md` for the full internals.
+
+## Marketplace publishing
+
+The validator is the only party that knows an agent's scores, so after each
+round it pushes **metadata and scores** of qualifying agents to the marketplace
+backend (`BACKEND_FLOW.md`): `POST /api/internal/agents`, bearer token, upsert
+by agent id. The backend keeps the run history and derives safe-rate,
+average requests and variants from it.
+
+- **Who qualifies.** An agent enters when its miner's **cross-category
+  aggregate** -- the same freshness-filtered mean that feeds weights -- reaches
+  `MASXAI_MARKETPLACE_MIN_SCORE` (default 1.0, within a small tolerance because
+  the aggregate is an EMA). Once listed, every later evaluation of that agent is
+  pushed too, so the marketplace shows its real trajectory. The listed set is
+  persisted in `security_marketplace_listed.json`.
+- **What is sent.** Agent id (the intake digest), miner hotkey and uid,
+  netuid/mechid, the agent's self-reported name/version, the aggregate, the
+  per-category scores, and the run just scored (category, variant, score,
+  safe, requests, duration). **Never** a blob URL, image reference, ciphertext
+  hash, image id, layers, logs or findings. `assert_publishable()` enforces
+  this on every outgoing record.
+- **Failure policy.** Best-effort by construction: bounded timeout, a few
+  retries, never raises, never touches scoring or weight-setting. Records are
+  sent after the evaluation loop so a slow backend cannot eat the round budget.
+- **Kill switch.** Unset `MASXAI_MARKETPLACE_BASE_URL` or
+  `MASXAI_MARKETPLACE_TOKEN` and nothing is built or sent.
+
+The wire schema lives in one function, `masxai/marketplace_client.py::
+build_agent_payload()`; align its field names with the backend's `docs/API.md`.
