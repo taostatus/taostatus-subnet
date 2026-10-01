@@ -19,6 +19,10 @@ export MASXAI_QUERY_VALIDATOR_UIDS=true
 # burn at a valid uid here -- otherwise burn allocation fails and set_weights is
 # skipped, and nothing reaches the chain.
 export MASXAI_BURN_UID=0
+# Marketplace publishing (metadata + scores of agents whose aggregate reaches
+# 1.0). Leave both unset to keep it off. Values live on the host, not in git.
+# export MASXAI_MARKETPLACE_BASE_URL=https://<marketplace-backend>
+# export MASXAI_MARKETPLACE_TOKEN=<shared-secret>
 
 exec sg docker -c '/home/aman/taostatus-subnet/.venv/bin/python neurons/security_validator.py \
   --netuid 501 --subtensor.network test \

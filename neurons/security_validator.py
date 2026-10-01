@@ -30,6 +30,8 @@ import tempfile
 import time
 import urllib.request
 import uuid
+from dataclasses import dataclass
+from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -43,6 +45,13 @@ from masxai.agent_crypto import (
 )
 from masxai.bt_compat import bt
 from masxai.env import load_env
+from masxai.marketplace_client import (
+    build_agent_payload,
+    load_listed,
+    open_marketplace_client_from_env,
+    save_listed,
+    should_publish,
+)
 from secqurityVali import db, docker_ops
 from secqurityVali.category_scores import CategoryScores
 from secqurityVali.docker_ops import docker_available
@@ -63,6 +72,26 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, default))
     except (TypeError, ValueError):
         return default
+
+
+@dataclass
+class EvalOutcome:
+    """What one miner's evaluation produced, kept together so the round can
+    both score it and (if it qualifies) publish it.
+
+    reward    float, or None meaning "our fault, do not score" (retryable)
+    detail    short summary for the round log
+    category  the vulnerability category the run tested; None when no job ran
+    agent_id  the intake agent digest -- the agent's stable identity, and the
+              id the marketplace upserts by
+    job       the JobResult when the isolated job ran, else None
+    """
+
+    reward: Optional[float]
+    detail: str
+    category: Optional[str]
+    agent_id: Optional[str] = None
+    job: Any = None
 
 
 class SecurityValidator(BaseValidatorNeuron):
@@ -110,6 +139,23 @@ class SecurityValidator(BaseValidatorNeuron):
             C.SECURITY_ROUND_BUDGET_SECONDS_ENV, C.SECURITY_ROUND_BUDGET_SECONDS
         )
         self._forward_pace_s = 5.0
+
+        # Marketplace publishing (BACKEND_FLOW.md). None when unconfigured --
+        # the kill switch; the round then never builds or sends a record. Only
+        # metadata + scores ever go out (see masxai/marketplace_client.py).
+        self._marketplace = open_marketplace_client_from_env()
+        self._marketplace_min_score = _env_float(
+            C.MARKETPLACE_MIN_SCORE_ENV, C.MARKETPLACE_MIN_SCORE
+        )
+        self._marketplace_tolerance = _env_float(
+            C.MARKETPLACE_SCORE_TOLERANCE_ENV, C.MARKETPLACE_SCORE_TOLERANCE
+        )
+        # Agent ids already listed: once in, every later evaluation is pushed.
+        self._listed_agents_path = os.getenv(
+            C.MARKETPLACE_LISTED_FILE_ENV, C.MARKETPLACE_LISTED_FILE
+        )
+        self._listed_agents: set[str] = load_listed(self._listed_agents_path)
+
         if not docker_available():
             bt.logging.warning(
                 "security-validator: docker daemon is not reachable -- rounds will "
@@ -118,7 +164,9 @@ class SecurityValidator(BaseValidatorNeuron):
         bt.logging.info(
             f"Security validator initialized | db={self.db_path} "
             f"pubkey_id={self._pubkey_id} "
-            f"netuid={getattr(self.config, 'netuid', '?')}"
+            f"netuid={getattr(self.config, 'netuid', '?')} "
+            f"marketplace={'on' if self._marketplace else 'off'} "
+            f"listed_agents={len(self._listed_agents)}"
         )
 
     def _load_or_create_keypair(self) -> None:
@@ -185,8 +233,8 @@ class SecurityValidator(BaseValidatorNeuron):
         work can take minutes, so it runs in a thread; doing it inline would
         freeze the validator's async loop.
 
-        Returns (reward, detail): reward is a float, or None meaning "our fault,
-        do not score" (a Docker/orchestration failure, retryable).
+        Returns an EvalOutcome; its reward is a float, or None meaning "our
+        fault, do not score" (a Docker/orchestration failure, retryable).
         """
         def work():
             conn = db.connect(self.db_path)
@@ -199,7 +247,12 @@ class SecurityValidator(BaseValidatorNeuron):
                     # a bad or duplicate image is the miner's verdict; a docker
                     # outage during intake is our fault (reward_for_verdict -> None).
                     # No job ran, so there is no category to file this under.
-                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}", None
+                    return EvalOutcome(
+                        reward_for_verdict(verdict),
+                        f"intake:{verdict.stage_reached.value}",
+                        None,
+                        agent_id=verdict.agent_digest,
+                    )
 
                 # 2. full evaluation: sandboxed run, task + safety scoring
                 job = run_job(image_ref)
@@ -209,7 +262,10 @@ class SecurityValidator(BaseValidatorNeuron):
                     f"task={job.task.score if job.task else None} safe={job.safe} "
                     f"requests={job.request_count}"
                 )
-                return reward, detail, (job.category or None)
+                return EvalOutcome(
+                    reward, detail, job.category or None,
+                    agent_id=verdict.agent_digest, job=job,
+                )
             finally:
                 conn.close()
 
@@ -220,7 +276,7 @@ class SecurityValidator(BaseValidatorNeuron):
 
         The decrypted tarball goes through the same STRONG tarball intake as a
         file submission (FILE -> STRUCTURE -> LOAD -> INSPECT), then the full
-        isolated job. Returns (reward, detail); reward None means our own
+        isolated job. Returns an EvalOutcome; reward None means our own
         (retryable) fault. A failed or corrupt download is our fault; a blob
         that will not decrypt for our key is the miner's (they must encrypt for
         the key we advertised), so that scores 0.
@@ -233,13 +289,13 @@ class SecurityValidator(BaseValidatorNeuron):
                 try:
                     blob = self._download_blob(blob_url)
                 except Exception as e:  # noqa: BLE001 - network/host issue, retryable
-                    return None, f"download_failed:{type(e).__name__}", None
+                    return EvalOutcome(None, f"download_failed:{type(e).__name__}", None)
                 if ciphertext_sha256 and hashlib.sha256(blob).hexdigest() != ciphertext_sha256:
-                    return None, "sha256_mismatch", None  # truncated/corrupt -> retry
+                    return EvalOutcome(None, "sha256_mismatch", None)  # truncated/corrupt -> retry
                 try:
                     tar = decrypt_agent(blob, self._priv_b64)
                 except AgentCryptoError:
-                    return 0.0, "decrypt_failed", None  # miner's fault, deterministic
+                    return EvalOutcome(0.0, "decrypt_failed", None)  # miner's fault, deterministic
 
                 fd, tar_path = tempfile.mkstemp(prefix="secval-agent-", suffix=".tar")
                 with os.fdopen(fd, "wb") as fh:
@@ -250,7 +306,12 @@ class SecurityValidator(BaseValidatorNeuron):
                     conn, tar_path, miner_id, from_registry=False, skip_dry_run=True
                 )
                 if not verdict.accepted:
-                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}", None
+                    return EvalOutcome(
+                        reward_for_verdict(verdict),
+                        f"intake:{verdict.stage_reached.value}",
+                        None,
+                        agent_id=verdict.agent_digest,
+                    )
 
                 # 2. load the validated image for a runnable ref, then evaluate
                 image_ref = docker_ops.load_image(tar_path)
@@ -261,7 +322,10 @@ class SecurityValidator(BaseValidatorNeuron):
                     f"task={job.task.score if job.task else None} safe={job.safe} "
                     f"requests={job.request_count}"
                 )
-                return reward, detail, (job.category or None)
+                return EvalOutcome(
+                    reward, detail, job.category or None,
+                    agent_id=verdict.agent_digest, job=job,
+                )
             finally:
                 if image_ref:
                     docker_ops.remove_image(image_ref)
@@ -327,6 +391,7 @@ class SecurityValidator(BaseValidatorNeuron):
 
         rewards: dict[int, float] = {}
         skipped: list[int] = []
+        pending_pushes: list[dict] = []   # marketplace records, sent after the loop
         answered = 0
         budget_reached = False
         round_started = time.monotonic()
@@ -353,17 +418,18 @@ class SecurityValidator(BaseValidatorNeuron):
                 if blob_url:
                     # primary path: encrypted blob, opaque to peers
                     cipher_sha = (getattr(resp, "ciphertext_sha256", "") or "").strip()
-                    reward, detail, category = await self._evaluate_blob(blob_url, cipher_sha, hotkey)
+                    outcome = await self._evaluate_blob(blob_url, cipher_sha, hotkey)
                     submitted = blob_url
                 elif image_ref:
                     # fallback path: plaintext registry reference
-                    reward, detail, category = await self._evaluate(image_ref, hotkey)
+                    outcome = await self._evaluate(image_ref, hotkey)
                     submitted = image_ref
                 else:
                     continue  # answered has_agent=True but sent nothing usable
             except Exception as e:  # noqa: BLE001 - never let one miner break the round
                 bt.logging.warning(f"security-validator: uid={uid} evaluation errored: {e}")
                 continue
+            reward, detail, category = outcome.reward, outcome.detail, outcome.category
             if reward is None:
                 # our fault (docker/orchestration) -- retryable, not the miner's
                 skipped.append(int(uid))
@@ -386,11 +452,19 @@ class SecurityValidator(BaseValidatorNeuron):
                 f"security-validator: uid={uid} raw={reward} cat={category} "
                 f"agg={agg:.3f} ({detail}) src={submitted}"
             )
+            # Marketplace: decide now (the aggregate and the job are in hand),
+            # send after the loop so a slow backend never eats eval budget.
+            self._queue_marketplace_push(
+                pending_pushes, uid=int(uid), hotkey=hotkey, outcome=outcome,
+                aggregate=agg, now=now,
+            )
 
         if rewards or skipped:
             # persist the matrix (best-effort) after folding in this round
             self._cat_scores.prune(set(self.metagraph.hotkeys))
             self._cat_scores.save(self._cat_scores_path)
+
+        published = await self._publish_pending(pending_pushes)
 
         if skipped:
             bt.logging.info(
@@ -409,9 +483,83 @@ class SecurityValidator(BaseValidatorNeuron):
         bt.logging.info(
             f"security-validator round | asked={len(miner_uids)} answered={answered} "
             f"scored={len(rewards)} skipped={len(skipped)} "
+            f"published={published}/{len(pending_pushes)} "
             f"budget_reached={budget_reached}"
         )
         self.last_security_round_at = now
+
+    # ------------------------------------------------------- marketplace
+    def _queue_marketplace_push(
+        self, pending: list[dict], *, uid: int, hotkey: str,
+        outcome: EvalOutcome, aggregate: float, now: float,
+    ) -> None:
+        """Decide whether this evaluation goes to the marketplace and, if so,
+        build its record now while the data is in hand. The gate is the
+        cross-category aggregate -- the very number that feeds weights -- so
+        "score 1" on the marketplace means the same thing as "score 1" on chain.
+        Never raises: a payload problem is logged and that record is dropped.
+        """
+        client = getattr(self, "_marketplace", None)
+        if client is None or outcome.job is None:
+            return  # feature off, or no isolated run happened (nothing to list)
+        listed = getattr(self, "_listed_agents", None)
+        if listed is None:
+            listed = self._listed_agents = set()
+        if not should_publish(
+            aggregate=aggregate,
+            agent_id=outcome.agent_id,
+            listed=listed,
+            min_score=getattr(self, "_marketplace_min_score", C.MARKETPLACE_MIN_SCORE),
+            tolerance=getattr(self, "_marketplace_tolerance", C.MARKETPLACE_SCORE_TOLERANCE),
+        ):
+            return
+        # Listed from now on, so later (possibly lower) evaluations are pushed
+        # too and the marketplace shows the agent's real trajectory. Marked
+        # before the push, so a failed push is simply retried by the next
+        # evaluation rather than silently un-listing the agent.
+        listed.add(outcome.agent_id)
+        try:
+            record = build_agent_payload(
+                agent_id=outcome.agent_id,
+                miner_hotkey=hotkey,
+                miner_uid=uid,
+                netuid=int(getattr(self.config, "netuid", 0) or 0),
+                mechid=int(getattr(self, "mechid", 0) or 0),
+                validator_hotkey=self.wallet.hotkey.ss58_address,
+                overall_score=aggregate,
+                category_scores={
+                    cat: score
+                    for cat in self._active_categories
+                    if (score := self._cat_scores.category_score(hotkey, cat)) is not None
+                },
+                job=outcome.job,
+                evaluated_at=now,
+            )
+        except Exception as e:  # noqa: BLE001 - a record problem must not touch scoring
+            bt.logging.warning(f"security-validator: uid={uid} marketplace record skipped: {e}")
+            return
+        pending.append(record)
+
+    async def _publish_pending(self, pending: list[dict]) -> int:
+        """Send this round's marketplace records concurrently; return how many
+        the backend accepted. Best-effort by construction (the client never
+        raises), and the listed set is persisted so a restart keeps pushing."""
+        client = getattr(self, "_marketplace", None)
+        if client is None or not pending:
+            return 0
+        results = await asyncio.gather(
+            *(client.push_agent(record) for record in pending), return_exceptions=True
+        )
+        published = sum(1 for r in results if r is True)
+        if published < len(pending):
+            bt.logging.warning(
+                f"security-validator: marketplace accepted {published}/{len(pending)} "
+                "record(s); the rest retry on the agents' next evaluation"
+            )
+        path = getattr(self, "_listed_agents_path", None)
+        if path:
+            save_listed(path, getattr(self, "_listed_agents", set()))
+        return published
 
     def _recompute_all_scores(self, now: float) -> dict[int, float]:
         """{uid: score} for every miner that has category history, each the

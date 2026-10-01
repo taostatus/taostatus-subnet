@@ -7,6 +7,7 @@ evaluation produced (with a None reward -- our fault -- left unscored).
 """
 
 import asyncio
+import hashlib
 import tempfile
 import types
 
@@ -52,14 +53,24 @@ def make_validator(responses, reward_by_ref):
     v._round_task = None
     v._round_budget_s = 1e9      # effectively unbounded for tests
     v._forward_pace_s = 0.0
+    # marketplace publishing: off unless a test installs a fake client
+    v._marketplace = None
+    v._listed_agents = set()
+    v._listed_agents_path = tempfile.mktemp(suffix=".json")
+    v._marketplace_min_score = 1.0
+    v._marketplace_tolerance = 1e-3
 
     async def fake_dendrite(axons, synapse, deserialize, timeout):
         return responses
     v.dendrite = fake_dendrite
 
-    # _evaluate returns (reward, detail, category); reward None means "our fault"
+    # _evaluate returns an EvalOutcome; reward None means "our fault"
     async def fake_evaluate(image_ref, miner_id):
-        return (reward_by_ref[image_ref], "faked", "sqli")
+        reward = reward_by_ref[image_ref]
+        return sv.EvalOutcome(
+            reward, "faked", "sqli",
+            agent_id=aid(image_ref), job=fake_job(reward),
+        )
     v._evaluate = fake_evaluate
 
     v.captured = None
@@ -69,6 +80,36 @@ def make_validator(responses, reward_by_ref):
     v._update_from_rewards = fake_apply
 
     return v
+
+
+def aid(image_ref):
+    """A realistic agent id: the intake digest is a sha256 hex, never a ref."""
+    return hashlib.sha256(image_ref.encode()).hexdigest()
+
+
+def fake_job(score, *, safe=True, variant="union"):
+    """A JobResult stand-in with just what scoring and publishing read."""
+    task = None if score is None else types.SimpleNamespace(score=float(score))
+    return types.SimpleNamespace(
+        run_id="run-1", category="sqli", variant=variant, safe=safe,
+        accepted=bool(task and task.score > 0 and safe), request_count=42,
+        duration_ms=1234, agent_name="demo-agent", agent_version="0.3", task=task,
+    )
+
+
+class FakeMarketplace:
+    """Records what the round would have sent to the backend."""
+
+    def __init__(self, ok=True, raise_exc=False):
+        self.pushed = []
+        self.ok = ok
+        self.raise_exc = raise_exc
+
+    async def push_agent(self, payload):
+        if self.raise_exc:
+            raise RuntimeError("backend exploded")
+        self.pushed.append(payload)
+        return self.ok
 
 
 def resp(has_agent, image_ref=""):
@@ -93,7 +134,7 @@ def test_encrypted_blob_path_is_scored():
     called = {}
     async def fake_blob(blob_url, cipher_sha, miner_id):
         called["args"] = (blob_url, cipher_sha, miner_id)
-        return (0.8, "faked-blob", "sqli")
+        return sv.EvalOutcome(0.8, "faked-blob", "sqli")
     v._evaluate_blob = fake_blob
 
     asyncio.run(v.security_round())
@@ -212,3 +253,97 @@ def test_forward_does_not_start_overlapping_rounds():
         assert len(calls) == 1
         await v._round_task
     asyncio.run(drive())
+
+
+# --- marketplace publishing ------------------------------------------
+
+def test_perfect_aggregate_is_published_to_marketplace():
+    """The gate is the cross-category aggregate: the uid at 1.0 is pushed with
+    metadata + scores; the uid at 0.5 is not. Scoring is unchanged either way."""
+    responses = [resp(True, "ghcr.io/a:1"), resp(True, "ghcr.io/b:1")]
+    v = make_validator(responses, {"ghcr.io/a:1": 1.0, "ghcr.io/b:1": 0.5})
+    mp = FakeMarketplace()
+    v._marketplace = mp
+
+    asyncio.run(v.security_round())
+
+    assert [p["agent_id"] for p in mp.pushed] == [aid("ghcr.io/a:1")]
+    rec = mp.pushed[0]
+    assert rec["miner_uid"] == 1 and rec["miner_hotkey"] == "miner-1"
+    assert rec["netuid"] == 501 and rec["mechid"] == 1
+    assert rec["validator_hotkey"] == "us-hotkey"
+    assert rec["overall_score"] == 1.0 and rec["category_scores"] == {"sqli": 1.0}
+    assert rec["run"]["score"] == 1.0 and rec["run"]["safe"] is True
+    assert rec["run"]["variant"] == "union" and rec["run"]["requests"] == 42
+    assert rec["name"] == "demo-agent" and rec["version"] == "0.3"
+    assert aid("ghcr.io/a:1") in v._listed_agents
+    assert dict(zip(v.captured[1], v.captured[0])) == {1: 1.0, 2: 0.5}
+
+
+def test_payload_never_carries_anything_fetchable():
+    """Nothing in a record lets a peer locate or pull the agent."""
+    import json
+    v = make_validator([resp(True, "ghcr.io/a:1")], {"ghcr.io/a:1": 1.0})
+    mp = FakeMarketplace()
+    v._marketplace = mp
+    asyncio.run(v.security_round())
+    flat = json.dumps(mp.pushed[0]).lower()
+    for forbidden in ("ghcr.io", "blob", "image", "ciphertext", "layer", "url"):
+        assert forbidden not in flat, forbidden
+
+
+def test_aggregate_below_one_is_not_published():
+    """A perfect sqli run with xss untested is an aggregate of 0.5 -> not listed.
+    Breadth gates the marketplace exactly as it gates weight."""
+    v = make_validator([resp(True, "ghcr.io/a:1")], {"ghcr.io/a:1": 1.0})
+    v._active_categories = ("sqli", "xss")
+    mp = FakeMarketplace()
+    v._marketplace = mp
+    asyncio.run(v.security_round())
+    assert mp.pushed == [] and v._listed_agents == set()
+
+
+def test_listed_agent_keeps_being_published_after_a_drop():
+    """Once listed, a later worse evaluation is pushed too, so the marketplace
+    shows the agent's real trajectory instead of freezing at 1.0."""
+    v = make_validator([resp(True, "ghcr.io/a:1")], {"ghcr.io/a:1": 0.0})
+    v._listed_agents = {aid("ghcr.io/a:1")}
+    mp = FakeMarketplace()
+    v._marketplace = mp
+    asyncio.run(v.security_round())
+    assert len(mp.pushed) == 1
+    assert mp.pushed[0]["overall_score"] == 0.0 and mp.pushed[0]["run"]["score"] == 0.0
+
+
+def test_marketplace_failure_never_changes_scores():
+    v = make_validator([resp(True, "ghcr.io/a:1")], {"ghcr.io/a:1": 1.0})
+    v._marketplace = FakeMarketplace(raise_exc=True)
+    asyncio.run(v.security_round())          # must not raise
+    assert dict(zip(v.captured[1], v.captured[0])) == {1: 1.0}
+    assert aid("ghcr.io/a:1") in v._listed_agents   # retried on next evaluation
+
+
+def test_no_marketplace_client_means_nothing_is_listed():
+    v = make_validator([resp(True, "ghcr.io/a:1")], {"ghcr.io/a:1": 1.0})
+    assert v._marketplace is None
+    asyncio.run(v.security_round())
+    assert v._listed_agents == set()
+
+
+def test_our_fault_run_is_never_published():
+    """A None reward (docker/orchestration failure) is not a statement about
+    the agent, so even a listed agent gets no record for it."""
+    v = make_validator([resp(True, "ghcr.io/a:1")], {"ghcr.io/a:1": None})
+    v._listed_agents = {aid("ghcr.io/a:1")}
+    mp = FakeMarketplace()
+    v._marketplace = mp
+    asyncio.run(v.security_round())
+    assert mp.pushed == []
+
+
+def test_listed_set_is_persisted_after_a_push():
+    from masxai.marketplace_client import load_listed
+    v = make_validator([resp(True, "ghcr.io/a:1")], {"ghcr.io/a:1": 1.0})
+    v._marketplace = FakeMarketplace()
+    asyncio.run(v.security_round())
+    assert load_listed(v._listed_agents_path) == {aid("ghcr.io/a:1")}
