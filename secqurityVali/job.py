@@ -164,6 +164,19 @@ def _run(args: list[str], timeout: int) -> subprocess.CompletedProcess:
     )
 
 
+def _blackhole_resolv() -> str:
+    """Write a resolv.conf that resolves nothing (a dead loopback nameserver),
+    to bind-mount read-only over the agent's /etc/resolv.conf. This -- not
+    `--dns` -- is what actually disables DNS (see _agent_create_args). The file
+    lives outside the agent-writable /out mount so the agent cannot rewrite it.
+    Returns the path; the caller removes it on teardown."""
+    fd, path = tempfile.mkstemp(prefix="secval-resolv-")
+    with os.fdopen(fd, "w") as fh:
+        fh.write("nameserver 127.0.0.1\n")
+    os.chmod(path, 0o444)
+    return path
+
+
 def _network_create(name: str) -> None:
     _run(["network", "create", "--internal", name], timeout=C.DOCKER_CLI_TIMEOUT_S)
 
@@ -182,7 +195,8 @@ def _container_ip(name: str, network: str) -> str:
     return (res.stdout or "").strip()
 
 
-def _agent_create_args(name, network, agent_image, target_ip, out_dir, run_id, timeout_s):
+def _agent_create_args(name, network, agent_image, target_ip, out_dir, run_id, timeout_s,
+                       resolv_path):
     """The full agent invocation. Like the dry-run's flags, but on the job
     network with the target reachable, /out mounted, and the challenge context
     in the environment. Built as a list so a test can assert on it."""
@@ -190,9 +204,15 @@ def _agent_create_args(name, network, agent_image, target_ip, out_dir, run_id, t
         "create", "--name", name,
         "--runtime", C.JOB_AGENT_RUNTIME,
         "--network", network,
-        # target reachable by IP; DNS pointed at nothing so no name resolution
-        # and no DNS-based exfiltration.
+        # DNS is fully disabled. On a user-defined network docker injects its own
+        # embedded resolver (127.0.0.11), which resolves EXTERNAL names via the
+        # daemon even on an --internal network with no egress -- a DNS-exfiltration
+        # channel. `--dns` alone does NOT close it (verified on the isolation host:
+        # external names still resolved). Bind-mounting a blackhole resolv.conf
+        # read-only over /etc/resolv.conf replaces the embedded resolver entirely,
+        # so no name resolution happens at all; the target is reached by IP.
         "--dns", "127.0.0.1",
+        "--mount", f"type=bind,src={resolv_path},dst=/etc/resolv.conf,readonly",
         "--memory", C.DRY_RUN_MEMORY,
         "--memory-swap", C.DRY_RUN_MEMORY_SWAP,
         "--cpus", str(C.DRY_RUN_CPUS),
@@ -239,6 +259,7 @@ def run_job(
         os.chmod(out_dir, 0o777)
     except OSError:
         pass
+    resolv_path = _blackhole_resolv()   # read-only /etc/resolv.conf: no DNS at all
     started = time.monotonic()
     agent_cid = ""
 
@@ -264,7 +285,7 @@ def run_job(
         # agent, under the monitored runtime
         created = _run(
             _agent_create_args(agent_name, network, agent_image, target_ip, out_dir,
-                               run_id, timeout_s),
+                               run_id, timeout_s, resolv_path),
             timeout=C.DOCKER_CLI_TIMEOUT_S,
         )
         if created.returncode != 0:
@@ -315,6 +336,10 @@ def run_job(
             _rm_container(target_name)
             _network_remove(network)
             shutil.rmtree(out_dir, ignore_errors=True)
+            try:
+                os.unlink(resolv_path)
+            except OSError:
+                pass
 
 
 def _maybe_replay(challenge: Challenge, findings_raw: bytes) -> bool:
