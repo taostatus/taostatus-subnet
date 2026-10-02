@@ -231,6 +231,15 @@ SECURITY_ROUND_BUDGET_SECONDS = 240
 SECURITY_DB_PATH_ENV = "MASXAI_SECURITY_DB_PATH"
 SECURITY_DB_PATH = "secqurityVali.db"
 
+# --- marketplace handoff (catalog backend) -----------------------------
+# After scoring, the validator pushes each agent's METADATA + SCORES (never the
+# image/code) to the marketplace backend, which the frontend reads. Both unset
+# => the push is a no-op, so the validator runs fine without a backend.
+MARKETPLACE_URL_ENV = "MASXAI_MARKETPLACE_URL"       # e.g. http://host:8099
+MARKETPLACE_TOKEN_ENV = "MASXAI_MARKETPLACE_TOKEN"   # bearer for the internal API
+MARKETPLACE_TIMEOUT_ENV = "MASXAI_MARKETPLACE_TIMEOUT"
+MARKETPLACE_TIMEOUT = 5.0                             # short: never hold up a round
+
 # --- security-track agent encryption (v2 transport) --------------------
 # The validator's SealedBox keypair. The private half is persisted here so a
 # restart can still decrypt blobs miners encrypted for the previous ask; the

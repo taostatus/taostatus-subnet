@@ -19,6 +19,11 @@ export MASXAI_QUERY_VALIDATOR_UIDS=true
 # burn at a valid uid here -- otherwise burn allocation fails and set_weights is
 # skipped, and nothing reaches the chain.
 export MASXAI_BURN_UID=0
+# Marketplace handoff: push scored agents' metadata+scores to the catalog backend
+# (same box, port 8099). The URL is not secret, so it lives here; the TOKEN is a
+# secret and comes from the process environment (set in pm2's env at start, from
+# a gitignored file), never from this file and never committed to git.
+export MASXAI_MARKETPLACE_URL="http://127.0.0.1:8099"
 
 exec sg docker -c '/home/aman/taostatus-subnet/.venv/bin/python neurons/security_validator.py \
   --netuid 501 --subtensor.network test \

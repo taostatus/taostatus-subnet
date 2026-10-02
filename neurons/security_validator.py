@@ -43,6 +43,7 @@ from masxai.agent_crypto import (
 )
 from masxai.bt_compat import bt
 from masxai.env import load_env
+from masxai.marketplace_client import build_agent_payload, open_marketplace_client_from_env
 from secqurityVali import db, docker_ops
 from secqurityVali.category_scores import CategoryScores
 from secqurityVali.docker_ops import docker_available
@@ -100,6 +101,12 @@ class SecurityValidator(BaseValidatorNeuron):
         self._freshness_s = _env_float(
             C.SECURITY_CATEGORY_FRESHNESS_SECONDS_ENV, C.SECURITY_CATEGORY_FRESHNESS_SECONDS
         )
+
+        # Marketplace handoff: push scored agents' metadata to the catalog
+        # backend (None when not configured -> no-op). Never blocks a round.
+        self._marketplace = open_marketplace_client_from_env()
+        if self._marketplace is not None:
+            bt.logging.info("marketplace: scored agents will be published to the catalog backend")
 
         self.last_security_round_at = 0.0
         # Evaluation runs as a background task so it never blocks weight-setting
@@ -199,7 +206,7 @@ class SecurityValidator(BaseValidatorNeuron):
                     # a bad or duplicate image is the miner's verdict; a docker
                     # outage during intake is our fault (reward_for_verdict -> None).
                     # No job ran, so there is no category to file this under.
-                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}", None
+                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}", None, None
 
                 # 2. full evaluation: sandboxed run, task + safety scoring
                 job = run_job(image_ref)
@@ -209,7 +216,14 @@ class SecurityValidator(BaseValidatorNeuron):
                     f"task={job.task.score if job.task else None} safe={job.safe} "
                     f"requests={job.request_count}"
                 )
-                return reward, detail, (job.category or None)
+                run_info = {
+                    "category": job.category or None,
+                    "variant": job.variant,
+                    "task_score": job.task.score if job.task else None,
+                    "safe": job.safe,
+                    "requests": job.request_count,
+                }
+                return reward, detail, (job.category or None), run_info
             finally:
                 conn.close()
 
@@ -233,13 +247,13 @@ class SecurityValidator(BaseValidatorNeuron):
                 try:
                     blob = self._download_blob(blob_url)
                 except Exception as e:  # noqa: BLE001 - network/host issue, retryable
-                    return None, f"download_failed:{type(e).__name__}", None
+                    return None, f"download_failed:{type(e).__name__}", None, None
                 if ciphertext_sha256 and hashlib.sha256(blob).hexdigest() != ciphertext_sha256:
-                    return None, "sha256_mismatch", None  # truncated/corrupt -> retry
+                    return None, "sha256_mismatch", None, None  # truncated/corrupt -> retry
                 try:
                     tar = decrypt_agent(blob, self._priv_b64)
                 except AgentCryptoError:
-                    return 0.0, "decrypt_failed", None  # miner's fault, deterministic
+                    return 0.0, "decrypt_failed", None, None  # miner's fault, deterministic
 
                 fd, tar_path = tempfile.mkstemp(prefix="secval-agent-", suffix=".tar")
                 with os.fdopen(fd, "wb") as fh:
@@ -250,7 +264,7 @@ class SecurityValidator(BaseValidatorNeuron):
                     conn, tar_path, miner_id, from_registry=False, skip_dry_run=True
                 )
                 if not verdict.accepted:
-                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}", None
+                    return reward_for_verdict(verdict), f"intake:{verdict.stage_reached.value}", None, None
 
                 # 2. load the validated image for a runnable ref, then evaluate
                 image_ref = docker_ops.load_image(tar_path)
@@ -261,7 +275,14 @@ class SecurityValidator(BaseValidatorNeuron):
                     f"task={job.task.score if job.task else None} safe={job.safe} "
                     f"requests={job.request_count}"
                 )
-                return reward, detail, (job.category or None)
+                run_info = {
+                    "category": job.category or None,
+                    "variant": job.variant,
+                    "task_score": job.task.score if job.task else None,
+                    "safe": job.safe,
+                    "requests": job.request_count,
+                }
+                return reward, detail, (job.category or None), run_info
             finally:
                 if image_ref:
                     docker_ops.remove_image(image_ref)
@@ -327,6 +348,7 @@ class SecurityValidator(BaseValidatorNeuron):
 
         rewards: dict[int, float] = {}
         skipped: list[int] = []
+        runs_this_round: dict[str, dict] = {}   # hotkey -> this round's run info
         answered = 0
         budget_reached = False
         round_started = time.monotonic()
@@ -353,11 +375,11 @@ class SecurityValidator(BaseValidatorNeuron):
                 if blob_url:
                     # primary path: encrypted blob, opaque to peers
                     cipher_sha = (getattr(resp, "ciphertext_sha256", "") or "").strip()
-                    reward, detail, category = await self._evaluate_blob(blob_url, cipher_sha, hotkey)
+                    reward, detail, category, run_info = await self._evaluate_blob(blob_url, cipher_sha, hotkey)
                     submitted = blob_url
                 elif image_ref:
                     # fallback path: plaintext registry reference
-                    reward, detail, category = await self._evaluate(image_ref, hotkey)
+                    reward, detail, category, run_info = await self._evaluate(image_ref, hotkey)
                     submitted = image_ref
                 else:
                     continue  # answered has_agent=True but sent nothing usable
@@ -378,6 +400,8 @@ class SecurityValidator(BaseValidatorNeuron):
             # scores on the miner's standing aggregate.
             if category is not None:
                 self._cat_scores.update(hotkey, category, reward)
+            if run_info is not None:
+                runs_this_round[hotkey] = run_info
             agg = self._cat_scores.aggregate(
                 hotkey, self._active_categories, now=now, freshness_s=self._freshness_s
             )
@@ -405,6 +429,11 @@ class SecurityValidator(BaseValidatorNeuron):
         score_map = self._recompute_all_scores(now)
         if score_map:
             self._update_from_rewards(score_map)
+            # Publish metadata + scores to the catalog backend (off the loop so a
+            # slow/absent backend can't delay the round). Best-effort.
+            mp = getattr(self, "_marketplace", None)
+            if mp is not None:
+                await asyncio.to_thread(self._publish_to_marketplace, score_map, runs_this_round)
 
         bt.logging.info(
             f"security-validator round | asked={len(miner_uids)} answered={answered} "
@@ -412,6 +441,35 @@ class SecurityValidator(BaseValidatorNeuron):
             f"budget_reached={budget_reached}"
         )
         self.last_security_round_at = now
+
+    def _publish_to_marketplace(self, score_map: dict[int, float],
+                                runs: dict[str, dict] | None = None) -> None:
+        """Push each scored agent's metadata + scores to the catalog backend.
+        `runs` carries this round's per-hotkey evaluation (variant/task/safe/
+        requests) for miners evaluated this round. Runs in a worker thread;
+        best-effort (publish_agent never raises)."""
+        runs = runs or {}
+        netuid = getattr(self.config, "netuid", None)
+        mechid = getattr(self, "mechid", None)
+        published = 0
+        for uid, score in score_map.items():
+            hotkey = self.metagraph.hotkeys[int(uid)]
+            cells = self._cat_scores.cells.get(hotkey, {})
+            categories = {cat: cell["score"] for cat, cell in cells.items()}
+            payload = build_agent_payload(
+                miner_hotkey=hotkey,
+                uid=int(uid),
+                overall_score=score,
+                categories=categories,
+                status="active" if score > 0 else "stale",
+                netuid=netuid,
+                mechid=mechid,
+                run=runs.get(hotkey),
+            )
+            if self._marketplace.publish_agent(payload):
+                published += 1
+        if published:
+            bt.logging.info(f"marketplace: published {published} agent(s) to the catalog")
 
     def _recompute_all_scores(self, now: float) -> dict[int, float]:
         """{uid: score} for every miner that has category history, each the

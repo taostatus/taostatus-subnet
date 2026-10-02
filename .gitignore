@@ -173,6 +173,12 @@ secqurityVali.db
 secqurityVali.db-wal
 secqurityVali.db-shm
 
+# marketplace backend lives in its OWN repo (taostatus/marketplace-server).
+# The validator's client stays here (masxai/marketplace_client.py); the backend
+# folder is ignored so this repo never tracks it.
+marketplace.db
+marketplace_backend/
+
 # Private: reference/red-team solvers (kept local, not published so miners cannot copy)
 secqurityVali/agents/
 tests/test_secqurityvali_reference_agent.py

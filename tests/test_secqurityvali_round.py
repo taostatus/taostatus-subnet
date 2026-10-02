@@ -57,9 +57,11 @@ def make_validator(responses, reward_by_ref):
         return responses
     v.dendrite = fake_dendrite
 
-    # _evaluate returns (reward, detail, category); reward None means "our fault"
+    # _evaluate returns (reward, detail, category, run_info); reward None = our fault
     async def fake_evaluate(image_ref, miner_id):
-        return (reward_by_ref[image_ref], "faked", "sqli")
+        r = reward_by_ref[image_ref]
+        run = {"category": "sqli", "variant": "union", "task_score": r, "safe": True, "requests": 10}
+        return (r, "faked", "sqli", run)
     v._evaluate = fake_evaluate
 
     v.captured = None
@@ -93,7 +95,8 @@ def test_encrypted_blob_path_is_scored():
     called = {}
     async def fake_blob(blob_url, cipher_sha, miner_id):
         called["args"] = (blob_url, cipher_sha, miner_id)
-        return (0.8, "faked-blob", "sqli")
+        run = {"category": "sqli", "variant": "union", "task_score": 0.8, "safe": True, "requests": 10}
+        return (0.8, "faked-blob", "sqli", run)
     v._evaluate_blob = fake_blob
 
     asyncio.run(v.security_round())
