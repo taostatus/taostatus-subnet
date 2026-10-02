@@ -73,6 +73,12 @@ class BaseNeuron(ABC):
     metagraph: "bt.Metagraph"
     spec_version: int = spec_version
 
+    # The subnet mechanism this neuron belongs to. Registration, UIDs, stake and
+    # validator permits are subnet-wide, but each mechanism keeps its own weight
+    # matrix, consensus and LastUpdate. A validator subclass sets this so its
+    # weights land on its own mechanism's matrix. 0 is the primary mechanism.
+    mechid: int = 0
+
     @property
     def block(self):
         return ttl_get_block(self)
@@ -108,7 +114,9 @@ class BaseNeuron(ABC):
         else:
             self.wallet = bt.Wallet(config=self.config)
             self.subtensor = bt.Subtensor(config=self.config)
-            self.metagraph = self.subtensor.metagraph(self.config.netuid)
+            self.metagraph = self.subtensor.metagraph(
+                self.config.netuid, mechid=int(self.mechid)
+            )
 
         bt.logging.info(f"Wallet: {self.wallet}")
         bt.logging.info(f"Subtensor: {self.subtensor}")
@@ -204,6 +212,11 @@ class BaseNeuron(ABC):
             return 0
 
     def should_set_weights(self) -> bool:
+        # Miners never set weights. Checked first so a miner never pays for the
+        # chain read below.
+        if self.neuron_type == "MinerNeuron":
+            return False
+
         # Don't set weights on initialization.
         if self.step == 0:
             return False
@@ -212,12 +225,37 @@ class BaseNeuron(ABC):
         if self.config.neuron.disable_set_weights:
             return False
 
-        # Define appropriate logic for when set weights.
         return (
-            (self.block - self.metagraph.last_update[self.uid])
-            > self.config.neuron.epoch_length
-            and self.neuron_type != "MinerNeuron"
-        )  # don't set weights if you're a miner
+            self.block - self._last_weight_update_block()
+        ) > self.config.neuron.epoch_length
+
+    def _last_weight_update_block(self) -> int:
+        """The block at which this hotkey last set weights on ITS mechanism.
+
+        The SDK's metagraph fills `last_update` from neurons_lite(netuid), which
+        is mechanism 0's slot whatever mechid the metagraph was built with. For
+        mechanism 0 that is correct and is kept as-is. For any other mechanism
+        the chain keeps a separate LastUpdate row (keyed by the mechanism's
+        storage index), so it is read directly -- otherwise the security
+        validator would pace itself on the LLM-key validator's weight sets.
+
+        An unreadable or empty row returns 0 ("never set"), which only means we
+        attempt a set; the chain's own per-mechanism rate limit still applies.
+        """
+        mechid = int(getattr(self, "mechid", 0) or 0)
+        if mechid == 0 or getattr(self.config, "mock", False):
+            return int(self.metagraph.last_update[self.uid])
+        try:
+            from bittensor.utils import get_mechid_storage_index
+
+            index = get_mechid_storage_index(self.config.netuid, mechid)
+            row = self.subtensor.substrate.query(
+                "SubtensorModule", "LastUpdate", [index]
+            ).value or []
+            return int(row[self.uid]) if self.uid < len(row) else 0
+        except Exception as exc:  # noqa: BLE001 - pacing must never crash the loop
+            bt.logging.debug(f"mech{mechid} LastUpdate unreadable, assuming never set: {exc}")
+            return 0
 
     def save_state(self):
         bt.logging.trace(

@@ -113,6 +113,11 @@ class BaseValidatorNeuron(BaseNeuron):
         bt.logging.info("Building validation weights.")
         self.scores = np.zeros(self.metagraph.n, dtype=np.float32)
 
+        # Say so loudly if this validator's mechanism does not exist on chain yet:
+        # every weight set to it would be rejected until the subnet owner raises
+        # the mechanism count (scripts/setup_mechanisms.py).
+        self._check_mechanism_exists()
+
         # Init sync with the network. Updates the metagraph.
         self.sync()
 
@@ -135,6 +140,84 @@ class BaseValidatorNeuron(BaseNeuron):
         self.is_running: bool = False
         self.thread: Union[threading.Thread, None] = None
         self.lock = asyncio.Lock()
+
+    def _check_mechanism_exists(self) -> None:
+        """Warn (never fail) when this validator's mechid is not live on chain."""
+        mechid = int(getattr(self, "mechid", 0) or 0)
+        if mechid == 0 or self.config.mock:
+            return
+        try:
+            count = int(self.subtensor.get_mechanism_count(netuid=self.config.netuid))
+        except Exception as exc:  # noqa: BLE001 - a read failure is not fatal
+            bt.logging.warning(f"could not read mechanism count: {exc}")
+            return
+        if mechid >= count:
+            bt.logging.error(
+                f"netuid {self.config.netuid} has {count} mechanism(s); mechanism "
+                f"{mechid} does not exist yet, so this validator's weights will be "
+                "rejected. The subnet owner must run scripts/setup_mechanisms.py."
+            )
+        else:
+            bt.logging.info(
+                f"validator bound to mechanism {mechid} of {count} on netuid {self.config.netuid}"
+            )
+
+    def _submit_weights(self, uids, weights):
+        """Send the processed weights to this validator's mechanism.
+
+        Mechanism 0 keeps the exact path it always had: Subtensor.set_weights,
+        which retries and routes to commit-reveal when the subnet has it on.
+
+        Any other mechanism goes straight to the extrinsic. Subtensor.set_weights
+        guards its retry loop with blocks_since_last_update(netuid, uid), which
+        reads LastUpdate for the bare netuid -- mechanism 0's row. With both
+        validators on one hotkey, the mechanism-1 call would then be skipped as
+        "too soon" whenever the LLM-key validator had just set weights. Our own
+        pacing (_last_weight_update_block) already reads the right row, and the
+        chain enforces the real per-mechanism rate limit either way.
+        """
+        mechid = int(getattr(self, "mechid", 0) or 0)
+        if mechid == 0:
+            return self.subtensor.set_weights(
+                wallet=self.wallet,
+                netuid=self.config.netuid,
+                mechid=0,
+                uids=uids,
+                weights=weights,
+                wait_for_finalization=True,
+                wait_for_inclusion=True,
+                version_key=self.spec_version,
+            )
+
+        from bittensor.core.extrinsics.weights import (
+            commit_timelocked_weights_extrinsic,
+            set_weights_extrinsic,
+        )
+
+        if self.subtensor.commit_reveal_enabled(netuid=self.config.netuid):
+            return commit_timelocked_weights_extrinsic(
+                subtensor=self.subtensor,
+                wallet=self.wallet,
+                netuid=self.config.netuid,
+                mechid=mechid,
+                uids=uids,
+                weights=weights,
+                block_time=12.0,
+                version_key=self.spec_version,
+                wait_for_inclusion=True,
+                wait_for_finalization=True,
+            )
+        return set_weights_extrinsic(
+            subtensor=self.subtensor,
+            wallet=self.wallet,
+            netuid=self.config.netuid,
+            mechid=mechid,
+            uids=uids,
+            weights=weights,
+            version_key=self.spec_version,
+            wait_for_inclusion=True,
+            wait_for_finalization=True,
+        )
 
     def serve_axon(self):
         """Serve axon to enable external connections."""
@@ -378,25 +461,17 @@ class BaseValidatorNeuron(BaseNeuron):
 
         # Temporary logging showing UIDs, raw scores, and final normalized weights
         bt.logging.info(
-            f"TEMPORARY WEIGHT LOGGING:\n"
+            f"TEMPORARY WEIGHT LOGGING (mechanism {getattr(self, 'mechid', 0)}):\n"
             f"  UIDs: {uint_uids}\n"
             f"  Raw Scores: {self.scores.tolist()}\n"
             f"  Final Normalized Weights: {processed_weights.tolist()}\n"
             f"  Scaled Uint16 Weights: {uint_weights}"
         )
 
-        # Set the weights on chain via our subtensor connection. SDK versions
-        # differ here: older releases returned (success, message), while newer
-        # releases return an ExtrinsicResponse with a .success attribute.
-        response = self.subtensor.set_weights(
-            wallet=self.wallet,
-            netuid=self.config.netuid,
-            uids=uint_uids,
-            weights=uint_weights,
-            wait_for_finalization=True,
-            wait_for_inclusion=True,
-            version_key=self.spec_version,
-        )
+        # Set the weights on chain, on this validator's own mechanism. SDK
+        # versions differ here: older releases returned (success, message),
+        # while newer releases return an ExtrinsicResponse with a .success.
+        response = self._submit_weights(uint_uids, uint_weights)
         result = getattr(response, "success", None)
         if result is None:
             try:
