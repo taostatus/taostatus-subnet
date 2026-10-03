@@ -168,6 +168,13 @@ testing/
 validator_state.json
 scripts/mock_validator_state.json
 
+# security validator SECRETS + runtime state -- NEVER commit. The keypair's
+# private half decrypts every miner's agent, so leaking it compromises the whole
+# track; the rest is local runtime state.
+security_validator_key.json
+security_category_scores.json
+security_marketplace_listed.json
+
 # secqurityVali - local submission database
 secqurityVali.db
 secqurityVali.db-wal
