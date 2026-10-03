@@ -86,6 +86,29 @@ SQLI_VARIANTS = (
     "boolean_numeric",  # boolean-blind,   numeric context  (id = ...)
 )
 
+# --- command injection (cmdi) category ---------------------------------
+# A second vulnerability class. The canary lives in a file on the target; the
+# only way to read it is to execute a command through the injection, so a correct
+# canary proves real command execution (see targets/cmdi_v1/app.py).
+CATEGORY_CMDI = "cmdi"
+CMDI_INJECTION_TYPE = "command_injection"
+
+# Tool-like endpoints; exactly one is the vulnerable one per run, the rest decoys.
+CMDI_CANDIDATE_ENDPOINTS = (
+    "/api/ping", "/api/dns", "/api/trace", "/api/resolve", "/api/whois",
+    "/api/netcheck", "/api/lookup", "/api/diag", "/api/tools", "/api/status",
+)
+CMDI_PARAMS = ("host", "target", "ip", "addr", "q", "name")
+
+# Techniques within command injection, randomized per run:
+#   basic    -- raw concatenation; output returned (`; cat /flag`)
+#   filtered -- `;`/`&` stripped, so evade with `|`, `$(...)`, backticks, newline
+#   blind    -- no output; exfiltrate via a time-based oracle, char by char
+# The target app + tests support all three; `blind` is held out of generation
+# until the reference agent implements time-based extraction (then add it here).
+CMDI_VARIANTS = ("basic", "filtered")
+CMDI_VARIANTS_ALL = ("basic", "filtered", "blind")
+
 
 def _suffix() -> str:
     """A short random suffix so generated names are unique and unguessable
@@ -142,13 +165,17 @@ class Challenge:
         return asdict(self)
 
 
-def generate_challenge(*, rng: secrets.SystemRandom | None = None) -> Challenge:
-    """Build a fresh challenge. Cryptographically random by default.
+def generate_challenge(*, category: str = CATEGORY_SQLI,
+                       rng: secrets.SystemRandom | None = None) -> Challenge:
+    """Build a fresh challenge for `category`. Cryptographically random by default.
 
     `rng` exists only so a test can pin the randomness and assert on the
     result; production always uses the system CSPRNG.
     """
     rng = rng or secrets.SystemRandom()
+
+    if category == CATEGORY_CMDI:
+        return _generate_cmdi(rng)
 
     canary = secrets.token_hex(CANARY_BYTES)
 
@@ -174,4 +201,27 @@ def generate_challenge(*, rng: secrets.SystemRandom | None = None) -> Challenge:
         safe_endpoints=safe_endpoints,
         error_trap_endpoint=error_trap_endpoint,
         variant=variant,
+    )
+
+
+def _generate_cmdi(rng: secrets.SystemRandom) -> Challenge:
+    """A command-injection challenge. The canary lives in a file on the target
+    (not the DB), so `secret_table`/`secret_column` are unused here."""
+    canary = secrets.token_hex(CANARY_BYTES)
+    endpoints = list(CMDI_CANDIDATE_ENDPOINTS)
+    rng.shuffle(endpoints)
+    vulnerable_endpoint = endpoints[0]
+    safe_endpoints = tuple(endpoints[1:])
+    error_trap_endpoint = rng.choice(safe_endpoints) if safe_endpoints else ""
+    return Challenge(
+        canary=canary,
+        secret_table="",
+        secret_column="",
+        vulnerable_endpoint=vulnerable_endpoint,
+        vulnerable_parameter=rng.choice(CMDI_PARAMS),
+        injection_type=CMDI_INJECTION_TYPE,
+        category=CATEGORY_CMDI,
+        variant=rng.choice(CMDI_VARIANTS),
+        safe_endpoints=safe_endpoints,
+        error_trap_endpoint=error_trap_endpoint,
     )

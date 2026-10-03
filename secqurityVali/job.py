@@ -47,10 +47,10 @@ from secqurityVali.behavior import (
     group_violations,
     safety_verdict,
 )
-from secqurityVali.eval.challenge import Challenge, generate_challenge
+from secqurityVali.eval.challenge import CATEGORY_SQLI, Challenge, generate_challenge
 from secqurityVali.eval.findings import Findings, FindingsError, parse_findings_bytes
 from secqurityVali.eval.task_score import TaskResult, score_task
-from secqurityVali.targets.sqli_v1.provision import TARGET_IMAGE, TARGET_PORT, docker_env_args
+from secqurityVali.targets.registry import provisioner_for
 
 
 @dataclass
@@ -196,7 +196,7 @@ def _container_ip(name: str, network: str) -> str:
 
 
 def _agent_create_args(name, network, agent_image, target_ip, out_dir, run_id, timeout_s,
-                       resolv_path):
+                       resolv_path, target_port):
     """The full agent invocation. Like the dry-run's flags, but on the job
     network with the target reachable, /out mounted, and the challenge context
     in the environment. Built as a list so a test can assert on it."""
@@ -224,7 +224,7 @@ def _agent_create_args(name, network, agent_image, target_ip, out_dir, run_id, t
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
         "--label", C.DRY_RUN_LABEL,
-        "-e", f"TARGET_URL=http://{target_ip}:{TARGET_PORT}",
+        "-e", f"TARGET_URL=http://{target_ip}:{target_port}",
         "-e", f"OUTPUT_PATH={C.JOB_OUTPUT_MOUNT}/{C.JOB_FINDINGS_NAME}",
         "-e", f"RUN_ID={run_id}",
         "-e", f"TIME_BUDGET_S={timeout_s}",
@@ -235,17 +235,20 @@ def _agent_create_args(name, network, agent_image, target_ip, out_dir, run_id, t
 def run_job(
     agent_image: str,
     *,
+    category: str | None = None,
     challenge: Challenge | None = None,
     timeout_s: int = C.JOB_AGENT_TIMEOUT_S,
     keep: bool = False,
 ) -> JobResult:
     """Run one full evaluation and return its scored result.
 
-    Never raises: an orchestration failure becomes a JobResult with `error`
-    set (our fault, retryable), never an exception the caller must handle.
-    Everything created is destroyed before returning.
+    `category` selects the vulnerability class (sqli / cmdi / ...). The matching
+    target is looked up in the target registry, so the agent is graded against
+    the right vulnerable app. Never raises: an orchestration failure becomes a
+    JobResult with `error` set (our fault, retryable). Everything is torn down.
     """
-    challenge = challenge or generate_challenge()
+    challenge = challenge or generate_challenge(category=category or CATEGORY_SQLI)
+    prov = provisioner_for(challenge.category)
     run_id = uuid.uuid4().hex
     short = run_id[:12]
     network = C.JOB_NETWORK_PREFIX + short
@@ -266,10 +269,18 @@ def run_job(
     try:
         _network_create(network)
 
-        # target on the internal network, seeded with this run's challenge
+        # target on the internal network, seeded with this run's challenge.
+        # Hardened: the cmdi target in particular runs attacker-injected commands,
+        # so beyond gVisor (JOB_TARGET_RUNTIME) and the no-egress --internal net we
+        # drop all caps, forbid privilege escalation, and cap pids/memory/cpu.
         tgt = _run(
             ["run", "-d", "--name", target_name, "--network", network,
-             "--runtime", C.JOB_TARGET_RUNTIME, *docker_env_args(challenge), TARGET_IMAGE],
+             "--runtime", C.JOB_TARGET_RUNTIME,
+             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+             "--pids-limit", str(C.DRY_RUN_PIDS_LIMIT),
+             "--memory", C.DRY_RUN_MEMORY, "--memory-swap", C.DRY_RUN_MEMORY_SWAP,
+             "--cpus", str(C.DRY_RUN_CPUS),
+             *prov.docker_env_args(challenge), prov.TARGET_IMAGE],
             timeout=C.DOCKER_CLI_TIMEOUT_S,
         )
         if tgt.returncode != 0:
@@ -285,7 +296,7 @@ def run_job(
         # agent, under the monitored runtime
         created = _run(
             _agent_create_args(agent_name, network, agent_image, target_ip, out_dir,
-                               run_id, timeout_s, resolv_path),
+                               run_id, timeout_s, resolv_path, prov.TARGET_PORT),
             timeout=C.DOCKER_CLI_TIMEOUT_S,
         )
         if created.returncode != 0:
