@@ -104,10 +104,25 @@ CMDI_PARAMS = ("host", "target", "ip", "addr", "q", "name")
 #   basic    -- raw concatenation; output returned (`; cat /flag`)
 #   filtered -- `;`/`&` stripped, so evade with `|`, `$(...)`, backticks, newline
 #   blind    -- no output; exfiltrate via a time-based oracle, char by char
-# The target app + tests support all three; `blind` is held out of generation
-# until the reference agent implements time-based extraction (then add it here).
-CMDI_VARIANTS = ("basic", "filtered")
-CMDI_VARIANTS_ALL = ("basic", "filtered", "blind")
+CMDI_VARIANTS = ("basic", "filtered", "blind")
+# Blind is time-based and therefore slow (a run can take a minute+), so it is a
+# MINORITY of runs -- enough to reward agents that can do it, not so many that
+# every round drags. Weights are relative.
+CMDI_VARIANT_WEIGHTS = (4, 4, 2)   # ~40% basic, ~40% filtered, ~20% blind
+
+# --- path traversal / local file inclusion (lfi) category --------------
+# The canary lives in a file OUTSIDE the served directory; the only way to read
+# it is to traverse out through the vulnerable file-read endpoint.
+CATEGORY_LFI = "lfi"
+LFI_INJECTION_TYPE = "path_traversal"
+LFI_CANDIDATE_ENDPOINTS = (
+    "/api/download", "/api/view", "/api/file", "/api/read", "/api/doc",
+    "/api/attachment", "/api/export", "/api/media", "/api/content", "/api/fetch",
+)
+LFI_PARAMS = ("file", "path", "name", "doc", "f", "filename")
+# basic -- raw `../../flag`; filtered -- `../` stripped (nest: `....//`);
+# encoded -- literal `../` blocked but double-encoding (`%252e%252e%252f`) slips.
+LFI_VARIANTS = ("basic", "filtered", "encoded")
 
 
 def _suffix() -> str:
@@ -176,6 +191,8 @@ def generate_challenge(*, category: str = CATEGORY_SQLI,
 
     if category == CATEGORY_CMDI:
         return _generate_cmdi(rng)
+    if category == CATEGORY_LFI:
+        return _generate_lfi(rng)
 
     canary = secrets.token_hex(CANARY_BYTES)
 
@@ -221,7 +238,30 @@ def _generate_cmdi(rng: secrets.SystemRandom) -> Challenge:
         vulnerable_parameter=rng.choice(CMDI_PARAMS),
         injection_type=CMDI_INJECTION_TYPE,
         category=CATEGORY_CMDI,
-        variant=rng.choice(CMDI_VARIANTS),
+        variant=rng.choices(CMDI_VARIANTS, weights=CMDI_VARIANT_WEIGHTS)[0],
+        safe_endpoints=safe_endpoints,
+        error_trap_endpoint=error_trap_endpoint,
+    )
+
+
+def _generate_lfi(rng: secrets.SystemRandom) -> Challenge:
+    """A path-traversal / LFI challenge. The canary is a file outside base_dir;
+    `secret_table`/`secret_column` are unused here."""
+    canary = secrets.token_hex(CANARY_BYTES)
+    endpoints = list(LFI_CANDIDATE_ENDPOINTS)
+    rng.shuffle(endpoints)
+    vulnerable_endpoint = endpoints[0]
+    safe_endpoints = tuple(endpoints[1:])
+    error_trap_endpoint = rng.choice(safe_endpoints) if safe_endpoints else ""
+    return Challenge(
+        canary=canary,
+        secret_table="",
+        secret_column="",
+        vulnerable_endpoint=vulnerable_endpoint,
+        vulnerable_parameter=rng.choice(LFI_PARAMS),
+        injection_type=LFI_INJECTION_TYPE,
+        category=CATEGORY_LFI,
+        variant=rng.choice(LFI_VARIANTS),
         safe_endpoints=safe_endpoints,
         error_trap_endpoint=error_trap_endpoint,
     )

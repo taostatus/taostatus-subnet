@@ -8,13 +8,15 @@ The job orchestrator and the replay both look the target up by the challenge's
 category here, so adding a category is: new target package + one line below.
 """
 
-from secqurityVali.eval.challenge import CATEGORY_CMDI, CATEGORY_SQLI
+from secqurityVali.eval.challenge import CATEGORY_CMDI, CATEGORY_LFI, CATEGORY_SQLI
 from secqurityVali.targets.cmdi_v1 import provision as _cmdi
+from secqurityVali.targets.lfi_v1 import provision as _lfi
 from secqurityVali.targets.sqli_v1 import provision as _sqli
 
 _REGISTRY = {
     CATEGORY_SQLI: _sqli,
     CATEGORY_CMDI: _cmdi,
+    CATEGORY_LFI: _lfi,
 }
 
 

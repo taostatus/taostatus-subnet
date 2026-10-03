@@ -254,7 +254,7 @@ SECURITY_VALIDATOR_KEY_FILE = "security_validator_key.json"
 # failed category holds the mean down -- breadth is what earns. Add a category
 # here when a new target type (XSS, SSRF, ...) is introduced. Today: SQLi only,
 # so the aggregate equals the SQLi score until more are added.
-SECURITY_ACTIVE_CATEGORIES = ("sqli", "cmdi")
+SECURITY_ACTIVE_CATEGORIES = ("sqli", "cmdi", "lfi")
 
 # Where the per-miner, per-category EMA matrix is persisted (see
 # secqurityVali/category_scores.py), and the EMA weight on each new observation.
