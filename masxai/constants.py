@@ -247,6 +247,20 @@ MARKETPLACE_TIMEOUT = 5.0                             # short: never hold up a r
 MARKETPLACE_MIN_SCORE_ENV = "MASXAI_MARKETPLACE_MIN_SCORE"
 MARKETPLACE_MIN_SCORE = float(os.getenv(MARKETPLACE_MIN_SCORE_ENV, "0.8"))
 
+# --- admission reward: capability x efficiency -------------------------
+# The benchmark reward is no longer capability alone: a correct run is scaled by
+# how EFFICIENT it was (how few requests it took to solve). This breaks the tie
+# between agents that all solve the task -- a surgical agent beats a brute-forcer.
+# Efficiency uses request_count (the agent's own behaviour, roughly deterministic
+# and EMA-smoothed across runs) NOT wall-clock time (which varies per validator
+# and would break consensus). Floor keeps a correct-but-wasteful run worth
+# something; target is ~a competent agent's request budget (env-tunable, to be
+# calibrated on live data).
+SECURITY_EFFICIENCY_TARGET_REQUESTS_ENV = "MASXAI_SECURITY_EFFICIENCY_TARGET_REQUESTS"
+SECURITY_EFFICIENCY_TARGET_REQUESTS = int(os.getenv(SECURITY_EFFICIENCY_TARGET_REQUESTS_ENV, "1000"))
+SECURITY_EFFICIENCY_FLOOR_ENV = "MASXAI_SECURITY_EFFICIENCY_FLOOR"
+SECURITY_EFFICIENCY_FLOOR = float(os.getenv(SECURITY_EFFICIENCY_FLOOR_ENV, "0.6"))
+
 # --- security-track agent encryption (v2 transport) --------------------
 # The validator's SealedBox keypair. The private half is persisted here so a
 # restart can still decrypt blobs miners encrypted for the previous ask; the
