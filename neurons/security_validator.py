@@ -462,7 +462,7 @@ class SecurityValidator(BaseValidatorNeuron):
                 uid=int(uid),
                 overall_score=score,
                 categories=categories,
-                status="active" if score > 0 else "stale",
+                status="active" if score >= C.MARKETPLACE_MIN_SCORE else "stale",
                 netuid=netuid,
                 mechid=mechid,
                 run=runs.get(hotkey),

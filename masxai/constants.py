@@ -239,6 +239,13 @@ MARKETPLACE_URL_ENV = "MASXAI_MARKETPLACE_URL"       # e.g. http://host:8099
 MARKETPLACE_TOKEN_ENV = "MASXAI_MARKETPLACE_TOKEN"   # bearer for the internal API
 MARKETPLACE_TIMEOUT_ENV = "MASXAI_MARKETPLACE_TIMEOUT"
 MARKETPLACE_TIMEOUT = 5.0                             # short: never hold up a round
+# Only an agent whose cross-category aggregate reaches this is listed "active" in
+# the marketplace; below it it is marked "stale" (hidden from the active catalog).
+# So only genuinely capable, broad agents show up as sellable -- a weak, one-trick,
+# or decayed agent never appears. With N active categories a one-trick agent caps
+# at 1/N, so 0.8 effectively requires solving (nearly) every category well.
+MARKETPLACE_MIN_SCORE_ENV = "MASXAI_MARKETPLACE_MIN_SCORE"
+MARKETPLACE_MIN_SCORE = float(os.getenv(MARKETPLACE_MIN_SCORE_ENV, "0.8"))
 
 # --- security-track agent encryption (v2 transport) --------------------
 # The validator's SealedBox keypair. The private half is persisted here so a
@@ -269,7 +276,13 @@ SECURITY_CATEGORY_EMA_ALPHA = 0.5
 # fall to 0 -- so a one-time solve cannot pay forever. Rounds re-evaluate every
 # answering miner (~every submission interval), so this is several rounds long.
 SECURITY_CATEGORY_FRESHNESS_SECONDS_ENV = "MASXAI_SECURITY_CATEGORY_FRESHNESS_SECONDS"
-SECURITY_CATEGORY_FRESHNESS_SECONDS = 1800   # 30 minutes
+SECURITY_CATEGORY_FRESHNESS_SECONDS = 7200   # 2 hours
+# With several categories drawn at RANDOM per evaluation, a single agent is only
+# re-scored on one category at a time, so the window must be long enough that a
+# regularly-evaluated agent keeps EVERY category cell fresh at once (otherwise its
+# cross-category aggregate flaps as one cell ages out). 30 min was too short for 3
+# categories -- even a perfect all-rounder dipped to (1+1+0)/3 = 0.667. 2h covers
+# cycling all categories; a genuinely idle agent still decays to 0.
 
 # Bound on the encrypted blob the validator will download from a miner. A blob
 # is a docker-save tarball plus SealedBox overhead; larger than the image cap is
