@@ -185,6 +185,9 @@ secqurityVali.db-shm
 # folder is ignored so this repo never tracks it.
 marketplace.db
 marketplace_backend/
+# marketplace frontend lives in its OWN repo (taostatus/marketplace-client);
+# cloned here for local work, never tracked by this repo.
+marketplace_frontend/
 
 # Private: reference/red-team solvers (kept local, not published so miners cannot copy)
 secqurityVali/agents/
