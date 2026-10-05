@@ -63,6 +63,43 @@ _CANDIDATE_ENDPOINTS = (
     "/api/catalog",
 )
 
+# --- randomized, discoverable endpoint paths (Phase 1: real discovery) --
+# The old behaviour picked the vulnerable endpoint from the small fixed list
+# above, which an agent could simply hardcode -- "discovery" was just trying ten
+# known names. Phase 1 generates HIGH-ENTROPY paths per run (not in any fixed
+# list), so an agent cannot know them ahead of time. The target publishes a
+# standard discovery surface (index + /openapi.json) listing all of them, so a
+# genuine crawler finds the real attack surface the way it must on a real app;
+# a hardcoded-list agent now finds nothing. The randomness defeats memorisation;
+# the published surface keeps it fair.
+_PATH_PREFIXES = (
+    "api", "api/v1", "api/v2", "app", "service", "svc", "data", "core",
+    "internal", "web", "backend", "rest",
+)
+_RESOURCE_NOUNS = (
+    "inventory", "catalog", "orders", "report", "account", "record", "entry",
+    "lookup", "search", "items", "profile", "ledger", "listing", "detail",
+    "summary", "export", "query", "dataset", "resource", "node",
+)
+
+
+def _random_endpoints(rng: secrets.SystemRandom, n: int) -> list[str]:
+    """`n` unique, realistic-but-unguessable endpoint paths, e.g.
+    `/api/v2/inventory_a7f3`. The hex suffix makes the path high-entropy (not in
+    any list an agent could ship), while the words keep it looking like a real
+    route rather than an obviously-planted `/vulnerable`."""
+    seen: set[str] = set()
+    out: list[str] = []
+    while len(out) < n:
+        prefix = rng.choice(_PATH_PREFIXES)
+        noun = rng.choice(_RESOURCE_NOUNS)
+        path = f"/{prefix}/{noun}_{secrets.token_hex(2)}"
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
 INJECTION_TYPE = "sql_injection"
 
 # The broad vulnerability CLASS this challenge belongs to. The validator tracks
@@ -199,8 +236,8 @@ def generate_challenge(*, category: str = CATEGORY_SQLI,
     secret_table = f"{rng.choice(_SECRET_HOLDERS)}_{_suffix()}"
     secret_column = f"{rng.choice(_COLUMN_NOUNS)}_{_suffix()}"
 
-    endpoints = list(_CANDIDATE_ENDPOINTS)
-    rng.shuffle(endpoints)
+    # High-entropy paths the agent must DISCOVER (not a fixed list it can ship).
+    endpoints = _random_endpoints(rng, 7)
     vulnerable_endpoint = endpoints[0]
     safe_endpoints = tuple(endpoints[1:])
     # The error trap is one of the decoys, chosen at random each run.
