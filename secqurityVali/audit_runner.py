@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 
 from secqurityVali import constants as C
 from secqurityVali import job
+from secqurityVali import repo_target
 from secqurityVali import replay_confirm
 from secqurityVali.behavior import analyze, safety_verdict
 from secqurityVali.target_guard import TargetRejected, validate_target
@@ -302,3 +303,150 @@ def _agent_args(name, network, agent_image, proxy_ip, out_dir, resolv_path, run_
         "-e", f"TIME_BUDGET_S={timeout_s}",
         agent_image,
     ]
+
+
+# --- repo target: audit a customer git repo (built + run in isolation) --
+
+def _confirm_in_net(target: repo_target.RepoTarget, findings: list) -> tuple[bool, int]:
+    """Replay findings against a repo-built target from a trusted container ON its
+    internal network -- the validator host has no route to it. Reuses the exact
+    `replay_confirm` logic (repo_confirmer.py). Fails closed: any error, any
+    unparseable verdict, is (not-confirmed, 0)."""
+    data_dir = tempfile.mkdtemp(prefix="secaudit-cfm-")
+    name = C.REPO_CONFIRMER_NAME_PREFIX + uuid.uuid4().hex[:12]
+    try:
+        try:
+            os.chmod(data_dir, 0o777)
+        except OSError:
+            pass
+        with open(os.path.join(data_dir, "findings.json"), "w", encoding="utf-8") as fh:
+            json.dump(findings or [], fh)
+        args = [
+            "run", "--rm", "--name", name,
+            "--network", target.network, "--label", C.REPO_LABEL,
+            "--memory", "256m", "--cpus", "0.5", "--pids-limit", "64",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "-v", f"{repo_target.REPLAY_SCRIPT}:/app/replay_confirm.py:ro",
+            "-v", f"{repo_target.CONFIRMER_SCRIPT}:/app/repo_confirmer.py:ro",
+            "-v", f"{data_dir}:/data:ro",
+            "-e", f"TARGET_IP={target.ip}",
+            "-e", f"TARGET_PORT={target.port}",
+            "-e", f"TARGET_SCHEME={target.scheme}",
+            "-e", f"TARGET_HOST={target.ip}",
+            "-e", "FINDINGS_PATH=/data/findings.json",
+            C.REPO_UTIL_IMAGE, "python", "/app/repo_confirmer.py",
+        ]
+        res = job._run(args, timeout=C.REPO_HEALTH_TIMEOUT_S + C.DOCKER_CLI_TIMEOUT_S)
+        if res.returncode != 0:
+            return False, 0
+        out = (res.stdout or "").strip()
+        line = out.splitlines()[-1] if out else "{}"
+        verdict = json.loads(line)
+        return bool(verdict.get("confirmed")), int(verdict.get("false_positives") or 0)
+    except subprocess.TimeoutExpired:
+        job._rm_container(name)
+        return False, 0
+    except Exception:  # noqa: BLE001 - confirmation failure is fail-closed, never fatal
+        return False, 0
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def run_audit_from_repo(
+    agent_image: str,
+    repo_url: str, *,
+    ref: str | None = None,
+    subdir: str | None = None,
+    port: int | None = None,
+    env: dict | None = None,
+    git_token: str | None = None,
+    build_network: bool = True,
+    timeout_s: int = C.JOB_AGENT_TIMEOUT_S,
+    provision=None,
+    confirm=None,
+) -> AuditReport:
+    """Audit a customer's git repo: build + run it in isolation, then run the
+    agent against it on the same zero-egress network. Never raises -- any failure
+    is a `failed` report, and every container/image/network/temp file is torn
+    down before returning.
+
+    `provision`/`confirm` are injectable for tests; they default to the real
+    `repo_target.provision_repo_target` and the in-network replay confirmer.
+    """
+    provision = provision or repo_target.provision_repo_target
+    confirm = confirm or _confirm_in_net
+
+    # 1. build + run the repo as an isolated target (fails closed, self-cleans).
+    try:
+        target = provision(
+            repo_url, ref=ref, subdir=subdir, port=port, env=env,
+            git_token=git_token, build_network=build_network,
+        )
+    except repo_target.RepoError as exc:
+        return AuditReport.failed(f"repo target: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        return AuditReport.failed(f"repo target: {type(exc).__name__}: {exc}")
+
+    run_id = uuid.uuid4().hex
+    agent_name = C.JOB_AGENT_NAME_PREFIX + "ra" + run_id[:10]
+    out_dir = tempfile.mkdtemp(prefix="secaudit-out-")
+    try:
+        os.chmod(out_dir, 0o777)
+    except OSError:
+        pass
+    resolv_path = job._blackhole_resolv()
+    started = time.monotonic()
+    agent_cid = ""
+    try:
+        # 2. agent on the SAME internal network, pointed straight at the target IP
+        #    (no proxy: there is no egress to proxy -- everything stays in-network).
+        create_args = job._agent_create_args(
+            agent_name, target.network, agent_image, target.ip, out_dir, run_id,
+            timeout_s, resolv_path, target.port,
+        )
+        created = job._run(create_args, timeout=C.DOCKER_CLI_TIMEOUT_S)
+        if created.returncode != 0:
+            return AuditReport.failed(f"agent create failed: {created.stderr.strip()[:300]}")
+        agent_cid = (created.stdout or "").strip()
+        job._run(["start", agent_name], timeout=C.DOCKER_CLI_TIMEOUT_S)
+
+        timed_out = False
+        try:
+            job._run(["wait", agent_name], timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            job._run(["kill", agent_name], timeout=C.DOCKER_CLI_TIMEOUT_S)
+        duration_ms = int((time.monotonic() - started) * 1000)
+
+        # 3. collect: findings + gVisor behaviour (safety is fail-closed)
+        findings_raw = job._read_findings(out_dir)
+        behaviour = job._read_behaviour(agent_cid)
+        monitoring_available = bool(behaviour.strip())
+        safe = safety_verdict(analyze(behaviour))[0] if monitoring_available else False
+
+        # 4. confirm by in-network replay, then score (no proxy -> request_count
+        #    is not measured; the gate-first score still requires confirmed+safe).
+        findings = _parse_findings(findings_raw)
+        confirmed, false_positives = confirm(target, findings)
+        score, clean = score_audit(
+            confirmed=confirmed, safe=safe, monitoring_available=monitoring_available,
+            timed_out=timed_out, duration_ms=duration_ms, request_count=0,
+            error_count=0, false_positives=false_positives,
+        )
+        return AuditReport(
+            status="completed", confirmed=confirmed, clean=clean, safe=safe, score=score,
+            duration_ms=duration_ms, request_count=None, error_count=0,
+            false_positives=false_positives, findings=findings,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return AuditReport.failed(f"docker call timed out: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        return AuditReport.failed(f"{type(exc).__name__}: {exc}")
+    finally:
+        job._rm_container(agent_name)
+        target.teardown()
+        shutil.rmtree(out_dir, ignore_errors=True)
+        try:
+            os.unlink(resolv_path)
+        except OSError:
+            pass

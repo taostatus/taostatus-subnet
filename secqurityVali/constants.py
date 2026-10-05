@@ -193,3 +193,36 @@ JOB_FINDINGS_NAME = "findings.json"
 # JOB_OUT_DIR_MAX_BYTES we refuse it outright.
 JOB_FINDINGS_MAX_BYTES = 1 * 1024 * 1024        # 1 MiB -- larger is not a real findings doc
 JOB_OUT_DIR_MAX_BYTES = 16 * 1024 * 1024        # 16 MiB total in /out before it's treated as abuse
+
+# --- repo-build target (customer gives a git repo instead of a live URL) ---
+# The customer's repo is UNTRUSTED code. We clone it, build its single
+# Dockerfile, and run it as the audit target on an --internal (zero-egress)
+# network -- the agent reaches it on that network, so even a malicious repo
+# cannot phone home. Every step is time-, size-, and resource-capped, and the
+# whole thing (clone dir, image, container, network) is torn down afterwards.
+REPO_CLONE_TIMEOUT_S = 120                       # git clone wall-clock cap
+REPO_BUILD_TIMEOUT_S = 900                       # docker build wall-clock cap (deps can be slow)
+REPO_HEALTH_TIMEOUT_S = 90                       # wait for the app to start listening
+REPO_MAX_CLONE_BYTES = 300 * 1024 * 1024         # reject an oversized checkout (300 MiB)
+REPO_MAX_IMAGE_BYTES = 4 * 1024 * 1024 * 1024    # reject an oversized built image (4 GiB)
+REPO_DEFAULT_PORT = 8000                         # assumed app port when none declared/EXPOSEd
+# The build is heavier than the run (compilers, deps); the run is capped like any
+# other untrusted target.
+REPO_BUILD_MEMORY = "2g"
+REPO_BUILD_CPUS = "2.0"
+REPO_RUN_MEMORY = "1g"
+REPO_RUN_MEMORY_SWAP = "1g"                      # == memory: swap disabled
+REPO_RUN_CPUS = "1.0"
+REPO_RUN_PIDS_LIMIT = 256
+# Allowed git URL schemes. file:// and git:// (cleartext, often unauthenticated,
+# can target localhost) are refused -- https/ssh only.
+REPO_ALLOWED_SCHEMES = ("https", "ssh")
+REPO_IMAGE_PREFIX = "secval-repo-"
+REPO_NETWORK_PREFIX = "secval-repo-net-"
+REPO_TARGET_NAME_PREFIX = "secval-repo-tgt-"
+REPO_PROBE_NAME_PREFIX = "secval-repo-probe-"
+REPO_CONFIRMER_NAME_PREFIX = "secval-repo-cfm-"
+# A small trusted image used for the health probe and the in-network confirmer
+# (stdlib Python only -- no third-party deps).
+REPO_UTIL_IMAGE = os.getenv("MASXAI_REPO_UTIL_IMAGE", "python:3.12-alpine")
+REPO_LABEL = "secqurityvali-repo=1"              # every repo-build artifact carries this
