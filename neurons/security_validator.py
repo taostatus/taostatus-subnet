@@ -51,6 +51,7 @@ from secqurityVali.docker_ops import docker_available
 from secqurityVali.job import run_job
 from secqurityVali.pipeline import check_and_record
 from secqurityVali.reward import reward_for_job, reward_for_verdict
+from secqurityVali.target_guard import TargetRejected, validate_target
 
 try:
     from template.base.validator import BaseValidatorNeuron
@@ -245,6 +246,16 @@ class SecurityValidator(BaseValidatorNeuron):
             image_ref = None
             conn = db.connect(self.db_path)
             try:
+                # Anti-SSRF: blob_url is miner-controlled. Refuse any URL that
+                # resolves to a non-public address (loopback, private, cloud
+                # metadata) so a miner cannot turn the validator into a fetch
+                # proxy for its internal network or steal cloud credentials. A bad
+                # URL is the miner's doing, so it scores a deterministic 0 -- never
+                # a retryable "our fault" download failure.
+                try:
+                    validate_target(blob_url)
+                except TargetRejected as exc:
+                    return 0.0, f"unsafe_blob_url:{exc}", None, None
                 try:
                     blob = self._download_blob(blob_url)
                 except Exception as e:  # noqa: BLE001 - network/host issue, retryable
