@@ -430,6 +430,42 @@ class RepoTarget:
 
 # --- orchestration ------------------------------------------------------
 
+
+def provision_source_only(
+    repo_url: str, *,
+    ref: str | None = None,
+    subdir: str | None = None,
+    git_token: str | None = None,
+    clone_timeout: int = C.REPO_CLONE_TIMEOUT_S,
+) -> RepoTarget:
+    """Clone a repo's SOURCE only -- no build, no run, no network. For a static
+    code-analysis report on a repo we can't (or won't) run. Cloning executes no
+    repo code (shallow, no submodules, .git/hooks dropped, file/ext transports
+    off), so this is the safe path for any public repo. The returned RepoTarget
+    carries only `clone_dir` (repo tree at clone_dir/"src"); teardown rmtrees it.
+    Raises RepoError on a bad/unreachable/oversized repo."""
+    url = validate_repo_url(repo_url)
+    clone_dir = tempfile.mkdtemp(prefix="secval-src-")
+    target = RepoTarget(network="", name="", ip="", port=0, image_tag="",
+                        clone_dir=clone_dir)
+    try:
+        checkout = os.path.join(clone_dir, "src")
+        clone_repo(url, checkout, ref=ref, token=git_token, timeout=clone_timeout)
+        if _dir_size_exceeds(checkout, C.REPO_MAX_CLONE_BYTES):
+            raise RepoError(
+                f"repository is too large (> {C.REPO_MAX_CLONE_BYTES // (1024*1024)} MiB)"
+            )
+        # guard a subdir that escapes the clone, same as the build path
+        if subdir:
+            _resolve_context(checkout, subdir)
+        return target
+    except RepoError:
+        target.teardown()
+        raise
+    except Exception as exc:  # noqa: BLE001 - source provisioning must fail as RepoError
+        target.teardown()
+        raise RepoError(f"{type(exc).__name__}: {exc}")
+
 def provision_repo_target(
     repo_url: str, *,
     ref: str | None = None,

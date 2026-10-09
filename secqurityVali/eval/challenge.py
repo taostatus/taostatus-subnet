@@ -162,6 +162,35 @@ LFI_PARAMS = ("file", "path", "name", "doc", "f", "filename")
 LFI_VARIANTS = ("basic", "filtered", "encoded")
 
 
+# --- broken access control / IDOR (idor) category ----------------------
+# Two authenticated users (Alice, Bob). One resource endpoint is missing its
+# ownership check, so Alice can read Bob's resource by id. The canary lives in
+# Bob's resource on that endpoint -- reading it proves the access-control bypass.
+# No injection; the exploit is identity + another user's id.
+CATEGORY_IDOR = "idor"
+IDOR_ENDPOINT_POOL = (
+    "/api/notes", "/api/orders", "/api/profile", "/api/invoices",
+    "/api/messages", "/api/documents", "/api/tickets", "/api/files",
+    "/api/accounts", "/api/records",
+)
+IDOR_VARIANTS = ("basic",)          # sequential-id IDOR (more variants later)
+
+
+# --- server-side request forgery (ssrf) category -----------------------
+# A url-fetch endpoint with no SSRF protection: pointing it at an internal host
+# (loopback / cloud metadata) returns that host's content, which holds the canary.
+# Reaching the canary proves the forged server-side request. Decoys validate the
+# url and block internal hosts.
+CATEGORY_SSRF = "ssrf"
+SSRF_ENDPOINT_POOL = (
+    "/api/fetch", "/api/preview", "/api/webhook", "/api/import",
+    "/api/thumbnail", "/api/proxy", "/api/screenshot", "/api/oembed",
+    "/api/resolve", "/api/callback",
+)
+SSRF_PARAMS = ("url", "target", "uri", "link", "callback", "src")
+SSRF_VARIANTS = ("basic",)          # raw internal host (bypass variants later)
+
+
 def _suffix() -> str:
     """A short random suffix so generated names are unique and unguessable
     without being long: `vault_7f3a`."""
@@ -213,6 +242,16 @@ class Challenge:
     # out; reporting it is still a false positive.
     error_trap_endpoint: str = ""
 
+    # IDOR-only (broken access control): two Bearer sessions and the resource ids
+    # whose content holds the canary (Bob's) and a benign one (Alice's). Empty /
+    # zero for every other category, so this is backward compatible.
+    alice_token: str = ""
+    bob_token: str = ""
+    alice_id: str = ""
+    bob_id: str = ""
+    bob_resource_id: int = 0
+    alice_resource_id: int = 0
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -230,6 +269,10 @@ def generate_challenge(*, category: str = CATEGORY_SQLI,
         return _generate_cmdi(rng)
     if category == CATEGORY_LFI:
         return _generate_lfi(rng)
+    if category == CATEGORY_IDOR:
+        return _generate_idor(rng)
+    if category == CATEGORY_SSRF:
+        return _generate_ssrf(rng)
 
     canary = secrets.token_hex(CANARY_BYTES)
 
@@ -301,4 +344,57 @@ def _generate_lfi(rng: secrets.SystemRandom) -> Challenge:
         variant=rng.choice(LFI_VARIANTS),
         safe_endpoints=safe_endpoints,
         error_trap_endpoint=error_trap_endpoint,
+    )
+
+
+def _generate_idor(rng: secrets.SystemRandom) -> Challenge:
+    """A broken-access-control / IDOR challenge. The canary lives in Bob's resource
+    on the one endpoint missing its ownership check. Tokens, user ids and resource
+    ids are all per-run random; `secret_table`/`secret_column` are unused here."""
+    canary = secrets.token_hex(CANARY_BYTES)
+    endpoints = list(rng.sample(IDOR_ENDPOINT_POOL, 6))
+    vulnerable_endpoint = endpoints[0]
+    safe_endpoints = tuple(endpoints[1:])
+    # distinct resource ids (Bob's holds the canary; Alice's is benign) and
+    # distinct user ids; sequential-ish range so the agent can enumerate.
+    alice_rid, bob_rid = rng.sample(range(2, 40), 2)
+    alice_uid, bob_uid = rng.sample(range(1000, 9999), 2)
+    return Challenge(
+        canary=canary,
+        secret_table="",
+        secret_column="",
+        vulnerable_endpoint=vulnerable_endpoint,
+        vulnerable_parameter="id",
+        injection_type="",
+        category=CATEGORY_IDOR,
+        variant=rng.choice(IDOR_VARIANTS),
+        safe_endpoints=safe_endpoints,
+        error_trap_endpoint="",
+        alice_token=secrets.token_hex(16),
+        bob_token=secrets.token_hex(16),
+        alice_id=str(alice_uid),
+        bob_id=str(bob_uid),
+        alice_resource_id=alice_rid,
+        bob_resource_id=bob_rid,
+    )
+
+
+def _generate_ssrf(rng: secrets.SystemRandom) -> Challenge:
+    """An SSRF challenge. The canary sits behind an internal host the vulnerable
+    url-fetch endpoint will reach; `secret_table`/`secret_column` are unused."""
+    canary = secrets.token_hex(CANARY_BYTES)
+    endpoints = list(rng.sample(SSRF_ENDPOINT_POOL, 6))
+    vulnerable_endpoint = endpoints[0]
+    safe_endpoints = tuple(endpoints[1:])
+    return Challenge(
+        canary=canary,
+        secret_table="",
+        secret_column="",
+        vulnerable_endpoint=vulnerable_endpoint,
+        vulnerable_parameter=rng.choice(SSRF_PARAMS),
+        injection_type="ssrf",
+        category=CATEGORY_SSRF,
+        variant=rng.choice(SSRF_VARIANTS),
+        safe_endpoints=safe_endpoints,
+        error_trap_endpoint="",
     )

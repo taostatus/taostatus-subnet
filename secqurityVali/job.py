@@ -47,7 +47,9 @@ from secqurityVali.behavior import (
     group_violations,
     safety_verdict,
 )
-from secqurityVali.eval.challenge import CATEGORY_SQLI, Challenge, generate_challenge
+from secqurityVali.eval.challenge import (
+    CATEGORY_IDOR, CATEGORY_SQLI, Challenge, generate_challenge,
+)
 from secqurityVali.eval.findings import Findings, FindingsError, parse_findings_bytes
 from secqurityVali.eval.task_score import TaskResult, score_task
 from secqurityVali.targets.registry import provisioner_for
@@ -196,11 +198,19 @@ def _container_ip(name: str, network: str) -> str:
 
 
 def _agent_create_args(name, network, agent_image, target_ip, out_dir, run_id, timeout_s,
-                       resolv_path, target_port):
+                       resolv_path, target_port, extra_env=None, source_dir=None):
     """The full agent invocation. Like the dry-run's flags, but on the job
     network with the target reachable, /out mounted, and the challenge context
-    in the environment. Built as a list so a test can assert on it."""
-    return [
+    in the environment. Built as a list so a test can assert on it.
+
+    `source_dir` (optional): a host directory holding the TARGET's source, mounted
+    READ-ONLY at C.JOB_SOURCE_MOUNT so a white-box agent can analyse the code it is
+    attacking. Safe because (a) the agent is zero-egress (blackholed DNS, --internal
+    net, read-only rootfs, caps dropped) so source cannot be exfiltrated, and (b)
+    the synthetic benchmark canary is runtime-injected, never in source -- so source
+    access can never reveal the ground-truth. Only wired in the customer repo path;
+    the benchmark does not mount source, so scoring integrity is unchanged."""
+    args = [
         "create", "--name", name,
         "--runtime", C.JOB_AGENT_RUNTIME,
         "--network", network,
@@ -228,8 +238,34 @@ def _agent_create_args(name, network, agent_image, target_ip, out_dir, run_id, t
         "-e", f"OUTPUT_PATH={C.JOB_OUTPUT_MOUNT}/{C.JOB_FINDINGS_NAME}",
         "-e", f"RUN_ID={run_id}",
         "-e", f"TIME_BUDGET_S={timeout_s}",
-        agent_image,
     ]
+    # Optional READ-ONLY source mount for a white-box agent (see docstring).
+    if source_dir:
+        args += ["--mount", f"type=bind,src={source_dir},dst={C.JOB_SOURCE_MOUNT},readonly"]
+        args += ["-e", f"SECAUDIT_SOURCE_DIR={C.JOB_SOURCE_MOUNT}"]
+    # Optional extra env (e.g. white-box code-analysis hints). Values are JSON/
+    # strings we build; never anything the target controls.
+    for k, v in (extra_env or {}).items():
+        args += ["-e", f"{k}={v}"]
+    args.append(agent_image)
+    return args
+
+
+def _benchmark_agent_env(challenge: Challenge) -> dict:
+    """Per-challenge agent env for the benchmark. For IDOR the agent is given
+    Alice's session (as the SECAUDIT_CREDS token the reference agent already reads),
+    so it can authenticate and then try to reach Bob's resource. The canary still
+    lives only in Bob's data, so a session alone proves nothing -- the agent must
+    actually exploit the broken access control to extract it."""
+    if challenge.category == CATEGORY_IDOR and challenge.alice_token:
+        return {
+            "SECAUDIT_CREDS": json.dumps({
+                "mode": "token",
+                "header": "Authorization",
+                "value": f"Bearer {challenge.alice_token}",
+            })
+        }
+    return {}
 
 
 def run_job(
@@ -296,7 +332,8 @@ def run_job(
         # agent, under the monitored runtime
         created = _run(
             _agent_create_args(agent_name, network, agent_image, target_ip, out_dir,
-                               run_id, timeout_s, resolv_path, prov.TARGET_PORT),
+                               run_id, timeout_s, resolv_path, prov.TARGET_PORT,
+                               extra_env=_benchmark_agent_env(challenge)),
             timeout=C.DOCKER_CLI_TIMEOUT_S,
         )
         if created.returncode != 0:

@@ -290,7 +290,8 @@ def analyze_source(root: str) -> list[Candidate]:
             if seen_files > _MAX_FILES:
                 break
             full = os.path.join(dirpath, name)
-            rel = os.path.relpath(full, root)
+            # forward-slash, root-relative path -- portable + clean in the report
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
             out.extend(analyze_file(full, rel))
         if seen_files > _MAX_FILES:
             break

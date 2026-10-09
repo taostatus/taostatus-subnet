@@ -13,9 +13,31 @@ import pytest
 
 from secqurityVali import constants as C
 from secqurityVali.eval.challenge import Challenge
-from secqurityVali.job import _read_findings, assemble_result
+from secqurityVali.job import _agent_create_args, _read_findings, assemble_result
 
 CANARY = "cafef00ddeadbeef0011223344556677"
+
+
+def _mk_args(**over):
+    kw = dict(name="ag", network="net", agent_image="img:1", target_ip="172.30.0.9",
+              out_dir="/tmp/out", run_id="r1", timeout_s=60, resolv_path="/tmp/resolv",
+              target_port=8000)
+    kw.update(over)
+    return _agent_create_args(**kw)
+
+
+def test_agent_create_args_no_source_mount_by_default():
+    args = " ".join(_mk_args())
+    assert "SECAUDIT_SOURCE_DIR" not in args
+    assert "dst=/src" not in args
+
+
+def test_agent_create_args_mounts_source_read_only_when_given():
+    args = _mk_args(source_dir="/host/clone/src")
+    joined = " ".join(args)
+    assert "SECAUDIT_SOURCE_DIR=/src" in joined
+    # the mount is the exact host dir, at /src, read-only
+    assert any("type=bind,src=/host/clone/src,dst=/src,readonly" == x for x in args)
 
 
 def _challenge():

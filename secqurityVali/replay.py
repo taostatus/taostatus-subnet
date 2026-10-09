@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 
 from secqurityVali import constants as C
-from secqurityVali.eval.challenge import Challenge
+from secqurityVali.eval.challenge import CATEGORY_IDOR, Challenge
 from secqurityVali.eval.findings import ReproStep
 from secqurityVali.targets.registry import provisioner_for
 
@@ -48,10 +48,16 @@ def execute_reproduction(
     expected_canary: str,
     *,
     timeout: float = 5.0,
+    auth_header: tuple[str, str] | None = None,
 ) -> bool:
     """Run the agent's reproduction requests against base_url and report whether
-    the expected (fresh) canary appears in any response. Pure HTTP; runs no
-    agent code."""
+    the expected (fresh) canary appears in any response. Pure HTTP; runs no agent
+    code.
+
+    `auth_header` (name, value) is added to every request. For an authenticated
+    category (IDOR) the validator supplies it ITSELF from the challenge (the
+    session is the validator's, never the agent's), so the replay can reach the
+    behind-login surface without trusting anything the agent recorded."""
     if not steps or not expected_canary:
         return False
     base_url = base_url.rstrip("/")
@@ -61,10 +67,12 @@ def execute_reproduction(
         try:
             if step.method == "POST":
                 req = urllib.request.Request(url, data=query.encode(), method="POST")
-                body = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
             else:
                 full = f"{url}?{query}" if query else url
-                body = urllib.request.urlopen(full, timeout=timeout).read().decode("utf-8", "replace")
+                req = urllib.request.Request(full, method="GET")
+            if auth_header:
+                req.add_header(auth_header[0], auth_header[1])
+            body = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
         except Exception:
             continue
         if expected_canary in body:
@@ -145,7 +153,13 @@ def run_replay(
             )
             return extracted == replay_challenge.canary
 
-        return execute_reproduction(base, steps, replay_challenge.canary)
+        # IDOR: the validator replays with ITS OWN session (Alice's token from the
+        # fresh challenge), so the behind-login request reaches the resource. The
+        # fresh canary only appears if the broken access control is really there.
+        auth = None
+        if replay_challenge.category == CATEGORY_IDOR and replay_challenge.alice_token:
+            auth = ("Authorization", f"Bearer {replay_challenge.alice_token}")
+        return execute_reproduction(base, steps, replay_challenge.canary, auth_header=auth)
     except Exception:
         return False
     finally:
