@@ -32,9 +32,11 @@ EMA_ALPHA = 0.1                       # generic default smoothing alpha for ema_
 # Env-overridable so a network whose metagraph has no uid 25 (e.g. testnet 501,
 # which only has ~15 uids) can point the burn at a valid uid -- otherwise
 # _apply_burn_allocation raises "BURN_UID not present" and set_weights is skipped
-# entirely, so nothing ever reaches the chain. Mainnet keeps the 25/0.95 default.
+# entirely, so nothing ever reaches the chain. Mainnet uses uid 25 and, for now,
+# burns 100% of emission -- the network is bootstrapping and no miner is paid yet;
+# lower MASXAI_BURN_PERCENTAGE (or this default) once real agents should earn.
 BURN_UID = int(os.getenv("MASXAI_BURN_UID", "25"))          # receives reserved burn allocation
-BURN_PERCENTAGE = float(os.getenv("MASXAI_BURN_PERCENTAGE", "0.95"))  # burn 95%, 5% to scored miners
+BURN_PERCENTAGE = float(os.getenv("MASXAI_BURN_PERCENTAGE", "1.0"))  # burn 100%, 0% to miners (bootstrapping)
 
 # Liveness participation: tracked for observability only (is a miner's
 # software online and responsive) - never blended into submitted chain
