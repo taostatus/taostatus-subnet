@@ -25,6 +25,7 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import sys
 import tempfile
 import time
@@ -255,7 +256,7 @@ class SecurityValidator(BaseValidatorNeuron):
                     )
 
                 # 2. full evaluation: sandboxed run, task + safety scoring
-                job = run_job(image_ref)
+                job = run_job(image_ref, category=random.choice(self._active_categories))
                 reward = reward_for_job(job)
                 detail = (
                     f"job:variant={job.variant} accepted={job.accepted} "
@@ -315,7 +316,7 @@ class SecurityValidator(BaseValidatorNeuron):
 
                 # 2. load the validated image for a runnable ref, then evaluate
                 image_ref = docker_ops.load_image(tar_path)
-                job = run_job(image_ref)
+                job = run_job(image_ref, category=random.choice(self._active_categories))
                 reward = reward_for_job(job)
                 detail = (
                     f"job:variant={job.variant} accepted={job.accepted} "
