@@ -29,6 +29,7 @@ import random
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ from secqurityVali.docker_ops import docker_available
 from secqurityVali.job import run_job
 from secqurityVali.pipeline import check_and_record
 from secqurityVali.reward import reward_for_job, reward_for_verdict
+from secqurityVali.target_guard import TargetRejected, validate_target
 
 try:
     from template.base.validator import BaseValidatorNeuron
@@ -287,6 +289,17 @@ class SecurityValidator(BaseValidatorNeuron):
             image_ref = None
             conn = db.connect(self.db_path)
             try:
+                # Anti-SSRF: blob_url is 100% miner-controlled. Refuse any URL
+                # that is not http/https or that resolves to a non-public address
+                # (loopback, private, link-local, CGNAT, cloud metadata) BEFORE we
+                # ever fetch it -- otherwise a miner turns the validator into a
+                # fetch proxy for its internal network / cloud credentials, or
+                # reads local files via file://. A bad URL is the miner's doing,
+                # so it scores a deterministic 0 (never a retryable "our fault").
+                try:
+                    validate_target(blob_url)
+                except TargetRejected as exc:
+                    return EvalOutcome(0.0, f"unsafe_blob_url:{exc}", None)
                 try:
                     blob = self._download_blob(blob_url)
                 except Exception as e:  # noqa: BLE001 - network/host issue, retryable
@@ -339,12 +352,24 @@ class SecurityValidator(BaseValidatorNeuron):
 
         return await asyncio.to_thread(work)
 
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        """Refuse every redirect. The initial blob_url was SSRF-validated, but a
+        30x Location is not -- following it would let a miner's server bounce the
+        validator to an internal host / metadata and defeat the gate. A redirect
+        is the miner's doing, so we raise and the caller fails the fetch."""
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise urllib.error.HTTPError(
+                req.full_url, code, f"redirect to {newurl!r} refused", headers, fp
+            )
+
     def _download_blob(self, url: str) -> bytes:
         """Download an encrypted blob, bounded in size and time. Raises on any
-        problem so the caller scores it as our own (retryable) fault."""
+        problem so the caller scores it as our own (retryable) fault. Redirects
+        are refused (see _NoRedirect) so a 30x cannot bypass the SSRF gate."""
         max_bytes = C.SECURITY_BLOB_MAX_BYTES
         req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=C.SECURITY_BLOB_DOWNLOAD_TIMEOUT_S) as resp:
+        opener = urllib.request.build_opener(self._NoRedirect)
+        with opener.open(req, timeout=C.SECURITY_BLOB_DOWNLOAD_TIMEOUT_S) as resp:
             chunks: list[bytes] = []
             total = 0
             while True:
