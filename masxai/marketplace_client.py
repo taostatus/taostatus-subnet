@@ -261,6 +261,42 @@ class MarketplaceClient:
             bt.logging.warning(f"marketplace: push failed: {e}")
         return False
 
+    async def get_confirmed_usage(self, since: Optional[str] = None) -> list[dict[str, Any]]:
+        """GET per-agent confirmed-audit usage. Returns [] on ANY error -- a poll
+        must never break the validator's weight-setting loop. The token is never
+        logged. `since` is an ISO-8601 cutoff the backend windows by."""
+        headers = {"Authorization": f"Bearer {self._token}"}
+        params = {"since": since} if since else None
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.base_url, timeout=self.timeout, transport=self._transport
+            ) as client:
+                for attempt in range(1, self.max_retries + 1):
+                    try:
+                        resp = await client.get(
+                            C.MARKETPLACE_USAGE_PATH, headers=headers, params=params
+                        )
+                    except httpx.RequestError as e:
+                        if attempt >= self.max_retries:
+                            bt.logging.warning(f"marketplace: usage poll network error: {e!r}")
+                            return []
+                        await _backoff(attempt)
+                        continue
+                    if 200 <= resp.status_code < 300:
+                        data = resp.json()
+                        return data if isinstance(data, list) else []
+                    if resp.status_code == 429 or resp.status_code >= 500:
+                        if attempt < self.max_retries:
+                            await _backoff(attempt, resp)
+                            continue
+                    bt.logging.warning(
+                        f"marketplace: usage poll HTTP {resp.status_code}: {resp.text[:200]}"
+                    )
+                    return []
+        except Exception as e:  # noqa: BLE001 -- must never break a caller
+            bt.logging.warning(f"marketplace: usage poll failed: {e}")
+        return []
+
 
 async def _backoff(attempt: int, response: Optional[httpx.Response] = None) -> None:
     import asyncio

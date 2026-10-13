@@ -279,6 +279,28 @@ SECURITY_VALIDATOR_KEY_FILE = "security_validator_key.json"
 # so the aggregate equals the SQLi score until more are added.
 SECURITY_ACTIVE_CATEGORIES = ("sqli", "cmdi", "lfi", "idor", "ssrf")
 
+# --- security-track EMISSION from confirmed customer-audit USAGE ---------
+# When ON, the security validator sets weights from each miner's CONFIRMED real
+# audits (GET /api/internal/usage) instead of the synthetic benchmark -- so
+# emission pays for delivered, replay-confirmed value, not for passing the
+# admission test (which stays as a capability GATE). OFF by default: the
+# benchmark remains the weight signal and this cannot change mainnet weights
+# until deliberately enabled. Independent of BURN_PERCENTAGE -- with the flag ON
+# but burn still 1.0, scores come from usage yet nothing is paid (safe to test).
+SECURITY_EMISSION_FROM_USAGE_ENV = "MASXAI_SECURITY_EMISSION_FROM_USAGE"
+SECURITY_EMISSION_FROM_USAGE = os.getenv(
+    SECURITY_EMISSION_FROM_USAGE_ENV, "false"
+).strip().lower() in ("1", "true", "yes", "on")
+# Confirmed audits (within the window) for full volume credit; fewer scale down.
+SECURITY_USAGE_TARGET_AUDITS_ENV = "MASXAI_SECURITY_USAGE_TARGET_AUDITS"
+SECURITY_USAGE_TARGET_AUDITS = int(os.getenv(SECURITY_USAGE_TARGET_AUDITS_ENV, "10"))
+# Only confirmed audits newer than this window count, so an old win can't pay
+# forever (mirrors the benchmark's freshness decay). Default 7 days.
+SECURITY_USAGE_WINDOW_SECONDS_ENV = "MASXAI_SECURITY_USAGE_WINDOW_SECONDS"
+SECURITY_USAGE_WINDOW_SECONDS = int(
+    os.getenv(SECURITY_USAGE_WINDOW_SECONDS_ENV, str(7 * 24 * 3600))
+)
+
 # Where the per-miner, per-category EMA matrix is persisted (see
 # secqurityVali/category_scores.py), and the EMA weight on each new observation.
 SECURITY_CATEGORY_SCORES_FILE_ENV = "MASXAI_SECURITY_CATEGORY_SCORES_FILE"
@@ -326,6 +348,7 @@ SECURITY_BLOB_PORT = 8912
 MARKETPLACE_BASE_URL_ENV = "MASXAI_MARKETPLACE_BASE_URL"
 MARKETPLACE_TOKEN_ENV = "MASXAI_MARKETPLACE_TOKEN"
 MARKETPLACE_AGENTS_PATH = "/api/internal/agents"      # POST, bearer token, upsert by agent id
+MARKETPLACE_USAGE_PATH = "/api/internal/usage"        # GET, bearer token, per-hotkey confirmed-audit usage
 MARKETPLACE_TIMEOUT_ENV = "MASXAI_MARKETPLACE_TIMEOUT_SECONDS"
 MARKETPLACE_TIMEOUT = 10.0                             # short: a push must never hold up a round
 MARKETPLACE_MAX_RETRIES = 3                            # on 429 / 5xx / network error

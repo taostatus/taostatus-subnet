@@ -32,6 +32,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -39,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from masxai.protocol import SecurityAgentSynapse
 from masxai import constants as C
+from masxai.scoring import usage_score
 from masxai.agent_crypto import (
     AgentCryptoError,
     decrypt_agent,
@@ -158,6 +160,18 @@ class SecurityValidator(BaseValidatorNeuron):
             C.MARKETPLACE_LISTED_FILE_ENV, C.MARKETPLACE_LISTED_FILE
         )
         self._listed_agents: set[str] = load_listed(self._listed_agents_path)
+
+        # Emission source. OFF (default) -> weights come from the synthetic
+        # benchmark (capability/admission). ON -> weights come from each miner's
+        # CONFIRMED real audits (GET /api/internal/usage); the benchmark then only
+        # gates who may take customer jobs. Needs the marketplace client to poll;
+        # with no client it falls back to the benchmark. Independent of burn, so
+        # it can run with burn=1.0 to validate scoring before any payout.
+        self._emission_from_usage = bool(
+            getattr(C, "SECURITY_EMISSION_FROM_USAGE", False)
+        ) and self._marketplace is not None
+        self._usage_target_audits = int(getattr(C, "SECURITY_USAGE_TARGET_AUDITS", 10))
+        self._usage_window_s = int(getattr(C, "SECURITY_USAGE_WINDOW_SECONDS", 7 * 24 * 3600))
 
         if not docker_available():
             bt.logging.warning(
@@ -498,11 +512,16 @@ class SecurityValidator(BaseValidatorNeuron):
                 f"own fault (retryable), not the miner's: {skipped}"
             )
 
-        # Score EVERY miner from the freshness-filtered matrix -- not only those
-        # evaluated this round -- so an idle/offline miner whose cells went stale
-        # decays to 0 instead of earning forever (F4), while a recently-scored
-        # miner keeps its score until its window lapses.
-        score_map = self._recompute_all_scores(now)
+        # Score EVERY miner. By DEFAULT from the freshness-filtered benchmark
+        # matrix (capability) -- an idle miner whose cells went stale decays to 0
+        # (F4) instead of earning forever. When emission-from-usage is enabled,
+        # score instead from each miner's CONFIRMED real audits, so emission pays
+        # for delivered, replay-confirmed value rather than for passing the
+        # admission test. Off by default -> mainnet weights are unchanged.
+        if getattr(self, "_emission_from_usage", False):
+            score_map = await self._recompute_scores_from_usage(now)
+        else:
+            score_map = self._recompute_all_scores(now)
         if score_map:
             self._update_from_rewards(score_map)
 
@@ -603,6 +622,41 @@ class SecurityValidator(BaseValidatorNeuron):
             out[uid] = self._cat_scores.aggregate(
                 hotkey, self._active_categories, now=now, freshness_s=self._freshness_s
             )
+        return out
+
+    async def _recompute_scores_from_usage(self, now: float) -> dict[int, float]:
+        """{uid: score} from each miner's CONFIRMED real-audit usage, polled from
+        the backend -- the one shared source every validator reads, so their
+        weight decisions converge (consensus-safe). score = usage_score(count,
+        avg_score): volume x quality, fail-closed, windowed so an old win cannot
+        pay forever. A poll failure returns {} (no weight change this round)
+        rather than paying or zeroing blindly."""
+        client = getattr(self, "_marketplace", None)
+        if client is None:
+            return {}
+        since = datetime.fromtimestamp(
+            max(0.0, now - self._usage_window_s), tz=timezone.utc
+        ).isoformat()
+        try:
+            rows = await client.get_confirmed_usage(since=since)
+        except Exception as e:  # noqa: BLE001 - a poll must never break the round
+            bt.logging.warning(f"security-validator: usage poll failed: {e}")
+            return {}
+        hk_to_uid = {hk: i for i, hk in enumerate(self.metagraph.hotkeys)}
+        out: dict[int, float] = {}
+        for row in rows or []:
+            hotkey = str((row or {}).get("agent_digest") or "")
+            uid = hk_to_uid.get(hotkey)
+            if uid is None:
+                continue  # hotkey not (or no longer) in the metagraph
+            out[uid] = usage_score(
+                (row or {}).get("confirmed_count", 0),
+                (row or {}).get("avg_score"),
+                target_audits=self._usage_target_audits,
+            )
+        bt.logging.info(
+            f"security-validator: scored {len(out)} miner(s) from confirmed-audit usage"
+        )
         return out
 
     def _update_from_rewards(self, rewards: dict[int, float]) -> None:
