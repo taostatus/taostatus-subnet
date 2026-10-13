@@ -21,6 +21,25 @@ from secqurityVali.audit_runner import AuditReport
 from secqurityVali.audit_runner import run_audit as _run_audit
 from secqurityVali.audit_runner import run_audit_from_repo as _run_audit_from_repo
 from secqurityVali.audit_runner import run_browser_audit as _run_browser_audit
+from secqurityVali.report import format_report
+
+
+def _finalize(report: AuditReport, target: str) -> dict:
+    """The RunResultIn body plus the customer-facing formatted report attached
+    under `report`. A rendering problem never fails the run -- the raw result
+    (findings, score, confirmed) still posts without it."""
+    result = report.to_result()
+    try:
+        result["report"] = format_report(
+            report.findings or [],
+            target=target,
+            confirmed=report.confirmed,
+            score=report.score,
+            safe=report.safe,
+        )
+    except Exception:  # noqa: BLE001 - report formatting must never break a run
+        pass
+    return result
 
 
 def process_audit_job(
@@ -77,7 +96,7 @@ def process_audit_job(
                 "browser (modern-app) audits are temporarily unavailable"
             ).to_result()
         report = run_browser_audit(target, credentials=credentials, **kwargs)
-        return report.to_result()
+        return _finalize(report, target)
 
     # Security gate: only vetted agents may ever run against a real target.
     if not is_vetted(agent_id):
@@ -96,4 +115,4 @@ def process_audit_job(
     else:
         report = run_audit(image, target, scope=scope,
                            credentials=credentials, **kwargs)  # black-box URL
-    return report.to_result()
+    return _finalize(report, target)
