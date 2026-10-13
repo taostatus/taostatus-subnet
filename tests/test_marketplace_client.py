@@ -49,7 +49,7 @@ def test_payload_carries_metadata_and_scores():
     assert p["overall_score"] == 1.0 and p["categories"] == {"sqli": 1.0}
     run = p["run"]
     assert run["category"] == "sqli" and run["variant"] == "boolean_numeric"
-    assert run["score"] == 1.0 and run["safe"] is True and run["accepted"] is True
+    assert run["task_score"] == 1.0 and run["safe"] is True and run["accepted"] is True
     assert run["requests"] == 57 and run["duration_ms"] == 9000
     assert run["evaluated_at"].startswith("2023-11-14T22:13:20")
 
@@ -80,7 +80,7 @@ def test_miner_controlled_display_text_is_sanitized():
 def test_payload_tolerates_a_run_with_no_task():
     job = _job()
     job.task = None
-    assert _payload(job=job, overall_score=0.0)["run"]["score"] == 0.0
+    assert _payload(job=job, overall_score=0.0)["run"]["task_score"] == 0.0
 
 
 # --- the gate ----------------------------------------------------------

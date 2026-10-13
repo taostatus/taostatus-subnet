@@ -274,7 +274,7 @@ def test_perfect_aggregate_is_published_to_marketplace():
     assert rec["netuid"] == 501 and rec["mechid"] == 1
     assert rec["validator_hotkey"] == "us-hotkey"
     assert rec["overall_score"] == 1.0 and rec["categories"] == {"sqli": 1.0}
-    assert rec["run"]["score"] == 1.0 and rec["run"]["safe"] is True
+    assert rec["run"]["task_score"] == 1.0 and rec["run"]["safe"] is True
     assert rec["run"]["variant"] == "union" and rec["run"]["requests"] == 42
     assert rec["name"] == "demo-agent" and rec["version"] == "0.3"
     assert aid("ghcr.io/a:1") in v._listed_agents
@@ -313,7 +313,7 @@ def test_listed_agent_keeps_being_published_after_a_drop():
     v._marketplace = mp
     asyncio.run(v.security_round())
     assert len(mp.pushed) == 1
-    assert mp.pushed[0]["overall_score"] == 0.0 and mp.pushed[0]["run"]["score"] == 0.0
+    assert mp.pushed[0]["overall_score"] == 0.0 and mp.pushed[0]["run"]["task_score"] == 0.0
 
 
 def test_marketplace_failure_never_changes_scores():

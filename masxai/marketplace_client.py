@@ -151,7 +151,10 @@ def build_agent_payload(
             "run_id": str(getattr(job, "run_id", "")),
             "category": str(getattr(job, "category", "") or ""),
             "variant": str(getattr(job, "variant", "") or ""),
-            "score": round(float(getattr(task, "score", 0.0) or 0.0), 4) if task else 0.0,
+            # The backend's RunIn schema + runs table use `task_score` (not
+            # `score`); sending `score` left the per-run column NULL -> "-" in the
+            # UI. Align the key so each run's score shows.
+            "task_score": round(float(getattr(task, "score", 0.0) or 0.0), 4) if task else 0.0,
             "safe": bool(getattr(job, "safe", False)),
             "accepted": bool(getattr(job, "accepted", False)),
             "requests": int(getattr(job, "request_count", 0) or 0),
