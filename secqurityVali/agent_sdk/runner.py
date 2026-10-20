@@ -52,6 +52,16 @@ class RunConfig:
     http_timeout_s: float = 15.0
     max_response_bytes: int = 512 * 1024   # don't let one response blow up memory
 
+    # browser-driven recon (optional; needs playwright). When on, the runner maps
+    # the surface with a REAL headless browser -- authenticated if login_* is set --
+    # and hands that to the agent instead of a static HTML crawl. This is what lets
+    # the agent see a modern SPA / server-component app's real endpoints and forms.
+    use_browser: bool = False
+    login_email: Optional[str] = None
+    login_password: Optional[str] = None
+    login_path: str = "/auth/login"
+    browser_max_pages: int = 12
+
 
 class RunnerError(Exception):
     """Raised when the agent exceeds a cap or the runner itself fails."""
@@ -95,6 +105,10 @@ class RunnerContext:
         self._llm_tokens = 0
         self._deadline = time.monotonic() + config.timeout_s
         self._logs: list[str] = []
+
+        # endpoint records captured by browser recon (empty unless use_browser);
+        # the agent reads this to attack the real surface instead of a static crawl
+        self.discovered: list = []
 
         # one reused client each; the target client has creds baked in
         self._llm_http = httpx.Client(timeout=config.llm_timeout_s)
@@ -217,6 +231,29 @@ class RunnerContext:
             existing = headers.get("Cookie")
             headers["Cookie"] = f"{existing}; {jar}" if existing else jar
 
+    def run_browser_recon(self) -> None:
+        """Map the surface with a real browser and store it in `self.discovered`
+        for the agent. Scope is enforced with the same `_in_scope` the agent's http
+        uses; the login (if any) and cookies come from the run config/credentials.
+        Never raises -- recon failure just falls back to the agent's static crawl."""
+        from secqurityVali.agent_sdk import browser
+        login = None
+        if self._cfg.login_email and self._cfg.login_password:
+            login = {"email": self._cfg.login_email,
+                     "password": self._cfg.login_password,
+                     "path": self._cfg.login_path}
+        cookies = (dict(self.credentials.cookies)
+                   if (self.credentials and self.credentials.cookies) else None)
+        try:
+            self.discovered = browser.browser_recon(
+                self.target_url, cookies=cookies, login=login,
+                in_scope=self._in_scope, max_pages=self._cfg.browser_max_pages,
+                log=self.log,
+            )
+        except Exception as exc:  # noqa: BLE001 - recon must never crash the run
+            self.log(f"browser: recon failed {type(exc).__name__}: {exc}")
+            self.discovered = []
+
     def close(self) -> None:
         self._llm_http.close()
         self._target_http.close()
@@ -237,6 +274,8 @@ def run_agent(agent_main: AgentMain, config: RunConfig) -> RunResult:
     findings: list[Finding] = []
     error: Optional[str] = None
     try:
+        if config.use_browser:
+            ctx.run_browser_recon()
         out = agent_main(ctx)
         for f in out or []:
             if isinstance(f, Finding):
