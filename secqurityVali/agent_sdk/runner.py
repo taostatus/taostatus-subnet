@@ -95,6 +95,9 @@ class RunnerContext:
     def __init__(self, config: RunConfig, run_id: str):
         self._cfg = config
         self.target_url = config.target_url.rstrip("/")
+        from secqurityVali.agent_sdk.browser import _registrable
+        from urllib.parse import urlparse as _urlparse
+        self._target_site = _registrable(_urlparse(self.target_url).netloc)
         self.scope = config.scope
         self.credentials = config.credentials
         self.run_id = run_id
@@ -204,13 +207,17 @@ class RunnerContext:
 
     def _in_scope(self, path: str) -> bool:
         """Allow only in-scope paths. `exclude` always wins; an empty `include`
-        means the whole target host is in scope. Absolute URLs to another host
-        are never allowed."""
+        means the whole target site is in scope. An absolute URL is allowed only to
+        the SAME registrable domain (the app and its API subdomain, e.g.
+        app-dev.meroims.com + api.meroims.com) -- never to an unrelated host."""
+        from secqurityVali.agent_sdk.browser import _registrable
         p = path if path.startswith("/") else "/" + path
         if path.startswith(("http://", "https://")):
-            if not path.startswith(self.target_url):
+            from urllib.parse import urlparse
+            u = urlparse(path)
+            if _registrable(u.netloc) != self._target_site:
                 return False
-            p = path[len(self.target_url):] or "/"
+            p = u.path or "/"
         for ex in self.scope.exclude:
             if p.startswith(ex):
                 return False
@@ -245,11 +252,20 @@ class RunnerContext:
         cookies = (dict(self.credentials.cookies)
                    if (self.credentials and self.credentials.cookies) else None)
         try:
-            self.discovered = browser.browser_recon(
+            self.discovered, session = browser.browser_recon(
                 self.target_url, cookies=cookies, login=login,
                 in_scope=self._in_scope, max_pages=self._cfg.browser_max_pages,
                 log=self.log,
             )
+            # hand the browser's authenticated session (bearer token / cookies) to
+            # the agent's http client, so its attacks run AUTHENTICATED against the
+            # app's API -- otherwise it would hit protected endpoints as a guest.
+            if session and (session.get("bearer") or session.get("cookies")):
+                self.credentials = Credentials(
+                    cookies=session.get("cookies") or {},
+                    bearer=session.get("bearer"),
+                    headers=session.get("headers") or {},
+                )
         except Exception as exc:  # noqa: BLE001 - recon must never crash the run
             self.log(f"browser: recon failed {type(exc).__name__}: {exc}")
             self.discovered = []

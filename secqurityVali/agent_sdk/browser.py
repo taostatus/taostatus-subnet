@@ -48,6 +48,19 @@ def _real_params(query: str) -> list[str]:
     return sorted({k for k, _ in parse_qsl(query) if k.lower() not in _VOLATILE})
 
 
+def _registrable(netloc: str) -> str:
+    """The registrable domain (last two labels) -- app-dev.meroims.com and
+    api.meroims.com both reduce to meroims.com, so we treat an app and its API
+    subdomain as the same in-scope site."""
+    host = netloc.split(":")[0].lower()
+    parts = host.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def _same_site(netloc: str, target_netloc: str) -> bool:
+    return _registrable(netloc) == _registrable(target_netloc)
+
+
 def _body_fields(post_data: Optional[str], content_type: str) -> tuple[list[str], str]:
     """Pull the field NAMES (never values) out of a request body, and normalise the
     content type to 'json' or 'form'."""
@@ -80,11 +93,12 @@ def browser_recon(
     """Drive the browser and return the captured endpoint records. `login` is
     {"email","password","path"} to authenticate first; `in_scope(path)->bool`
     rejects out-of-scope paths (from the run's Scope)."""
+    empty_session = {"cookies": {}, "bearer": None, "headers": {}}
     try:
         from playwright.sync_api import sync_playwright
     except Exception:  # noqa: BLE001 - optional dependency
         log("browser: playwright not installed -> static recon fallback")
-        return []
+        return [], empty_session
 
     target = target_url.rstrip("/")
     host = urlparse(target).netloc
@@ -92,14 +106,21 @@ def browser_recon(
 
     # method+path -> record (params/body_fields accumulate across requests)
     records: dict = {}
+    # the authenticated session the browser obtained, to hand to the agent so its
+    # attacks run authenticated (bearer token from the API's Authorization header)
+    session = {"cookies": {}, "bearer": None, "headers": {}}
 
     def _keep(path: str) -> bool:
         return bool(path) and scoped(path)
 
     def _record(method: str, u, rtype: str, post_data, content_type) -> None:
-        if u.netloc and u.netloc != host:
+        if u.netloc and not _same_site(u.netloc, host):
             return
-        path = u.path or "/"
+        # a request to a SIBLING subdomain (the API host) is stored as an absolute
+        # URL so the agent hits the right host; same-host stays relative
+        cross = bool(u.netloc and u.netloc != host)
+        path = (f"{u.scheme or 'https'}://{u.netloc}{u.path or '/'}" if cross
+                else (u.path or "/"))
         if not _keep(path):
             return
         key = (method, path)
@@ -117,6 +138,10 @@ def browser_recon(
             if req.resource_type in _NOISE_TYPES:
                 return
             u = urlparse(req.url)
+            if u.netloc and _same_site(u.netloc, host):
+                auth = (req.headers or {}).get("authorization", "")
+                if auth.lower().startswith("bearer ") and not session["bearer"]:
+                    session["bearer"] = auth[7:].strip()
             pd = req.post_data if req.method != "GET" else None
             ct = (req.headers or {}).get("content-type", "")
             _record(req.method, u, req.resource_type, pd, ct)
@@ -157,16 +182,22 @@ def browser_recon(
                     # domcontentloaded fires reliably; 'networkidle' never settles
                     # on data-heavy / polling SPA pages and times the whole nav out
                     page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=4000)
-                    except Exception:  # noqa: BLE001 - best effort; idle may never come
-                        pass
+                except Exception as e:  # noqa: BLE001
+                    # ERR_ABORTED etc. usually means a client-side redirect REPLACED
+                    # the navigation -- the page still landed somewhere useful and the
+                    # requests it fired are already captured, so don't skip: work with
+                    # whatever is on screen now.
+                    log(f"browser: nav {path} -> {type(e).__name__} (using landed page)")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=4000)
+                except Exception:  # noqa: BLE001 - best effort; idle may never come
+                    pass
+                try:
                     page.wait_for_timeout(900)
                     page.mouse.wheel(0, 5000)        # trigger lazy data loads
                     page.wait_for_timeout(1100)
-                except Exception as e:  # noqa: BLE001
-                    log(f"browser: nav {path} -> {type(e).__name__}")
-                    continue
+                except Exception:  # noqa: BLE001 - page may be mid-redirect
+                    pass
                 pages += 1
 
                 # rendered forms (React forms expose field names only in the DOM)
@@ -194,6 +225,13 @@ def browser_recon(
                             and not _SKIP_LINK.search(ref)
                             and len(queue) < max_pages * 3):
                         queue.append(absu)
+            # grab the authenticated session (cookies) to hand to the agent, THEN
+            # destroy the browser context
+            try:
+                for c in ctx.cookies():
+                    session["cookies"][c["name"]] = c["value"]
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             ctx.close()      # destroy cookies / session / local storage
             browser.close()
@@ -208,8 +246,10 @@ def browser_recon(
             "content_type": rec["content_type"],
             "source": rec["source"],
         })
-    log(f"browser: captured {len(out)} endpoint records")
-    return out
+    log(f"browser: captured {len(out)} endpoint records "
+        f"(session: bearer={'yes' if session['bearer'] else 'no'}, "
+        f"cookies={len(session['cookies'])})")
+    return out, session
 
 
 # --- helpers ----------------------------------------------------------------
