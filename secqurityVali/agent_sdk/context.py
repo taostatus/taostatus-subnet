@@ -129,11 +129,13 @@ class AgentContext(Protocol):
         params: Optional[Mapping[str, str]] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[bytes] = None,
+        authenticated: bool = True,
     ) -> HttpResponse:
         """Send one request to the target. `path` is resolved against `target_url`
         and must fall within `scope` (the proxy drops it otherwise). Credentials
-        are injected automatically. Rate-limited and bounded; never reaches any
-        host but the approved target."""
+        are injected automatically unless `authenticated=False` (used to test access
+        control: does a protected endpoint answer without a session?). Rate-limited
+        and bounded; never reaches any host but the approved in-scope site."""
         ...
 
     def log(self, message: str) -> None:

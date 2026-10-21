@@ -165,6 +165,7 @@ class RunnerContext:
         params: Optional[Mapping[str, str]] = None,
         headers: Optional[Mapping[str, str]] = None,
         body: Optional[bytes] = None,
+        authenticated: bool = True,
     ) -> HttpResponse:
         self._check_deadline()
         if self._http_requests >= self._cfg.max_http_requests:
@@ -175,7 +176,10 @@ class RunnerContext:
 
         url = self._resolve(path)
         req_headers = dict(headers or {})
-        self._inject_credentials(req_headers)
+        # authenticated=False sends the request WITHOUT the session -- the agent uses
+        # this to test access control (does a protected endpoint answer a guest?)
+        if authenticated:
+            self._inject_credentials(req_headers)
 
         t0 = time.monotonic()
         resp = self._target_http.request(
