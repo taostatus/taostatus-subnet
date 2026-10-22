@@ -98,6 +98,9 @@ class RunnerContext:
         from secqurityVali.agent_sdk.browser import _registrable
         from urllib.parse import urlparse as _urlparse
         self._target_site = _registrable(_urlparse(self.target_url).netloc)
+        # a known-valid login identity (the customer's test account), so the agent
+        # can test username enumeration (does a real vs fake email respond differently?)
+        self.login_email = config.login_email
         self.scope = config.scope
         self.credentials = config.credentials
         self.run_id = run_id
