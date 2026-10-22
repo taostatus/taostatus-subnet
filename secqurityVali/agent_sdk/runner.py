@@ -245,6 +245,50 @@ class RunnerContext:
             existing = headers.get("Cookie")
             headers["Cookie"] = f"{existing}; {jar}" if existing else jar
 
+    def tls_info(self) -> dict:
+        """Inspect the target's TLS: deprecated protocol support and certificate
+        validity/expiry. A PLATFORM capability (the agent never opens raw sockets);
+        connects only to the approved target host."""
+        import socket
+        import ssl
+        from urllib.parse import urlparse
+        u = urlparse(self.target_url)
+        info: dict = {"https": u.scheme == "https", "weak_protocols": [],
+                      "cert_error": None, "cert_expires_days": None}
+        if u.scheme != "https":
+            return info
+        host, port = u.hostname, (u.port or 443)
+        # deprecated protocol support (best effort -- our own OpenSSL may refuse to
+        # even offer these, which only costs us a true-negative, never a false one)
+        for label, ver in (("TLS 1.0", ssl.TLSVersion.TLSv1),
+                            ("TLS 1.1", ssl.TLSVersion.TLSv1_1)):
+            try:
+                c = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                c.minimum_version = ver
+                c.maximum_version = ver
+                c.check_hostname = False
+                c.verify_mode = ssl.CERT_NONE
+                with socket.create_connection((host, port), timeout=8) as s:
+                    with c.wrap_socket(s, server_hostname=host):
+                        info["weak_protocols"].append(label)
+            except Exception:  # noqa: BLE001 - rejected = good
+                pass
+        # certificate validity + expiry (default context verifies trust/hostname)
+        try:
+            c = ssl.create_default_context()
+            with socket.create_connection((host, port), timeout=8) as s:
+                with c.wrap_socket(s, server_hostname=host) as ss:
+                    cert = ss.getpeercert() or {}
+                    na = cert.get("notAfter")
+                    if na:
+                        info["cert_expires_days"] = int(
+                            (ssl.cert_time_to_seconds(na) - time.time()) / 86400)
+        except ssl.SSLCertVerificationError as exc:
+            info["cert_error"] = str(exc)
+        except Exception:  # noqa: BLE001 - a connection issue is not a cert finding
+            pass
+        return info
+
     def run_browser_recon(self) -> None:
         """Map the surface with a real browser and store it in `self.discovered`
         for the agent. Scope is enforced with the same `_in_scope` the agent's http
