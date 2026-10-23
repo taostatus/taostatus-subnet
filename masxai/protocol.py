@@ -100,7 +100,7 @@ class LLMKeySynapse(bt.Synapse):
 # validator never trusts anything the miner says about the image beyond the
 # reference itself.
 
-SECURITY_SYNAPSE_VERSION = 2
+SECURITY_SYNAPSE_VERSION = 3
 
 
 class SecurityAgentSynapse(bt.Synapse):
@@ -146,6 +146,12 @@ class SecurityAgentSynapse(bt.Synapse):
         pubkey_id_used       echoes the request's pubkey_id
         image_ref            OPTIONAL plaintext fallback: a public registry ref,
                              used only when blob_url is empty
+        submission_kind      what the blob/ref carries: "" or "image" = a docker
+                             image (the original model); "script" = a single
+                             agent.py (the Python-script model). The transport is
+                             identical; this only tells the validator how to run
+                             the decrypted bytes. Defaulting to image keeps a v2
+                             miner working unchanged.
         timestamp            ISO8601 generation timestamp
     """
 
@@ -163,6 +169,7 @@ class SecurityAgentSynapse(bt.Synapse):
     blob_encoding: str = ""
     pubkey_id_used: str = ""
     image_ref: str = ""
+    submission_kind: str = ""          # "" | "image" | "script"
     timestamp: str = ""
 
     def deserialize(self) -> dict[str, Any]:
@@ -174,5 +181,6 @@ class SecurityAgentSynapse(bt.Synapse):
             "blob_encoding": self.blob_encoding,
             "pubkey_id_used": self.pubkey_id_used,
             "image_ref": self.image_ref,
+            "submission_kind": self.submission_kind,
             "timestamp": self.timestamp,
         }
