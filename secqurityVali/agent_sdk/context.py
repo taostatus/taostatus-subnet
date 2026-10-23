@@ -94,6 +94,22 @@ class Finding:
     reproduction: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
     confidence: str = "proven"                     # "proven" | "potential"
 
+    # --- machine-checkable proof (the validator's replay reads these) ----------
+    # For an injection-class finding these let the validator RE-RUN the exact
+    # exploit on a fresh attempt instead of trusting the agent's word. The
+    # strongest proof is `payload` + `canary`: the validator replays `payload`
+    # against the pinned target and requires `canary` to reappear in the response
+    # -- unforgeable, because each run plants a fresh unguessable canary that only
+    # a working injection can re-extract. `value` (a benign baseline) feeds the
+    # canary-free boolean differential used on real customer targets. `method` and
+    # `location` say where the parameter lives when they are not the GET/query
+    # defaults. All optional: a non-injection finding simply leaves them None.
+    method: Optional[str] = None
+    location: Optional[str] = None                 # "query" | "body"
+    value: Optional[str] = None                    # benign baseline value
+    payload: Optional[str] = None                  # the full injected value
+    canary: Optional[str] = None                   # the secret the agent extracted
+
 
 # --- the capabilities handed to the agent -----------------------------------
 
