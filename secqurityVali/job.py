@@ -28,6 +28,7 @@ exfiltrate. Teardown runs on every path, so no job leaves state behind.
 """
 
 import json
+import logging
 import os
 import shutil
 import stat
@@ -209,10 +210,19 @@ def _container_ip(name: str, network: str) -> str:
 
 
 def _agent_create_args(name, network, agent_image, target_ip, out_dir, run_id, timeout_s,
-                       resolv_path, target_port, extra_env=None, source_dir=None):
+                       resolv_path, target_port, extra_env=None, source_dir=None,
+                       agent_script=None):
     """The full agent invocation. Like the dry-run's flags, but on the job
     network with the target reachable, /out mounted, and the challenge context
     in the environment. Built as a list so a test can assert on it.
+
+    `agent_script` (optional): a host path to the miner's agent.py. When given,
+    the image run is the fixed audited base image (C.SANDBOX_BASE_IMAGE) and the
+    script is bind-mounted READ-ONLY at C.JOB_AGENT_SCRIPT_MOUNT -- the
+    Python-script admission model, where no miner-controlled image is ever loaded.
+    When omitted, `agent_image` is run as before (the legacy whole-image model).
+    Exactly one of the two is the unit of untrusted code; the sandbox around it is
+    identical either way.
 
     `source_dir` (optional): a host directory holding the TARGET's source, mounted
     READ-ONLY at C.JOB_SOURCE_MOUNT so a white-box agent can analyse the code it is
@@ -238,6 +248,11 @@ def _agent_create_args(name, network, agent_image, target_ip, out_dir, run_id, t
         "--memory-swap", C.DRY_RUN_MEMORY_SWAP,
         "--cpus", str(C.DRY_RUN_CPUS),
         "--pids-limit", str(C.DRY_RUN_PIDS_LIMIT),
+        # fsize caps any single file the agent writes; nofile caps open FDs. The
+        # host /out is itself a size-capped tmpfs (see run_job), so disk-fill is
+        # hard-bounded; these are the in-container belt-and-braces.
+        "--ulimit", f"fsize={C.JOB_AGENT_FSIZE_ULIMIT}",
+        "--ulimit", f"nofile={C.JOB_AGENT_NOFILE_ULIMIT}",
         "--read-only",
         "--tmpfs", C.DRY_RUN_TMPFS,
         # the one writable, size-capped place the agent may leave output
@@ -258,7 +273,15 @@ def _agent_create_args(name, network, agent_image, target_ip, out_dir, run_id, t
     # strings we build; never anything the target controls.
     for k, v in (extra_env or {}).items():
         args += ["-e", f"{k}={v}"]
-    args.append(agent_image)
+    # Python-script model: mount the miner's agent.py read-only into the fixed
+    # base image, instead of running a miner-supplied image. The mount is the ONLY
+    # miner-controlled byte in the container.
+    if agent_script:
+        args += ["--mount",
+                 f"type=bind,src={agent_script},dst={C.JOB_AGENT_SCRIPT_MOUNT},readonly"]
+        args.append(C.SANDBOX_BASE_IMAGE)
+    else:
+        args.append(agent_image)
     return args
 
 
@@ -280,8 +303,9 @@ def _benchmark_agent_env(challenge: Challenge) -> dict:
 
 
 def run_job(
-    agent_image: str,
+    agent_image: str | None = None,
     *,
+    agent_script: str | None = None,
     category: str | None = None,
     challenge: Challenge | None = None,
     timeout_s: int = C.JOB_AGENT_TIMEOUT_S,
@@ -289,14 +313,22 @@ def run_job(
 ) -> JobResult:
     """Run one full evaluation and return its scored result.
 
+    Supply exactly one unit of untrusted code: `agent_image` (the legacy
+    whole-image model) OR `agent_script` (a host path to the miner's agent.py,
+    run inside the fixed audited base image -- the Python-script admission model).
+    The sandbox, scoring, replay and teardown are identical either way.
+
     `category` selects the vulnerability class (sqli / cmdi / ...). The matching
     target is looked up in the target registry, so the agent is graded against
     the right vulnerable app. Never raises: an orchestration failure becomes a
     JobResult with `error` set (our fault, retryable). Everything is torn down.
     """
+    run_id = uuid.uuid4().hex
+    if bool(agent_image) == bool(agent_script):
+        return _our_fault(
+            run_id, "run_job needs exactly one of agent_image or agent_script")
     challenge = challenge or generate_challenge(category=category or CATEGORY_SQLI)
     prov = provisioner_for(challenge.category)
-    run_id = uuid.uuid4().hex
     short = run_id[:12]
     network = C.JOB_NETWORK_PREFIX + short
     target_name = C.JOB_TARGET_NAME_PREFIX + short
@@ -309,6 +341,9 @@ def run_job(
         os.chmod(out_dir, 0o777)
     except OSError:
         pass
+    # Hard-cap /out so the agent can never fill the host disk (best-effort; falls
+    # back to the plain dir + fsize ulimit if tmpfs can't be mounted).
+    _mount_out_tmpfs(out_dir)
     resolv_path = _blackhole_resolv()   # read-only /etc/resolv.conf: no DNS at all
     started = time.monotonic()
     agent_cid = ""
@@ -344,7 +379,8 @@ def run_job(
         created = _run(
             _agent_create_args(agent_name, network, agent_image, target_ip, out_dir,
                                run_id, timeout_s, resolv_path, prov.TARGET_PORT,
-                               extra_env=_benchmark_agent_env(challenge)),
+                               extra_env=_benchmark_agent_env(challenge),
+                               agent_script=agent_script),
             timeout=C.DOCKER_CLI_TIMEOUT_S,
         )
         if created.returncode != 0:
@@ -394,6 +430,7 @@ def run_job(
             _rm_container(agent_name)
             _rm_container(target_name)
             _network_remove(network)
+            _umount_out(out_dir)   # release the /out tmpfs now the container is gone
             shutil.rmtree(out_dir, ignore_errors=True)
             try:
                 os.unlink(resolv_path)
@@ -426,6 +463,50 @@ def _exit_code(name: str) -> int | None:
         return int((res.stdout or "").strip())
     except ValueError:
         return None
+
+
+_log = logging.getLogger(__name__)
+
+
+def _mount_out_tmpfs(out_dir: str) -> bool:
+    """Back the agent's /out with a size-capped tmpfs, so a malicious agent cannot
+    fill the host disk during the run (the read-side refusal at
+    JOB_OUT_DIR_MAX_BYTES is only after the fact). Linux + privileged only;
+    returns False on any failure, and the caller keeps the plain dir -- still
+    protected by the --ulimit fsize cap and the read-side refusal. Best-effort."""
+    try:
+        res = subprocess.run(
+            ["mount", "-t", "tmpfs", "-o",
+             f"size={C.JOB_OUT_TMPFS_SIZE},mode=0777,noexec,nosuid", "tmpfs", out_dir],
+            capture_output=True, text=True, timeout=C.DOCKER_CLI_TIMEOUT_S,
+        )
+        if res.returncode == 0:
+            return True
+        _log.debug("job: /out tmpfs mount skipped: %s", (res.stderr or "").strip()[:160])
+    except Exception as e:  # noqa: BLE001 -- never let hardening break a run
+        _log.debug("job: /out tmpfs mount skipped: %s: %s", type(e).__name__, e)
+    return False
+
+
+def _umount_out(out_dir: str) -> None:
+    """Unmount the /out tmpfs if one is mounted. Called only after the agent
+    container is removed (so nothing holds the mount); a lazy unmount is the
+    fallback so a transient 'busy' can never leak the mount. Always best-effort."""
+    try:
+        if not os.path.ismount(out_dir):
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    for extra in ([], ["-l"]):   # normal, then lazy
+        try:
+            res = subprocess.run(
+                ["umount", *extra, out_dir],
+                capture_output=True, text=True, timeout=C.DOCKER_CLI_TIMEOUT_S,
+            )
+            if res.returncode == 0:
+                return
+        except Exception:  # noqa: BLE001
+            continue
 
 
 def _read_findings(out_dir: str) -> bytes:

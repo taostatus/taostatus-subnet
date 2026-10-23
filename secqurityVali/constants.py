@@ -174,6 +174,13 @@ JOB_AGENT_RUNTIME = os.getenv(JOB_AGENT_RUNTIME_ENV, "runsc-monitor")
 JOB_TARGET_RUNTIME_ENV = "MASXAI_JOB_TARGET_RUNTIME"
 JOB_TARGET_RUNTIME = os.getenv(JOB_TARGET_RUNTIME_ENV, "runsc")
 
+# Fail-closed sandbox gate. Untrusted miner agents MUST run under gVisor; if the
+# configured agent runtime is not a registered gVisor runtime, the validator
+# refuses to run them (a silent fall-back to runc = arbitrary code with no real
+# isolation). This opt-out exists ONLY for local dev on a box without gVisor
+# (Windows/macOS Docker Desktop) and must never be set on a mainnet validator.
+ALLOW_INSECURE_SANDBOX_ENV = "MASXAI_ALLOW_INSECURE_SANDBOX"
+
 # Where the monitored runtime writes its per-container strace logs.
 JOB_MON_LOG_ROOT_ENV = "RUNSC_MON_LOG_ROOT"
 JOB_MON_LOG_ROOT = os.getenv(JOB_MON_LOG_ROOT_ENV, "/tmp/runsc-mon")
@@ -201,6 +208,23 @@ BROWSER_AGENT_TIMEOUT_S = 300
 BROWSER_AUDIT_ENABLED = os.getenv("MASXAI_BROWSER_AUDIT_ENABLED", "false").strip().lower() in (
     "1", "true", "yes", "on",
 )
+
+# --- Python-script agent model -------------------------------------------------
+# The admission marketplace accepts a single miner-supplied agent.py (defining
+# agent_main(ctx)), NOT a whole Docker image. The validator runs ONE fixed,
+# audited base image (secqurityVali/sandbox/Dockerfile) and mounts the miner's
+# script read-only at JOB_AGENT_SCRIPT_MOUNT. There is no attacker-controlled
+# image to load or vet per submission -- the only moving part is a few hundred
+# bytes of Python behind the identical, locked-down sandbox. Override the image
+# tag with MASXAI_SANDBOX_BASE_IMAGE after building it on the validator host.
+SANDBOX_BASE_IMAGE = os.getenv("MASXAI_SANDBOX_BASE_IMAGE", "masxai-sandbox:base")
+# Where the miner's agent.py is bind-mounted (read-only) inside the base image.
+# NOT on PYTHONPATH, so a module it drops cannot shadow a stdlib/SDK import; the
+# entrypoint (secqurityVali/sandbox_entry.py) loads it from this explicit path.
+JOB_AGENT_SCRIPT_MOUNT = "/sandbox/agent.py"
+# Largest miner agent.py we will mount. A legitimate single-file agent is small;
+# anything past this is not an honest submission.
+MAX_AGENT_SCRIPT_BYTES = 512 * 1024             # 512 KiB
 
 # The findings file the agent must write, mounted from a per-run host dir.
 JOB_OUTPUT_MOUNT = "/out"
@@ -241,6 +265,19 @@ SCANNER_OUTPUT_MAX_BYTES = 16 * 1024 * 1024     # 16 MiB cap per scanner's JSON
 SCANNER_MAX_FINDINGS = 500                       # cap the merged list (severity-ranked)
 SCANNER_LABEL = "secqurityvali-scanner=1"
 JOB_OUT_DIR_MAX_BYTES = 16 * 1024 * 1024        # 16 MiB total in /out before it's treated as abuse
+
+# Hard resource caps for the untrusted agent run (beyond cgroup mem/cpu/pids).
+# fsize bounds any SINGLE file the agent can write (soft:hard, bytes) -> a `dd`
+# of /dev/zero into /out can't fill the host disk. nofile bounds open FDs.
+# A legit findings.json is KBs; 16 MiB is generous headroom while still capping
+# a runaway write. These are belt-and-braces alongside the /out tmpfs size cap.
+JOB_AGENT_FSIZE_ULIMIT = f"{JOB_OUT_DIR_MAX_BYTES}:{JOB_OUT_DIR_MAX_BYTES}"
+JOB_AGENT_NOFILE_ULIMIT = DRY_RUN_NOFILE_ULIMIT   # "1024:1024"
+
+# /out is mounted as a size-capped tmpfs so the agent physically cannot fill the
+# host disk during a run (the read-side refusal at JOB_OUT_DIR_MAX_BYTES is only
+# after the fact). A bit above the dir cap so a legit <=16 MiB write still fits.
+JOB_OUT_TMPFS_SIZE = os.getenv("MASXAI_JOB_OUT_TMPFS_SIZE", "32m")
 
 # --- repo-build target (customer gives a git repo instead of a live URL) ---
 # The customer's repo is UNTRUSTED code. We clone it, build its single

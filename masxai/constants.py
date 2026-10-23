@@ -94,6 +94,20 @@ DISCORD_WEBHOOK_URL_ENV = "MASXAI_DISCORD_WEBHOOK_URL"
 DISCORD_TIMEOUT_ENV = "MASXAI_DISCORD_TIMEOUT"
 DISCORD_TIMEOUT = 5.0                  # short on purpose: never hold up a round
 
+# A SEPARATE webhook for the security (mech 1) validator's per-round eval feed,
+# so it posts to its own private "Vali LOGS" channel without mixing into the
+# LLM-key channel above. Unset is the kill switch, exactly like the one above.
+# Only on-chain-public eval metadata is sent (uid, hotkey, category, pass/fail,
+# task score, safe flag) -- never a canary, a secret, or a miner's IP.
+SECURITY_DISCORD_WEBHOOK_URL_ENV = "MASXAI_SECURITY_DISCORD_WEBHOOK_URL"
+
+# A THIRD webhook for the per-miner detailed evaluation feed ("Testing Logs"
+# channel) -- one embed per agent test, with the task breakdown and a generic
+# failure hint so miners can debug why they passed or failed. Same safety rules:
+# never a canary, never that run's vulnerable endpoint/parameter (the answer),
+# never raw agent output or a miner IP. Unset is the kill switch.
+SECURITY_TESTLOG_DISCORD_WEBHOOK_URL_ENV = "MASXAI_SECURITY_TESTLOG_DISCORD_WEBHOOK_URL"
+
 LLM_KEY_BASE_URL_ENV = "MASXAI_LLM_KEY_BASE_URL"
 LLM_KEY_VALIDATOR_TOKEN_ENV = "MASXAI_LLM_KEY_VALIDATOR_TOKEN"
 LLM_KEY_TIMEOUT_ENV = "MASXAI_LLM_KEY_TIMEOUT"
@@ -213,6 +227,11 @@ LLM_KEY_MODEL_TIER_DEFAULT_WEIGHT = 0.5   # unlisted-but-allowed provider/model
 # security round (has_agent=False), never crashes the axon.
 SECURITY_AGENT_ENABLED_ENV = "MASXAI_SECURITY_AGENT_ENABLED"
 SECURITY_AGENT_IMAGE_ENV = "MASXAI_SECURITY_AGENT_IMAGE"
+# Python-script model: a path to the miner's single agent.py. When set (and
+# enabled), the miner submits that script instead of a docker image -- the
+# validator runs it in the fixed base-image sandbox. Takes precedence over the
+# image when both are configured; empty => the image path is used as before.
+SECURITY_AGENT_SCRIPT_ENV = "MASXAI_SECURITY_AGENT_SCRIPT"
 
 # Dendrite timeout when the validator asks a miner for its image reference.
 # The payload is tiny (one string), so this is short.
@@ -354,14 +373,15 @@ MARKETPLACE_TIMEOUT = 10.0                             # short: a push must neve
 MARKETPLACE_MAX_RETRIES = 3                            # on 429 / 5xx / network error
 
 # An agent ENTERS the marketplace when its miner's cross-category aggregate --
-# the same freshness-filtered mean that feeds weights -- reaches this score.
-# The aggregate is an EMA, so after any imperfect run it approaches 1.0 but
-# never lands on it exactly; the tolerance lets a miner that has recovered with
-# a run of perfect evaluations count as 1.0 instead of being locked out.
+# the same freshness-filtered mean that feeds weights -- reaches MARKETPLACE_MIN_SCORE
+# (defined once above, default 0.8). The aggregate is an EMA, so it approaches a
+# target but never lands on it exactly; the tolerance below lets a miner that has
+# effectively reached the bar count, instead of being locked out by a rounding gap.
 # Once listed, every later evaluation of that agent is pushed too, so the
 # marketplace shows its real trajectory rather than freezing at the entry score.
-MARKETPLACE_MIN_SCORE_ENV = "MASXAI_MARKETPLACE_MIN_SCORE"
-MARKETPLACE_MIN_SCORE = 1.0
+# NOTE: MARKETPLACE_MIN_SCORE is NOT redefined here -- a duplicate "= 1.0" used to
+# live here and silently overrode the 0.8 default above, making admission require
+# a perfect 1.0 in EVERY category. Removed so the single 0.8 definition applies.
 MARKETPLACE_SCORE_TOLERANCE_ENV = "MASXAI_MARKETPLACE_SCORE_TOLERANCE"
 MARKETPLACE_SCORE_TOLERANCE = 1e-3
 
