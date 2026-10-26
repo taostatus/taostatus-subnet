@@ -64,6 +64,7 @@ class AuditReport:
     # backend passes findings through as JSON, so this also rides along per-finding
     # as status="potential"; the top-level flag is for callers that want one bit.
     analysis_only: bool = False
+    recording: dict | None = None  # trimmed agent<->target transcript (replay view)
 
     def to_result(self) -> dict:
         """The POST /api/internal/runs/{id}/result body."""
@@ -78,6 +79,7 @@ class AuditReport:
             "error_count": self.error_count,
             "false_positives": self.false_positives,
             "findings": self.findings,
+            "recording": self.recording,
             "error": self.error,
         }
 
@@ -127,6 +129,14 @@ def score_audit(
 
 # --- the orchestration (integration-tested on the isolation host) -------
 
+def _read_recording(stats_dir: str) -> dict | None:
+    try:
+        with open(os.path.join(stats_dir, "transcript.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
 def _read_proxy_stats(stats_dir: str) -> dict:
     try:
         with open(os.path.join(stats_dir, "stats.json"), encoding="utf-8") as fh:
@@ -149,14 +159,16 @@ def _parse_findings(findings_raw: bytes) -> list:
 
 
 def run_audit(
-    agent_image: str,
-    target_url: str,
+    agent_image: str | None = None,
+    target_url: str = "",
     *,
     scope: dict | None = None,
     timeout_s: int = C.JOB_AGENT_TIMEOUT_S,
     allow_private: bool = False,
     credentials=None,
     confirm=None,
+    agent_script: str | None = None,
+    progress=None,
 ) -> AuditReport:
     """Run one audit and return a measured report. Never raises: any failure is a
     `failed` report, and everything created is destroyed before returning.
@@ -226,7 +238,8 @@ def run_audit(
         # agent: same hardening as the vetting sandbox, but pointed at the proxy.
         agent_args = _agent_args(agent_name, int_net, agent_image, proxy_ip,
                                  out_dir, resolv_path, run_id, timeout_s,
-                                 credentials=credentials)
+                                 credentials=credentials, agent_script=agent_script,
+                                 scope=scope)
         created = job._run(agent_args, timeout=C.DOCKER_CLI_TIMEOUT_S)
         if created.returncode != 0:
             return AuditReport.failed(f"agent create failed: {created.stderr.strip()[:300]}")
@@ -234,11 +247,25 @@ def run_audit(
         job._run(["start", agent_name], timeout=C.DOCKER_CLI_TIMEOUT_S)
 
         timed_out = False
-        try:
-            job._run(["wait", agent_name], timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            job._run(["kill", agent_name], timeout=C.DOCKER_CLI_TIMEOUT_S)
+        _deadline = time.monotonic() + timeout_s
+        while True:
+            _insp = job._run(["inspect", "-f", "{{.State.Running}}", agent_name],
+                             timeout=C.DOCKER_CLI_TIMEOUT_S)
+            _running = (_insp.stdout or "").strip() == "true"
+            if progress is not None:
+                try:
+                    _rec = _read_recording(stats_dir)
+                    if _rec:
+                        progress(_rec)
+                except Exception:
+                    pass
+            if not _running:
+                break
+            if time.monotonic() > _deadline:
+                timed_out = True
+                job._run(["kill", agent_name], timeout=C.DOCKER_CLI_TIMEOUT_S)
+                break
+            time.sleep(3)
         duration_ms = int((time.monotonic() - started) * 1000)
 
         # collect
@@ -267,6 +294,7 @@ def run_audit(
             status="completed", confirmed=confirmed, clean=clean, safe=safe, score=score,
             duration_ms=duration_ms, request_count=request_count, error_count=error_count,
             false_positives=false_positives, findings=findings,
+            recording=_read_recording(stats_dir),
         )
     except subprocess.TimeoutExpired as exc:
         return AuditReport.failed(f"docker call timed out: {exc}")
@@ -286,7 +314,7 @@ def run_audit(
 
 
 def _agent_args(name, network, agent_image, proxy_ip, out_dir, resolv_path, run_id,
-                timeout_s, credentials=None):
+                timeout_s, credentials=None, agent_script=None, scope=None):
     """Agent invocation: mirrors the vetting sandbox hardening (job.py) -- gVisor
     runtime, --internal network, blackhole DNS, read-only root, dropped caps,
     size-capped /out -- but TARGET_URL points at the proxy, not a synthetic
@@ -304,6 +332,9 @@ def _agent_args(name, network, agent_image, proxy_ip, out_dir, resolv_path, run_
         "--memory-swap", C.DRY_RUN_MEMORY_SWAP,
         "--cpus", str(C.DRY_RUN_CPUS),
         "--pids-limit", str(C.DRY_RUN_PIDS_LIMIT),
+        # single-file size cap + open-FD cap (host /out is a size-capped tmpfs too)
+        "--ulimit", f"fsize={C.JOB_AGENT_FSIZE_ULIMIT}",
+        "--ulimit", f"nofile={C.JOB_AGENT_NOFILE_ULIMIT}",
         "--read-only",
         "--tmpfs", C.DRY_RUN_TMPFS,
         "--mount", f"type=bind,src={out_dir},dst={C.JOB_OUTPUT_MOUNT}",
@@ -317,7 +348,16 @@ def _agent_args(name, network, agent_image, proxy_ip, out_dir, resolv_path, run_
     ]
     if credentials:
         args += ["-e", f"SECAUDIT_CREDS={json.dumps(credentials)}"]
-    args.append(agent_image)
+    if scope:
+        args += ["-e", f"SECAUDIT_SCOPE={json.dumps(scope)}"]
+    # Python-script model (new miner flow): mount the miner agent.py into the
+    # fixed base image instead of running a miner-supplied Docker image.
+    if agent_script:
+        args += ["--mount",
+                 f"type=bind,src={agent_script},dst={C.JOB_AGENT_SCRIPT_MOUNT},readonly"]
+        args.append(C.SANDBOX_BASE_IMAGE)
+    else:
+        args.append(agent_image)
     return args
 
 
@@ -725,6 +765,7 @@ def run_audit_from_repo(
         os.chmod(out_dir, 0o777)
     except OSError:
         pass
+    job._mount_out_tmpfs(out_dir)   # hard-cap /out so the agent can't fill host disk
     resolv_path = job._blackhole_resolv()
     started = time.monotonic()
     agent_cid = ""
@@ -791,6 +832,7 @@ def run_audit_from_repo(
     finally:
         job._rm_container(agent_name)
         target.teardown()
+        job._umount_out(out_dir)   # release the /out tmpfs now the container is gone
         shutil.rmtree(out_dir, ignore_errors=True)
         try:
             os.unlink(resolv_path)

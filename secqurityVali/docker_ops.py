@@ -166,6 +166,34 @@ def docker_available(*, runner: DockerRunner | None = None) -> bool:
     return result.returncode == 0
 
 
+def runtime_available(runtime: str, *, runner: DockerRunner | None = None) -> bool:
+    """Is `runtime` a container runtime the daemon has registered? Used to refuse
+    running untrusted miner agents unless the gVisor runtime is really present --
+    a missing runtime would otherwise let Docker fall back to the default (runc)
+    with no real isolation. Returns False on any uncertainty (fail-closed)."""
+    if not runtime:
+        return False
+    try:
+        result = run_docker(
+            ["info", "--format", "{{json .Runtimes}}"],
+            runner=runner,
+            timeout=C.DOCKER_CLI_TIMEOUT_S,
+            timeout_reason=RejectReason.DOCKER_UNAVAILABLE,
+        )
+    except StageFailure:
+        return False
+    if result.returncode != 0:
+        return False
+    out = (result.stdout or "").strip()
+    try:
+        runtimes = json.loads(out) if out else {}
+    except (ValueError, TypeError):
+        # Fall back to a substring check only if the JSON is unparseable, so a
+        # format quirk does not wrongly disable a correctly-configured host.
+        return f'"{runtime}"' in out
+    return runtime in (runtimes or {})
+
+
 def load_image(path: Path | str, *, runner: DockerRunner | None = None) -> str:
     """Run stage LOAD. Returns the image reference Docker reports.
 

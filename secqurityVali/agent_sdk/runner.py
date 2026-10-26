@@ -83,6 +83,10 @@ class RunResult:
     duration_ms: int
     logs: list[str] = field(default_factory=list)
     error: Optional[str] = None
+    # login proof (when a browser login was attempted)
+    authenticated: bool = False
+    login_screenshot: Optional[str] = None   # base64 JPEG of the post-login page
+    login_url: Optional[str] = None
 
 
 # --- the concrete context handed to the agent -------------------------------
@@ -115,6 +119,10 @@ class RunnerContext:
         # endpoint records captured by browser recon (empty unless use_browser);
         # the agent reads this to attack the real surface instead of a static crawl
         self.discovered: list = []
+        # login proof for the report (set by browser recon)
+        self.authenticated: bool = False
+        self.login_screenshot: Optional[str] = None
+        self.login_url: Optional[str] = None
 
         # one reused client each; the target client has creds baked in
         self._llm_http = httpx.Client(timeout=config.llm_timeout_s)
@@ -317,6 +325,10 @@ class RunnerContext:
                     bearer=session.get("bearer"),
                     headers=session.get("headers") or {},
                 )
+            # visual + status proof that the agent authenticated, for the report
+            self.authenticated = bool(session.get("authenticated"))
+            self.login_screenshot = session.get("login_screenshot")
+            self.login_url = session.get("login_url")
         except Exception as exc:  # noqa: BLE001 - recon must never crash the run
             self.log(f"browser: recon failed {type(exc).__name__}: {exc}")
             self.discovered = []
@@ -360,4 +372,7 @@ def run_agent(agent_main: AgentMain, config: RunConfig) -> RunResult:
         duration_ms=int((time.monotonic() - t0) * 1000),
         logs=list(ctx._logs),
         error=error,
+        authenticated=ctx.authenticated,
+        login_screenshot=ctx.login_screenshot,
+        login_url=ctx.login_url,
     )

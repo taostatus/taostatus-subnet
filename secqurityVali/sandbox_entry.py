@@ -30,9 +30,11 @@ never this process's self-report.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import traceback
 from urllib.parse import parse_qsl, urlsplit
@@ -51,6 +53,23 @@ _CONFIDENCE = {"proven": 0.99, "confirmed": 0.99, "potential": 0.5, "possible": 
 AGENT_PATH = os.getenv("AGENT_PATH", "/sandbox/agent.py")
 
 
+def _defines_agent_main(path: str) -> bool:
+    """Decide the run mode WITHOUT executing the miner code: does the module
+    define a top-level `agent_main` (SDK style), or is it a self-contained script
+    (an `if __name__ == '__main__'` guard) that runs itself? Parses only."""
+    try:
+        tree = ast.parse(open(path, "r", encoding="utf-8").read())
+    except Exception:  # noqa: BLE001 - unreadable/unparsable -> let the SDK path error clearly
+        return True
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "agent_main":
+            return True
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "agent_main" for t in node.targets):
+            return True
+    return False
+
+
 def _load_agent_main(path: str):
     """Load `agent_main` from the mounted agent file. Executing the miner's
     top-level code here is safe: this whole process already runs inside the
@@ -66,6 +85,34 @@ def _load_agent_main(path: str):
     if not callable(fn):
         raise RuntimeError("agent.py does not define a callable agent_main(ctx)")
     return fn
+
+
+def _run_self_contained(agent_path: str, out_path: str, run_id: str, budget: int) -> int:
+    """Run a self-contained agent (no agent_main): a standalone script that reads
+    TARGET_URL / OUTPUT_PATH / RUN_ID / SECAUDIT_CREDS from the environment and
+    writes its own findings.json. It runs as an isolated (-I), time-bounded
+    subprocess inside this same sandbox, so it is contained exactly like an SDK
+    agent. The script owns OUTPUT_PATH; we only backfill an empty findings file if
+    it produced none, so the validator never waits on a missing file."""
+    err = None
+    try:
+        r = subprocess.run([sys.executable, "-I", agent_path], env=os.environ.copy(),
+                           timeout=budget, check=False, capture_output=True)
+        if r.returncode != 0:
+            err = f"exit={r.returncode}"
+        tail = (r.stderr or b"").decode("utf-8", "replace")[-2000:]
+        if tail:
+            sys.stderr.write(tail)
+    except subprocess.TimeoutExpired:
+        err = "timeout"
+    except Exception as exc:  # noqa: BLE001
+        err = f"{type(exc).__name__}: {exc}"
+    if not os.path.isfile(out_path):
+        _write_findings(out_path, _build_findings_doc(
+            run_id, [], {"error": err or "no output", "mode": "self-contained"}))
+    print(f"sandbox_entry: self-contained agent done (err={err})",
+          file=sys.stderr, flush=True)
+    return 0
 
 
 def _credentials_from_env() -> "Credentials | None":
@@ -209,6 +256,11 @@ def main() -> int:
             budget = int(os.getenv("TIME_BUDGET_S", "300"))
         except ValueError:
             budget = 300
+
+        # Self-contained agent (no agent_main): a standalone script that writes its
+        # own findings.json. Run it directly and return; nothing below applies.
+        if not _defines_agent_main(AGENT_PATH):
+            return _run_self_contained(AGENT_PATH, out_path, run_id, budget)
 
         cfg = RunConfig(
             target_url=target,

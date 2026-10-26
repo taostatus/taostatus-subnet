@@ -93,7 +93,8 @@ def browser_recon(
     """Drive the browser and return the captured endpoint records. `login` is
     {"email","password","path"} to authenticate first; `in_scope(path)->bool`
     rejects out-of-scope paths (from the run's Scope)."""
-    empty_session = {"cookies": {}, "bearer": None, "headers": {}}
+    empty_session = {"cookies": {}, "bearer": None, "headers": {},
+                     "authenticated": False, "login_screenshot": None, "login_url": None}
     try:
         from playwright.sync_api import sync_playwright
     except Exception:  # noqa: BLE001 - optional dependency
@@ -108,7 +109,8 @@ def browser_recon(
     records: dict = {}
     # the authenticated session the browser obtained, to hand to the agent so its
     # attacks run authenticated (bearer token from the API's Authorization header)
-    session = {"cookies": {}, "bearer": None, "headers": {}}
+    session = {"cookies": {}, "bearer": None, "headers": {},
+               "authenticated": False, "login_screenshot": None, "login_url": None}
 
     def _keep(path: str) -> bool:
         return bool(path) and scoped(path)
@@ -162,7 +164,18 @@ def browser_recon(
             queue: list = [target + "/"]
 
             if login and login.get("email") and login.get("password"):
-                if _do_login(page, target, login, nav_timeout_ms, log):
+                ok = _do_login(page, target, login, nav_timeout_ms, log)
+                session["authenticated"] = bool(ok)
+                # capture what the agent sees AFTER logging in -- visual proof for the
+                # report that the agent really got past the login
+                try:
+                    import base64
+                    png = page.screenshot(type="jpeg", quality=55)
+                    session["login_screenshot"] = base64.b64encode(png).decode()
+                    session["login_url"] = page.url
+                except Exception:  # noqa: BLE001
+                    pass
+                if ok:
                     log("browser: login OK -> authenticated crawl")
                     for seed in ("/dashboard", "/profile", "/account", "/settings",
                                  "/my-listings", "/messages", "/notifications"):

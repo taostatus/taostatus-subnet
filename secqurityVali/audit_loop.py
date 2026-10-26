@@ -51,6 +51,7 @@ def process_audit_job(
     run_audit_from_repo=_run_audit_from_repo,
     run_browser_audit=_run_browser_audit,
     timeout_s: int | None = None,
+    progress=None,
 ) -> dict:
     """Run one audit job and return the result body (RunResultIn shape).
 
@@ -79,6 +80,8 @@ def process_audit_job(
     kwargs = {}
     if timeout_s is not None:
         kwargs["timeout_s"] = timeout_s
+    if progress is not None:
+        kwargs["progress"] = progress
 
     # Browser engine (Live-URL, modern/SPA): our own trusted Playwright agent, not
     # a miner image -- so it does not go through miner vetting/resolution.
@@ -113,6 +116,12 @@ def process_audit_job(
         report = run_audit_from_repo(image, target, aspects=aspects,
                                      credentials=credentials, **kwargs)  # white-box
     else:
-        report = run_audit(image, target, scope=scope,
-                           credentials=credentials, **kwargs)  # black-box URL
+        # Python-script model (new miner flow): resolve_agent may return a path
+        # to the miner agent.py (.py) instead of a Docker image ref.
+        if isinstance(image, str) and image.endswith(".py"):
+            report = run_audit(None, target, scope=scope, credentials=credentials,
+                               agent_script=image, **kwargs)
+        else:
+            report = run_audit(image, target, scope=scope,
+                               credentials=credentials, **kwargs)  # black-box URL
     return _finalize(report, target)

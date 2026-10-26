@@ -21,6 +21,7 @@ from masxai import constants as C
 
 NEXT_JOB_PATH = "/api/internal/next-job"
 RESULT_PATH = "/api/internal/runs/{run_id}/result"
+PROGRESS_PATH = "/api/internal/runs/{run_id}/progress"
 
 
 def _default_transport(method: str, url: str, headers: dict, body: bytes | None, timeout: float):
@@ -56,6 +57,17 @@ class AuditBackendClient:
         except Exception:  # noqa: BLE001 - a backend problem must never break the validator
             pass
         return None
+
+    def post_progress(self, run_id: str, recording: dict) -> bool:
+        """Push a partial recording mid-run so the UI can show it live."""
+        url = f"{self.base_url}{PROGRESS_PATH.format(run_id=urllib.parse.quote(str(run_id)))}"
+        headers = {**self._auth(), "Content-Type": "application/json"}
+        try:
+            body = json.dumps({"recording": recording}).encode("utf-8")
+            status, _ = self._transport("POST", url, headers, body, self.timeout)
+            return 200 <= int(status) < 300
+        except Exception:
+            return False
 
     def post_result(self, run_id: str, result: dict) -> bool:
         """Return the validated result for a run. True on a 2xx, else False."""

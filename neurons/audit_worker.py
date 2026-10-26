@@ -72,9 +72,12 @@ def main() -> int:
         return _agent_status(base_url, agent_id) == "active"
 
     def resolve_agent(agent_id: str) -> str:
-        # MVP: every operational audit runs the reference agent image (which is
-        # what every live agent serves today). A production build re-fetches and
-        # decrypts the specific miner's agent here instead.
+        # Python-script model (new miner flow): run the miner agent.py directly.
+        # MASXAI_AUDIT_AGENT_SCRIPT points at the script the miner serves; a
+        # production build re-fetches+decrypts the specific miner agent per run.
+        script = (os.getenv("MASXAI_AUDIT_AGENT_SCRIPT") or "").strip()
+        if script and os.path.exists(script):
+            return script
         return ref_image
 
     print(f"audit-worker: polling {base_url} every {poll_s}s | agent image: {ref_image}")
@@ -93,7 +96,8 @@ def main() -> int:
         run_id = job.get("run_id")
         print(f"audit-worker: START run={run_id} agent={job.get('agent_id')} "
               f"target={job.get('target_url')}")
-        result = process_audit_job(job, is_vetted=is_vetted, resolve_agent=resolve_agent)
+        result = process_audit_job(job, is_vetted=is_vetted, resolve_agent=resolve_agent,
+                                   progress=lambda rec: client.post_progress(run_id, rec))
         posted = client.post_result(run_id, result)
         print(f"audit-worker: DONE  run={run_id} status={result.get('status')} "
               f"confirmed={result.get('confirmed')} score={result.get('score')} posted={posted}")

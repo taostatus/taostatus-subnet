@@ -31,6 +31,8 @@ import http.client
 import ipaddress
 import json
 import os
+import re
+import socket
 import ssl
 import threading
 import time
@@ -80,6 +82,102 @@ class ProxyConfig:
                 f"refusing to proxy to non-public target {self.target_ip} "
                 f"(private/loopback/link-local/reserved)"
             )
+
+
+# --- transcript recorder: capture pages + attack payloads for the replay view ---
+_ATTACK_MARKERS = ("'", '"', " or ", "%27", " union ", "../", "..%2f", "<script",
+                   ";", "|", "`", "169.254", "127.0.0.1", "localhost", "etc/passwd",
+                   "sleep(", "waitfor", " and ", "--", "0x", "$(", "{{")
+
+
+def _classify_attack(path: str, body: str):
+    """Best-effort category for a request the agent sent: sqli/lfi/cmdi/ssrf/idor,
+    or None for benign recon. Lets the UI show what the agent tried per category."""
+    blob = (path + " " + (body or "")).lower()
+    if any(m in blob for m in ("../", "..%2f", "....//", "etc/passwd", "boot.ini", "/proc/self", "php://")):
+        return "lfi"
+    if any(m in blob for m in (";id", "|id", "`", "$(", "&&", "%0a", "sleep ", "sleep(", "whoami", ";cat ", "|cat ", "$ifs")):
+        return "cmdi"
+    if any(m in blob for m in ("'", "%27", " union ", "union select", " or ", "' and ", "--", "0x3", "'='", "sqlmap")):
+        return "sqli"
+    if any(m in blob for m in ("url=", "redirect=", "next=", "callback=", "169.254", "127.0.0.1", "localhost", "metadata", "http%3a", "file://", "gopher://", "dns=")):
+        return "ssrf"
+    if re.search(r"/(?:api|users?|orders?|accounts?|sellers?|buyers?|invoices?|profiles?)/\d", blob) or re.search(r"[?&]id=\d", blob):
+        return "idor"
+    return None
+
+
+class Transcript:
+    """Records a trimmed, bounded transcript of the agent<->target traffic so the
+    dashboard can replay what the agent saw and did. All best-effort; never raises
+    into the relay path."""
+
+    def __init__(self) -> None:
+        p = os.environ.get("PROXY_STATS_PATH") or "/stats/stats.json"
+        self.path = (p[:-len("stats.json")] + "transcript.json"
+                     if p.endswith("stats.json") else "/stats/transcript.json")
+        self.pages: dict[str, dict] = {}
+        self.events: list[dict] = []
+        self.attacks: list[dict] = []
+        self.n = 0
+        self.cats: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def capture(self, method, path, req_body, status, resp_headers, resp_body, cat_hint=None) -> None:
+        with self._lock:
+            self.n += 1
+            ctype = ""
+            for k, v in (resp_headers or []):
+                if k.lower() == "content-type":
+                    ctype = v
+                    break
+            is_html = "text/html" in ctype.lower()
+            try:
+                body_txt = (req_body or b"").decode("utf-8", "replace")[:400]
+            except Exception:
+                body_txt = ""
+            blob = (path + " " + body_txt).lower()
+            _ATTACK_PHASES = ("sqli", "idor", "ssrf", "cmdi", "lfi")
+            if cat_hint in _ATTACK_PHASES:
+                cat = cat_hint
+            elif cat_hint in ("recon", "auth"):
+                cat = None
+            else:
+                cat = _classify_attack(path, body_txt)
+            is_attack = cat is not None
+            if cat:
+                self.cats[cat] = self.cats.get(cat, 0) + 1
+            base = path.split("?", 1)[0]
+            if is_html and base not in self.pages and len(self.pages) < 14:
+                try:
+                    html = (resp_body or b"")[:60000].decode("utf-8", "replace")
+                except Exception:
+                    html = ""
+                self.pages[base] = {"url": path, "status": status, "html": html}
+            ev = {"i": self.n, "method": method, "path": path[:300],
+                  "status": status, "attack": is_attack, "cat": cat}
+            if is_attack and len(self.attacks) < 120:
+                ev["payload"] = body_txt[:300]
+                self.attacks.append(ev)
+            if len(self.events) < 600:
+                self.events.append(ev)
+            if self.n % 15 == 0:
+                self._write()
+
+    def _write(self) -> None:
+        try:
+            doc = {"pages": list(self.pages.values()), "events": self.events,
+                   "attacks": self.attacks, "cats": self.cats, "count": self.n}
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+            os.replace(tmp, self.path)
+        except Exception:
+            pass
+
+    def finalize(self) -> None:
+        with self._lock:
+            self._write()
 
 
 @dataclass
@@ -158,6 +256,7 @@ def make_server(config: ProxyConfig, *, require_public_target: bool = True) -> T
     server = ThreadingHTTPServer((config.listen_host, config.listen_port), _Handler)
     server.config = config                       # type: ignore[attr-defined]
     server.stats = Stats()                        # type: ignore[attr-defined]
+    server.transcript = Transcript()              # type: ignore[attr-defined]
     server.bucket = _TokenBucket(config.rate_per_sec, config.rate_burst)   # type: ignore[attr-defined]
     server.gate = threading.BoundedSemaphore(config.max_concurrent)         # type: ignore[attr-defined]
     return server
@@ -225,6 +324,12 @@ class _Handler(BaseHTTPRequestHandler):
             latency_ms = (time.monotonic() - started) * 1000.0
             self.stats.record(status=status, latency_ms=latency_ms,
                               sent=len(body), received=len(resp_body))
+            try:
+                self.server.transcript.capture(self.command, self.path, body,
+                                               status, resp_headers, resp_body,
+                                               self.headers.get("X-Audit-Phase"))  # type: ignore[attr-defined]
+            except Exception:
+                pass
             # HEAD must carry no body
             out_body = b"" if self.command == "HEAD" else resp_body
             self._respond(status, out_body, resp_headers)
@@ -247,8 +352,14 @@ class _Handler(BaseHTTPRequestHandler):
             if not cfg.verify_tls:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
-            conn = http.client.HTTPSConnection(cfg.target_ip, cfg.target_port,
+            # Connect to the PINNED ip, but present the real hostname as TLS SNI
+            # so name-based vhosts do not answer 421 Misdirected Request. The
+            # socket is pre-wrapped + assigned, so http.client never re-resolves.
+            conn = http.client.HTTPSConnection(cfg.target_host, cfg.target_port,
                                                timeout=cfg.req_timeout_s, context=ctx)
+            _raw = socket.create_connection((cfg.target_ip, cfg.target_port),
+                                            timeout=cfg.req_timeout_s)
+            conn.sock = ctx.wrap_socket(_raw, server_hostname=cfg.target_host)
         else:
             conn = http.client.HTTPConnection(cfg.target_ip, cfg.target_port,
                                               timeout=cfg.req_timeout_s)
@@ -298,6 +409,10 @@ def write_stats(server: ThreadingHTTPServer) -> None:
             json.dump(server.stats.snapshot(), fh)   # type: ignore[attr-defined]
         os.replace(tmp, cfg.stats_path)
     except OSError:
+        pass
+    try:
+        server.transcript.finalize()             # type: ignore[attr-defined]
+    except Exception:
         pass
 
 

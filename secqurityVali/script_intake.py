@@ -54,22 +54,38 @@ def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _is_main_guard(test: ast.expr) -> bool:
+    """True for an `if __name__ == "__main__":` test (either operand order)."""
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1 \
+            or not isinstance(test.ops[0], ast.Eq):
+        return False
+    names = {n.id for n in (test.left, *test.comparators) if isinstance(n, ast.Name)}
+    consts = {n.value for n in (test.left, *test.comparators) if isinstance(n, ast.Constant)}
+    return "__name__" in names and "__main__" in consts
+
+
 def _has_valid_entrypoint(tree: ast.Module) -> bool:
-    """True iff the module defines a top-level `agent_main` that can be called
-    with one positional argument (the context). A def or an async def both count;
-    so does `agent_main = <callable>` at module level (an alias). We check arity
-    only loosely -- at least one non-vararg parameter, or *args."""
+    """True iff the module has a runnable entry point. Two shapes are accepted:
+
+    * SDK style -- a top-level `agent_main(ctx)` (def, async def, or an alias
+      `agent_main = <callable>`). Arity is checked loosely (>=1 param, or *args).
+    * self-contained style -- an `if __name__ == "__main__":` guard, i.e. a
+      standalone script that reads TARGET_URL/OUTPUT_PATH from the env and writes
+      its own findings.json (the sandbox runs it as a subprocess).
+
+    Either way the script is untrusted and runs only inside the sandbox; intake
+    just checks it can be run at all."""
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == ENTRYPOINT:
             a = node.args
             if a.args or a.posonlyargs or a.vararg:
                 return True
-        # `agent_main = something` -- accept as an alias; arity can't be checked,
-        # the sandbox will surface a bad signature as a run error (-> zero score).
         if isinstance(node, ast.Assign):
             for t in node.targets:
                 if isinstance(t, ast.Name) and t.id == ENTRYPOINT:
                     return True
+        if isinstance(node, ast.If) and _is_main_guard(node.test):
+            return True
     return False
 
 
