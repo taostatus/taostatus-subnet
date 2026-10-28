@@ -41,12 +41,15 @@ def _payload(**overrides):
 def test_payload_carries_metadata_and_scores():
     p = _payload()
     assert p["agent_id"] == "a" * 64
-    assert (p["miner_hotkey"], p["miner_uid"], p["netuid"], p["mechid"]) == ("5Fminer", 7, 501, 1)
+    # The backend keys an agent by its hotkey: `agent_digest` == hotkey, and the
+    # uid/categories output names match marketplace-server's live API.
+    assert p["agent_digest"] == "5Fminer"
+    assert (p["miner_hotkey"], p["uid"], p["netuid"], p["mechid"]) == ("5Fminer", 7, 501, 1)
     assert p["validator_hotkey"] == "5Dvali"
-    assert p["overall_score"] == 1.0 and p["category_scores"] == {"sqli": 1.0}
+    assert p["overall_score"] == 1.0 and p["categories"] == {"sqli": 1.0}
     run = p["run"]
     assert run["category"] == "sqli" and run["variant"] == "boolean_numeric"
-    assert run["score"] == 1.0 and run["safe"] is True and run["accepted"] is True
+    assert run["task_score"] == 1.0 and run["safe"] is True and run["accepted"] is True
     assert run["requests"] == 57 and run["duration_ms"] == 9000
     assert run["evaluated_at"].startswith("2023-11-14T22:13:20")
 
@@ -77,7 +80,7 @@ def test_miner_controlled_display_text_is_sanitized():
 def test_payload_tolerates_a_run_with_no_task():
     job = _job()
     job.task = None
-    assert _payload(job=job, overall_score=0.0)["run"]["score"] == 0.0
+    assert _payload(job=job, overall_score=0.0)["run"]["task_score"] == 0.0
 
 
 # --- the gate ----------------------------------------------------------
@@ -88,10 +91,20 @@ def test_gate_is_the_aggregate_at_the_entry_score():
 
 
 def test_gate_tolerates_the_ema_asymptote():
-    # an EMA never lands exactly on 1.0 after an imperfect run; 0.9995 counts
-    assert mc.should_publish(aggregate=0.9995, agent_id="a", listed=set()) is True
-    assert mc.should_publish(aggregate=0.998, agent_id="a", listed=set()) is False
-    assert mc.should_publish(aggregate=0.998, agent_id="a", listed=set(), tolerance=0.01) is True
+    # An EMA never lands exactly on the entry score after an imperfect run, so the
+    # gate allows a hair below the bar (within tolerance). Derive the boundary
+    # from the live constants (entry score + tolerance) so this can't go stale
+    # when they are tuned (e.g. the entry bar moved 1.0 -> 0.8).
+    bar = C.MARKETPLACE_MIN_SCORE
+    tol = C.MARKETPLACE_SCORE_TOLERANCE
+    # exactly at the bar, and a hair below within tolerance -> publishes
+    assert mc.should_publish(aggregate=bar, agent_id="a", listed=set()) is True
+    assert mc.should_publish(aggregate=bar - tol / 2, agent_id="a", listed=set()) is True
+    # clearly beyond the tolerance band below the bar -> does not publish
+    assert mc.should_publish(aggregate=bar - 10 * tol, agent_id="a", listed=set()) is False
+    # a large enough explicit tolerance lets that same score through
+    assert mc.should_publish(aggregate=bar - 10 * tol, agent_id="a", listed=set(),
+                             tolerance=11 * tol) is True
 
 
 def test_listed_agent_passes_the_gate_at_any_score():

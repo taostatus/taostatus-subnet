@@ -25,11 +25,14 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -37,6 +40,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from masxai.protocol import SecurityAgentSynapse
 from masxai import constants as C
+from masxai import discord
+from masxai.scoring import usage_score
 from masxai.agent_crypto import (
     AgentCryptoError,
     decrypt_agent,
@@ -53,11 +58,13 @@ from masxai.marketplace_client import (
     should_publish,
 )
 from secqurityVali import db, docker_ops
+from secqurityVali import constants as SC
 from secqurityVali.category_scores import CategoryScores
-from secqurityVali.docker_ops import docker_available
+from secqurityVali.docker_ops import docker_available, runtime_available
 from secqurityVali.job import run_job
 from secqurityVali.pipeline import check_and_record
 from secqurityVali.reward import reward_for_job, reward_for_verdict
+from secqurityVali.target_guard import TargetRejected, safe_download
 
 try:
     from template.base.validator import BaseValidatorNeuron
@@ -156,11 +163,27 @@ class SecurityValidator(BaseValidatorNeuron):
         )
         self._listed_agents: set[str] = load_listed(self._listed_agents_path)
 
+        # Emission source. OFF (default) -> weights come from the synthetic
+        # benchmark (capability/admission). ON -> weights come from each miner's
+        # CONFIRMED real audits (GET /api/internal/usage); the benchmark then only
+        # gates who may take customer jobs. Needs the marketplace client to poll;
+        # with no client it falls back to the benchmark. Independent of burn, so
+        # it can run with burn=1.0 to validate scoring before any payout.
+        self._emission_from_usage = bool(
+            getattr(C, "SECURITY_EMISSION_FROM_USAGE", False)
+        ) and self._marketplace is not None
+        self._usage_target_audits = int(getattr(C, "SECURITY_USAGE_TARGET_AUDITS", 10))
+        self._usage_window_s = int(getattr(C, "SECURITY_USAGE_WINDOW_SECONDS", 7 * 24 * 3600))
+
         if not docker_available():
             bt.logging.warning(
                 "security-validator: docker daemon is not reachable -- rounds will "
                 "record docker_unavailable (a validator fault) until it is up"
             )
+
+        # Fail-closed sandbox gate: untrusted miner agents must run under gVisor.
+        self._sandbox_ok = self._check_sandbox_runtime()
+
         bt.logging.info(
             f"Security validator initialized | db={self.db_path} "
             f"pubkey_id={self._pubkey_id} "
@@ -168,6 +191,46 @@ class SecurityValidator(BaseValidatorNeuron):
             f"marketplace={'on' if self._marketplace else 'off'} "
             f"listed_agents={len(self._listed_agents)}"
         )
+
+    def _check_sandbox_runtime(self) -> bool:
+        """Confirm untrusted agents will run under gVisor, or refuse to run them.
+
+        The whole safety of running arbitrary miner code rests on the isolated
+        runtime. If the configured agent runtime is not a gVisor variant, or the
+        daemon has not registered it, Docker would silently fall back to the
+        default runtime (runc) -- arbitrary code with no real isolation. We treat
+        that as a hard stop and skip every untrusted agent run (fail-closed),
+        unless an explicit dev-only opt-out is set.
+        """
+        runtime = SC.JOB_AGENT_RUNTIME
+        is_gvisor = bool(runtime) and runtime.startswith("runsc")
+        registered = runtime_available(runtime) if is_gvisor else False
+        allow_insecure = str(
+            os.getenv(SC.ALLOW_INSECURE_SANDBOX_ENV, "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+        if is_gvisor and registered:
+            bt.logging.info(
+                f"security-validator: sandbox OK -- untrusted agents run under "
+                f"gVisor runtime '{runtime}'"
+            )
+            return True
+
+        msg = (
+            f"security-validator: UNSAFE SANDBOX -- agent runtime '{runtime}' is not "
+            f"a registered gVisor runtime (is_gvisor={is_gvisor}, registered={registered})"
+        )
+        if allow_insecure:
+            bt.logging.warning(
+                msg + f" -- {SC.ALLOW_INSECURE_SANDBOX_ENV} is set, continuing for DEV ONLY. "
+                "NEVER set this on a mainnet validator."
+            )
+            return True
+        bt.logging.error(
+            msg + " -- refusing to run untrusted miner agents (fail-closed). Install/register "
+            f"a gVisor runtime, or set {SC.ALLOW_INSECURE_SANDBOX_ENV}=true for local dev."
+        )
+        return False
 
     def _load_or_create_keypair(self) -> None:
         """Load the persisted SealedBox private key, or mint and store one.
@@ -255,7 +318,7 @@ class SecurityValidator(BaseValidatorNeuron):
                     )
 
                 # 2. full evaluation: sandboxed run, task + safety scoring
-                job = run_job(image_ref)
+                job = run_job(image_ref, category=random.choice(self._active_categories))
                 reward = reward_for_job(job)
                 detail = (
                     f"job:variant={job.variant} accepted={job.accepted} "
@@ -271,7 +334,8 @@ class SecurityValidator(BaseValidatorNeuron):
 
         return await asyncio.to_thread(work)
 
-    async def _evaluate_blob(self, blob_url: str, ciphertext_sha256: str, miner_id: str):
+    async def _evaluate_blob(self, blob_url: str, ciphertext_sha256: str, miner_id: str,
+                             *, kind: str = ""):
         """Download, verify, decrypt and evaluate an encrypted agent blob.
 
         The decrypted tarball goes through the same STRONG tarball intake as a
@@ -286,8 +350,24 @@ class SecurityValidator(BaseValidatorNeuron):
             image_ref = None
             conn = db.connect(self.db_path)
             try:
+                # Anti-SSRF: blob_url is 100% miner-controlled. Refuse any URL
+                # that is not http/https or that resolves to a non-public address
+                # (loopback, private, link-local, CGNAT, cloud metadata) BEFORE we
+                # ever fetch it -- otherwise a miner turns the validator into a
+                # fetch proxy for its internal network / cloud credentials, or
+                # reads local files via file://. A bad URL is the miner's doing,
+                # so it scores a deterministic 0 (never a retryable "our fault").
+                # SSRF-safe fetch: validate + PIN the host, then dial the pinned
+                # IP and never re-resolve (closes the DNS-rebind window between
+                # the check and the download). Redirects are refused inside.
                 try:
-                    blob = self._download_blob(blob_url)
+                    blob = safe_download(
+                        blob_url,
+                        max_bytes=C.SECURITY_BLOB_MAX_BYTES,
+                        timeout=C.SECURITY_BLOB_DOWNLOAD_TIMEOUT_S,
+                    )
+                except TargetRejected as exc:
+                    return EvalOutcome(0.0, f"unsafe_blob_url:{exc}", None)
                 except Exception as e:  # noqa: BLE001 - network/host issue, retryable
                     return EvalOutcome(None, f"download_failed:{type(e).__name__}", None)
                 if ciphertext_sha256 and hashlib.sha256(blob).hexdigest() != ciphertext_sha256:
@@ -296,6 +376,12 @@ class SecurityValidator(BaseValidatorNeuron):
                     tar = decrypt_agent(blob, self._priv_b64)
                 except AgentCryptoError:
                     return EvalOutcome(0.0, "decrypt_failed", None)  # miner's fault, deterministic
+
+                # Python-script model: the decrypted bytes are a single agent.py,
+                # not a docker image. Validate its form (parse only, never exec),
+                # then run it in the fixed base-image sandbox (run_job agent_script).
+                if kind == "script":
+                    return self._evaluate_script(tar, miner_id)
 
                 fd, tar_path = tempfile.mkstemp(prefix="secval-agent-", suffix=".tar")
                 with os.fdopen(fd, "wb") as fh:
@@ -315,7 +401,7 @@ class SecurityValidator(BaseValidatorNeuron):
 
                 # 2. load the validated image for a runnable ref, then evaluate
                 image_ref = docker_ops.load_image(tar_path)
-                job = run_job(image_ref)
+                job = run_job(image_ref, category=random.choice(self._active_categories))
                 reward = reward_for_job(job)
                 detail = (
                     f"job:variant={job.variant} accepted={job.accepted} "
@@ -338,23 +424,43 @@ class SecurityValidator(BaseValidatorNeuron):
 
         return await asyncio.to_thread(work)
 
-    def _download_blob(self, url: str) -> bytes:
-        """Download an encrypted blob, bounded in size and time. Raises on any
-        problem so the caller scores it as our own (retryable) fault."""
-        max_bytes = C.SECURITY_BLOB_MAX_BYTES
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=C.SECURITY_BLOB_DOWNLOAD_TIMEOUT_S) as resp:
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                chunk = resp.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ValueError(f"blob exceeds {max_bytes} bytes")
-                chunks.append(chunk)
-        return b"".join(chunks)
+    def _evaluate_script(self, raw: bytes, miner_id: str):
+        """Evaluate a Python-script submission (the decrypted agent.py bytes).
+
+        Intake is form-only and executes nothing (secqurityVali/script_intake.py);
+        the script runs solely inside the base-image gVisor sandbox. The identity
+        is the script's sha256 (no image digest), which the marketplace upserts by.
+        A malformed/oversized script is the miner's fault -> a deterministic 0.
+        """
+        from secqurityVali.script_intake import validate_agent_script
+
+        sv = validate_agent_script(raw)
+        if not sv.accepted:
+            return EvalOutcome(0.0, f"script_intake:{sv.reason}", None,
+                               agent_id=(sv.agent_id or None))
+
+        fd, script_path = tempfile.mkstemp(prefix="secval-agent-", suffix=".py")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
+            # mkstemp is 0600 (owner-only); the sandbox base image runs as a
+            # NON-root user, so the read-only bind mount must be world-readable or
+            # the container cannot even load the agent. Make it 0644 before the run.
+            os.chmod(script_path, 0o644)
+            job = run_job(agent_script=script_path,
+                          category=random.choice(self._active_categories))
+        finally:
+            try:
+                os.remove(script_path)
+            except OSError:
+                pass
+
+        reward = reward_for_job(job)
+        detail = (f"script:variant={job.variant} accepted={job.accepted} "
+                  f"task={job.task.score if job.task else None} safe={job.safe} "
+                  f"requests={job.request_count}")
+        return EvalOutcome(reward, detail, job.category or None,
+                           agent_id=sv.agent_id, job=job)
 
     async def security_round(self) -> None:
         """Ask every eligible miner for its agent image, evaluate each, and
@@ -389,9 +495,21 @@ class SecurityValidator(BaseValidatorNeuron):
             timeout=C.SECURITY_QUERY_TIMEOUT,
         )
 
+        # Fail-closed: never run untrusted miner agents without a verified gVisor
+        # sandbox. We still asked (harmless) and still recompute/persist scores
+        # below (so the validator keeps setting weights and does not go silent on
+        # chain), but no agent image is executed this round.
+        if not self._sandbox_ok:
+            bt.logging.error(
+                "security-validator: SANDBOX NOT VERIFIED (gVisor) -- skipping all "
+                "untrusted agent runs this round (fail-closed)"
+            )
+            responses = []
+
         rewards: dict[int, float] = {}
         skipped: list[int] = []
         pending_pushes: list[dict] = []   # marketplace records, sent after the loop
+        eval_results: list[dict] = []     # per-miner feed for the Discord round post
         answered = 0
         budget_reached = False
         round_started = time.monotonic()
@@ -418,7 +536,8 @@ class SecurityValidator(BaseValidatorNeuron):
                 if blob_url:
                     # primary path: encrypted blob, opaque to peers
                     cipher_sha = (getattr(resp, "ciphertext_sha256", "") or "").strip()
-                    outcome = await self._evaluate_blob(blob_url, cipher_sha, hotkey)
+                    kind = (getattr(resp, "submission_kind", "") or "").strip().lower()
+                    outcome = await self._evaluate_blob(blob_url, cipher_sha, hotkey, kind=kind)
                     submitted = blob_url
                 elif image_ref:
                     # fallback path: plaintext registry reference
@@ -433,6 +552,10 @@ class SecurityValidator(BaseValidatorNeuron):
             if reward is None:
                 # our fault (docker/orchestration) -- retryable, not the miner's
                 skipped.append(int(uid))
+                eval_results.append({
+                    "uid": int(uid), "hotkey": hotkey, "kind": "infra",
+                    "agent": getattr(outcome, "agent_id", None),
+                })
                 bt.logging.info(
                     f"security-validator: uid={uid} reward=None ({detail}) src={submitted}"
                 )
@@ -452,6 +575,29 @@ class SecurityValidator(BaseValidatorNeuron):
                 f"security-validator: uid={uid} raw={reward} cat={category} "
                 f"agg={agg:.3f} ({detail}) src={submitted}"
             )
+            _job = getattr(outcome, "job", None)
+            if _job is not None:
+                _task = getattr(_job, "task", None)
+                eval_results.append({
+                    "uid": int(uid), "hotkey": hotkey, "kind": "job",
+                    "cat": category,
+                    "variant": getattr(_job, "variant", None),
+                    "accepted": bool(getattr(_job, "accepted", False)),
+                    "task": (_task.score if _task else None),
+                    "canary": (bool(getattr(_task, "canary_found", False)) if _task else None),
+                    "replay": (bool(getattr(_task, "replay_confirmed", False)) if _task else None),
+                    "located": (bool(getattr(_task, "located", False)) if _task else None),
+                    "safe": bool(getattr(_job, "safe", False)),
+                    "requests": getattr(_job, "request_count", None),
+                    "agent": getattr(outcome, "agent_id", None),
+                    "agg": agg,
+                })
+            else:
+                # scored but no job ran -> a bad/duplicate image rejected at intake
+                eval_results.append({
+                    "uid": int(uid), "hotkey": hotkey, "kind": "intake",
+                    "agent": getattr(outcome, "agent_id", None),
+                })
             # Marketplace: decide now (the aggregate and the job are in hand),
             # send after the loop so a slow backend never eats eval budget.
             self._queue_marketplace_push(
@@ -472,11 +618,16 @@ class SecurityValidator(BaseValidatorNeuron):
                 f"own fault (retryable), not the miner's: {skipped}"
             )
 
-        # Score EVERY miner from the freshness-filtered matrix -- not only those
-        # evaluated this round -- so an idle/offline miner whose cells went stale
-        # decays to 0 instead of earning forever (F4), while a recently-scored
-        # miner keeps its score until its window lapses.
-        score_map = self._recompute_all_scores(now)
+        # Score EVERY miner. By DEFAULT from the freshness-filtered benchmark
+        # matrix (capability) -- an idle miner whose cells went stale decays to 0
+        # (F4) instead of earning forever. When emission-from-usage is enabled,
+        # score instead from each miner's CONFIRMED real audits, so emission pays
+        # for delivered, replay-confirmed value rather than for passing the
+        # admission test. Off by default -> mainnet weights are unchanged.
+        if getattr(self, "_emission_from_usage", False):
+            score_map = await self._recompute_scores_from_usage(now)
+        else:
+            score_map = self._recompute_all_scores(now)
         if score_map:
             self._update_from_rewards(score_map)
 
@@ -486,6 +637,30 @@ class SecurityValidator(BaseValidatorNeuron):
             f"published={published}/{len(pending_pushes)} "
             f"budget_reached={budget_reached}"
         )
+
+        # Best-effort: mirror this round to the private Discord channel. No-ops
+        # when the webhook is unset; never raises (so a dead channel can't break
+        # the round). Only public eval metadata is sent -- see masxai/discord.py.
+        _netuid = getattr(self.config, "netuid", None)
+        _network = getattr(getattr(self, "subtensor", None), "network", None)
+        try:
+            await discord.publish_security_round(
+                eval_results, asked=len(miner_uids), answered=answered,
+                netuid=_netuid, network=_network,
+            )
+        except Exception as e:  # noqa: BLE001 -- announcing must never break a round
+            bt.logging.warning(f"security-validator: discord round post failed: {e}")
+
+        # Per-miner detailed feed -> the Testing Logs channel. Posted sequentially
+        # (each await paces itself under Discord's burst limit); every failure is
+        # swallowed inside publish_security_eval so one dead post can't break the
+        # rest or the round.
+        for _r in eval_results:
+            try:
+                await discord.publish_security_eval(_r, netuid=_netuid, network=_network)
+            except Exception as e:  # noqa: BLE001
+                bt.logging.warning(f"security-validator: discord eval post failed: {e}")
+
         self.last_security_round_at = now
 
     # ------------------------------------------------------- marketplace
@@ -577,6 +752,41 @@ class SecurityValidator(BaseValidatorNeuron):
             out[uid] = self._cat_scores.aggregate(
                 hotkey, self._active_categories, now=now, freshness_s=self._freshness_s
             )
+        return out
+
+    async def _recompute_scores_from_usage(self, now: float) -> dict[int, float]:
+        """{uid: score} from each miner's CONFIRMED real-audit usage, polled from
+        the backend -- the one shared source every validator reads, so their
+        weight decisions converge (consensus-safe). score = usage_score(count,
+        avg_score): volume x quality, fail-closed, windowed so an old win cannot
+        pay forever. A poll failure returns {} (no weight change this round)
+        rather than paying or zeroing blindly."""
+        client = getattr(self, "_marketplace", None)
+        if client is None:
+            return {}
+        since = datetime.fromtimestamp(
+            max(0.0, now - self._usage_window_s), tz=timezone.utc
+        ).isoformat()
+        try:
+            rows = await client.get_confirmed_usage(since=since)
+        except Exception as e:  # noqa: BLE001 - a poll must never break the round
+            bt.logging.warning(f"security-validator: usage poll failed: {e}")
+            return {}
+        hk_to_uid = {hk: i for i, hk in enumerate(self.metagraph.hotkeys)}
+        out: dict[int, float] = {}
+        for row in rows or []:
+            hotkey = str((row or {}).get("agent_digest") or "")
+            uid = hk_to_uid.get(hotkey)
+            if uid is None:
+                continue  # hotkey not (or no longer) in the metagraph
+            out[uid] = usage_score(
+                (row or {}).get("confirmed_count", 0),
+                (row or {}).get("avg_score"),
+                target_audits=self._usage_target_audits,
+            )
+        bt.logging.info(
+            f"security-validator: scored {len(out)} miner(s) from confirmed-audit usage"
+        )
         return out
 
     def _update_from_rewards(self, rewards: dict[int, float]) -> None:

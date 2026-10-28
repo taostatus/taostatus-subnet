@@ -163,3 +163,30 @@ def llm_key_efficiency_score(
     tier = max(0.0, min(1.0, model_tier_weight))
 
     return composite * tier
+
+
+def usage_score(confirmed_count: int, avg_score: float | None, *,
+                target_audits: int) -> float:
+    """A miner's emission weight from its CONFIRMED-audit USAGE.
+
+    volume x quality: how much real, replay-confirmed work it delivered, scaled
+    by how good those audits were. Fail-closed -- zero confirmed audits, or
+    confirmed audits with no recorded quality, earn 0. `target_audits` confirmed
+    audits (within the window) give full volume credit; fewer scale down.
+    Clamped to [0, 1]; NaN/inf-safe.
+    """
+    try:
+        n = int(confirmed_count)
+    except (TypeError, ValueError):
+        return 0.0
+    if n <= 0 or avg_score is None:
+        return 0.0  # no delivered value, or confirmed-but-unscored -> pay nothing
+    try:
+        q = float(avg_score)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(q) or math.isinf(q):
+        return 0.0
+    q = max(0.0, min(1.0, q))
+    volume = min(1.0, n / max(1, int(target_audits)))
+    return max(0.0, min(1.0, volume * q))

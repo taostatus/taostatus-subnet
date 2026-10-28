@@ -145,6 +145,27 @@ class SecurityMiner(BaseMinerNeuron):
         self._agent_blobs[cache_key] = (url, cipher_sha)
         return url, cipher_sha
 
+    def _script_blob_for(
+        self, script_path: str, pubkey_b64: str, pubkey_id: str
+    ) -> tuple[str, str]:
+        """Return (blob_url, ciphertext_sha256) for the agent.py at `script_path`,
+        encrypted to `pubkey_b64`. The Python-script model: the script bytes ARE
+        the payload -- no docker-save, same encrypt + opaque-blob transport as the
+        image path. Raises on failure; the caller declines the round."""
+        with open(script_path, "rb") as fh:
+            raw = fh.read()
+        script_sha = sha256_hex(raw)
+        cache_key = (pubkey_b64, script_sha)
+        cached = self._agent_blobs.get(cache_key)
+        if cached is not None:
+            return cached
+        blob = encrypt_agent(raw, pubkey_b64)
+        cipher_sha = sha256_hex(blob)
+        name = f"{(pubkey_id or 'k')[:16]}-{script_sha[:12]}.py.enc"
+        url = self._blob_server.publish(blob, name)  # type: ignore[union-attr]
+        self._agent_blobs[cache_key] = (url, cipher_sha)
+        return url, cipher_sha
+
     async def forward(self, synapse: SecurityAgentSynapse) -> SecurityAgentSynapse:
         """Answer a request for this miner's security-agent image, or decline.
 
@@ -159,12 +180,36 @@ class SecurityMiner(BaseMinerNeuron):
             if not _env_flag(C.SECURITY_AGENT_ENABLED_ENV, False):
                 synapse.has_agent = False
                 return synapse
+            script_path = (os.getenv(C.SECURITY_AGENT_SCRIPT_ENV) or "").strip()
             image_ref = (os.getenv(C.SECURITY_AGENT_IMAGE_ENV) or "").strip()
-            if not image_ref:
+            if not script_path and not image_ref:
                 synapse.has_agent = False
                 return synapse
 
             pubkey = (synapse.validator_pubkey_b64 or "").strip()
+
+            # Python-script model (preferred when a script is configured). A
+            # script has no public-registry fallback, so it needs the validator's
+            # key + the blob server; without them we decline this round.
+            if script_path:
+                if pubkey and self._blob_server is not None:
+                    blob_url, cipher_sha = self._script_blob_for(
+                        script_path, pubkey, synapse.pubkey_id
+                    )
+                    synapse.blob_url = blob_url
+                    synapse.ciphertext_sha256 = cipher_sha
+                    synapse.blob_encoding = "nacl-sealedbox-v1"
+                    synapse.pubkey_id_used = synapse.pubkey_id
+                    synapse.submission_kind = "script"
+                    synapse.has_agent = True
+                    synapse.timestamp = _utc_now_iso()
+                else:
+                    bt.logging.warning(
+                        "security: script model needs the validator's pubkey and "
+                        "a blob server; declining this round")
+                    synapse.has_agent = False
+                return synapse
+
             if pubkey and self._blob_server is not None:
                 # encrypted path: host an opaque blob the validator can decrypt
                 blob_url, cipher_sha = self._agent_blob_for(

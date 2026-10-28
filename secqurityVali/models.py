@@ -62,6 +62,8 @@ class RejectReason(str, enum.Enum):
     MALFORMED_ARCHIVE = "malformed_archive"      # tar itself won't parse
     MALFORMED_MANIFEST = "malformed_manifest"    # manifest.json isn't valid image metadata
     MULTIPLE_IMAGES = "multiple_images"          # archive holds more than one image
+    RESERVED_TAG = "reserved_tag"                # carries a tag that docker load would use to
+                                                 # overwrite one of our own images (target poisoning)
     # Caught from the tar headers while streaming -- a member declaring 100 GB
     # is rejected before any of its payload is read.
     DECOMPRESSION_BOMB = "decompression_bomb"    # declared size or entry count past the cap

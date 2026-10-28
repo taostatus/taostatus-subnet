@@ -170,6 +170,9 @@ def check_submission(
             repo_tags=structure.repo_tags or None,
             layer_count=structure.layer_count,
         )
+        # Refuse a tag that `docker load` would use to OVERWRITE one of our own
+        # images (target poisoning) -- rejected here, before the daemon applies it.
+        docker_ops.assert_no_reserved_tags(structure.repo_tags)
 
         # --- stage LOAD: hostile bytes reach the daemon here ---
         stage = Stage.LOAD
@@ -188,6 +191,9 @@ def check_submission(
             image_user=image.image_user,
         )
         docker_ops.check_image(image)
+        # Defence in depth (covers the registry path, which skips STRUCTURE): the
+        # image docker actually unpacked must not carry a reserved tag either.
+        docker_ops.assert_no_reserved_tags(image.repo_tags)
         # Resolved last: an image with nothing to run is rejected here, and
         # the resolved command is what a future dry run would invoke.
         evidence.add(entrypoint=docker_ops.entrypoint_of(image))

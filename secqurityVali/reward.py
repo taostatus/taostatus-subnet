@@ -19,10 +19,26 @@ miner at all. It returns None -- "do not score this round" -- so a validator
 outage never records a zero against a miner who did nothing wrong.
 """
 
+from masxai import constants as C
 from secqurityVali.models import Verdict
 
 REWARD_PASS = 1.0
 REWARD_FAIL = 0.0
+
+
+def _efficiency_factor(request_count: int) -> float:
+    """Scale a correct run by how few requests it took. A surgical agent (<=
+    target requests) keeps full credit; a brute-forcer is scaled down toward the
+    floor. request_count is the agent's own behaviour -- roughly deterministic and
+    EMA-smoothed -- so this does not fracture multi-validator consensus the way a
+    wall-clock speed term would. Returns a multiplier in [FLOOR, 1.0]."""
+    floor = C.SECURITY_EFFICIENCY_FLOOR
+    target = max(1, C.SECURITY_EFFICIENCY_TARGET_REQUESTS)
+    n = int(request_count or 0)
+    if n <= 0:
+        return 1.0                        # nothing to penalise (shouldn't happen on a real solve)
+    efficiency = min(1.0, target / n)     # <= target requests -> 1.0; more -> less
+    return floor + (1.0 - floor) * efficiency
 
 
 def reward_for_verdict(verdict: Verdict) -> float | None:
@@ -58,7 +74,12 @@ def reward_for_job(job) -> float | None:
     task = getattr(job, "task", None)
     if task is None:
         return 0.0                        # malformed / unparseable findings
-    return float(task.score)
+    capability = float(task.score)
+    if capability <= 0.0:
+        return 0.0                        # no capability -> efficiency is irrelevant
+    # Fold in efficiency: a correct run is scaled by how few requests it took, so
+    # agents that all solve the task are separated by HOW WELL (surgical vs brute).
+    return capability * _efficiency_factor(getattr(job, "request_count", 0))
 
 
 def rewards_for_round(

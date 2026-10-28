@@ -43,6 +43,9 @@ def make_validator(responses, reward_by_ref):
     # keypair state the ask carries; a real validator sets these in __init__.
     v._pubkey_b64 = "test-pubkey-b64"
     v._pubkey_id = "testpubid"
+    # sandbox-runtime gate (__init__ sets this from _check_sandbox_runtime); the
+    # tests assume a healthy sandbox so agents are actually executed and scored.
+    v._sandbox_ok = True
     # per-category capability matrix (single active category here, so the
     # aggregate equals the run's raw score -- first observation seeds the cell).
     v._active_categories = ("sqli",)
@@ -132,14 +135,14 @@ def test_encrypted_blob_path_is_scored():
     v = make_validator(responses, {})
 
     called = {}
-    async def fake_blob(blob_url, cipher_sha, miner_id):
-        called["args"] = (blob_url, cipher_sha, miner_id)
+    async def fake_blob(blob_url, cipher_sha, miner_id, kind=""):
+        called["args"] = (blob_url, cipher_sha, miner_id, kind)
         return sv.EvalOutcome(0.8, "faked-blob", "sqli")
     v._evaluate_blob = fake_blob
 
     asyncio.run(v.security_round())
 
-    assert called["args"] == ("http://miner-1/agent.enc", "sha", "miner-1")
+    assert called["args"] == ("http://miner-1/agent.enc", "sha", "miner-1", "")
     assert dict(zip(v.captured[1], v.captured[0])) == {1: 0.8}
 
 
@@ -269,11 +272,12 @@ def test_perfect_aggregate_is_published_to_marketplace():
 
     assert [p["agent_id"] for p in mp.pushed] == [aid("ghcr.io/a:1")]
     rec = mp.pushed[0]
-    assert rec["miner_uid"] == 1 and rec["miner_hotkey"] == "miner-1"
+    assert rec["uid"] == 1 and rec["miner_hotkey"] == "miner-1"
+    assert rec["agent_digest"] == "miner-1"
     assert rec["netuid"] == 501 and rec["mechid"] == 1
     assert rec["validator_hotkey"] == "us-hotkey"
-    assert rec["overall_score"] == 1.0 and rec["category_scores"] == {"sqli": 1.0}
-    assert rec["run"]["score"] == 1.0 and rec["run"]["safe"] is True
+    assert rec["overall_score"] == 1.0 and rec["categories"] == {"sqli": 1.0}
+    assert rec["run"]["task_score"] == 1.0 and rec["run"]["safe"] is True
     assert rec["run"]["variant"] == "union" and rec["run"]["requests"] == 42
     assert rec["name"] == "demo-agent" and rec["version"] == "0.3"
     assert aid("ghcr.io/a:1") in v._listed_agents
@@ -312,7 +316,7 @@ def test_listed_agent_keeps_being_published_after_a_drop():
     v._marketplace = mp
     asyncio.run(v.security_round())
     assert len(mp.pushed) == 1
-    assert mp.pushed[0]["overall_score"] == 0.0 and mp.pushed[0]["run"]["score"] == 0.0
+    assert mp.pushed[0]["overall_score"] == 0.0 and mp.pushed[0]["run"]["task_score"] == 0.0
 
 
 def test_marketplace_failure_never_changes_scores():

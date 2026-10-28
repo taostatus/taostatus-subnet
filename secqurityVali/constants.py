@@ -174,6 +174,13 @@ JOB_AGENT_RUNTIME = os.getenv(JOB_AGENT_RUNTIME_ENV, "runsc-monitor")
 JOB_TARGET_RUNTIME_ENV = "MASXAI_JOB_TARGET_RUNTIME"
 JOB_TARGET_RUNTIME = os.getenv(JOB_TARGET_RUNTIME_ENV, "runsc")
 
+# Fail-closed sandbox gate. Untrusted miner agents MUST run under gVisor; if the
+# configured agent runtime is not a registered gVisor runtime, the validator
+# refuses to run them (a silent fall-back to runc = arbitrary code with no real
+# isolation). This opt-out exists ONLY for local dev on a box without gVisor
+# (Windows/macOS Docker Desktop) and must never be set on a mainnet validator.
+ALLOW_INSECURE_SANDBOX_ENV = "MASXAI_ALLOW_INSECURE_SANDBOX"
+
 # Where the monitored runtime writes its per-container strace logs.
 JOB_MON_LOG_ROOT_ENV = "RUNSC_MON_LOG_ROOT"
 JOB_MON_LOG_ROOT = os.getenv(JOB_MON_LOG_ROOT_ENV, "/tmp/runsc-mon")
@@ -182,9 +189,49 @@ JOB_MON_LOG_ROOT = os.getenv(JOB_MON_LOG_ROOT_ENV, "/tmp/runsc-mon")
 # agent probes many endpoints and enumerates a schema.
 JOB_AGENT_TIMEOUT_S = 180
 
+# The headless-browser agent (Playwright + Chromium) for Live-URL audits of
+# modern JS/SPA apps: it renders the page, logs in, explores, captures the real
+# API surface and attacks it. Heavier than the reference agent (needs ~2 GiB and
+# a shm tmpfs for Chromium), so it is used only on the Live-URL path, not the
+# synthetic benchmark. Override with MASXAI_BROWSER_AGENT_IMAGE.
+BROWSER_AGENT_IMAGE = os.getenv("MASXAI_BROWSER_AGENT_IMAGE", "secaudit-browser:v1")
+BROWSER_AGENT_MEMORY = "2g"
+BROWSER_AGENT_SHM = "1g"
+BROWSER_AGENT_CPUS = "2"
+BROWSER_AGENT_TIMEOUT_S = 300
+
+# The browser (Live-URL, modern/SPA) audit path runs headless Chromium with full
+# network egress, so a customer-controlled page could reach cloud metadata /
+# internal services from the isolation host (SSRF). It is therefore OFF by default
+# and must stay off on any host reachable by untrusted customers, until the egress
+# is forced through a public-only filtering proxy. Enable only then.
+BROWSER_AUDIT_ENABLED = os.getenv("MASXAI_BROWSER_AUDIT_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# --- Python-script agent model -------------------------------------------------
+# The admission marketplace accepts a single miner-supplied agent.py (defining
+# agent_main(ctx)), NOT a whole Docker image. The validator runs ONE fixed,
+# audited base image (secqurityVali/sandbox/Dockerfile) and mounts the miner's
+# script read-only at JOB_AGENT_SCRIPT_MOUNT. There is no attacker-controlled
+# image to load or vet per submission -- the only moving part is a few hundred
+# bytes of Python behind the identical, locked-down sandbox. Override the image
+# tag with MASXAI_SANDBOX_BASE_IMAGE after building it on the validator host.
+SANDBOX_BASE_IMAGE = os.getenv("MASXAI_SANDBOX_BASE_IMAGE", "masxai-sandbox:base")
+# Where the miner's agent.py is bind-mounted (read-only) inside the base image.
+# NOT on PYTHONPATH, so a module it drops cannot shadow a stdlib/SDK import; the
+# entrypoint (secqurityVali/sandbox_entry.py) loads it from this explicit path.
+JOB_AGENT_SCRIPT_MOUNT = "/sandbox/agent.py"
+# Largest miner agent.py we will mount. A legitimate single-file agent is small;
+# anything past this is not an honest submission.
+MAX_AGENT_SCRIPT_BYTES = 512 * 1024             # 512 KiB
+
 # The findings file the agent must write, mounted from a per-run host dir.
 JOB_OUTPUT_MOUNT = "/out"
 JOB_FINDINGS_NAME = "findings.json"
+# Where a white-box agent sees the target's source, mounted read-only (customer
+# repo audits only; never in the benchmark). The agent reads SECAUDIT_SOURCE_DIR.
+JOB_SOURCE_MOUNT = "/src"
 
 # The agent controls /out, so reading its findings must never let it hang the
 # validator (a FIFO read blocks forever), follow a symlink out of the mount, or
@@ -192,4 +239,79 @@ JOB_FINDINGS_NAME = "findings.json"
 # JOB_FINDINGS_MAX_BYTES; if the agent filled the whole mount past
 # JOB_OUT_DIR_MAX_BYTES we refuse it outright.
 JOB_FINDINGS_MAX_BYTES = 1 * 1024 * 1024        # 1 MiB -- larger is not a real findings doc
+
+# --- Layer 1: universal static scan (Semgrep + Trivy), offline in a sandbox ----
+# The pre-built scanner image (secqurityVali/scanners/Dockerfile) with Semgrep +
+# Trivy and their rules/DB baked in. Run with NO network (rules are local).
+SCANNER_IMAGE = "secaudit-scanner:v1"
+# The scanner only PARSES untrusted code (never executes it), so it runs under the
+# default runtime (runc) rather than gVisor: gVisor's gofer filesystem makes
+# reading the hundreds of rule files 2x+ slower, and the parser is already boxed by
+# caps-drop ALL + read-only + --network none + non-root + no-new-privileges.
+SCANNER_RUNTIME = "runc"
+SCANNER_SOURCE_MOUNT = "/repo"                  # repo mounted read-only here
+SCANNER_OUTPUT_MOUNT = "/out"                   # each scanner writes its JSON here
+SCANNER_SEMGREP_RULES = "/opt/semgrep-rules"    # baked-in rule tree
+SCANNER_TRIVY_CACHE = "/opt/trivy-cache"        # baked-in vuln DB
+# Scanners parse (never run) untrusted code, but are still sandboxed hard. They
+# need more room than the agent (Semgrep is memory/tmp-hungry on big repos).
+SCANNER_MEMORY = "2g"
+SCANNER_MEMORY_SWAP = "2g"                       # == memory -> swap disabled
+SCANNER_CPUS = "2.0"
+SCANNER_PIDS_LIMIT = 512
+SCANNER_TMPFS = "/tmp:rw,noexec,nosuid,size=512m"
+SCANNER_TIMEOUT_S = 300                          # per scanner, then killed
+SCANNER_OUTPUT_MAX_BYTES = 16 * 1024 * 1024     # 16 MiB cap per scanner's JSON
+SCANNER_MAX_FINDINGS = 500                       # cap the merged list (severity-ranked)
+SCANNER_LABEL = "secqurityvali-scanner=1"
 JOB_OUT_DIR_MAX_BYTES = 16 * 1024 * 1024        # 16 MiB total in /out before it's treated as abuse
+
+# Hard resource caps for the untrusted agent run (beyond cgroup mem/cpu/pids).
+# fsize bounds any SINGLE file the agent can write (soft:hard, bytes) -> a `dd`
+# of /dev/zero into /out can't fill the host disk. nofile bounds open FDs.
+# A legit findings.json is KBs; 16 MiB is generous headroom while still capping
+# a runaway write. These are belt-and-braces alongside the /out tmpfs size cap.
+JOB_AGENT_FSIZE_ULIMIT = f"{JOB_OUT_DIR_MAX_BYTES}:{JOB_OUT_DIR_MAX_BYTES}"
+JOB_AGENT_NOFILE_ULIMIT = DRY_RUN_NOFILE_ULIMIT   # "1024:1024"
+
+# /out is mounted as a size-capped tmpfs so the agent physically cannot fill the
+# host disk during a run (the read-side refusal at JOB_OUT_DIR_MAX_BYTES is only
+# after the fact). A bit above the dir cap so a legit <=16 MiB write still fits.
+JOB_OUT_TMPFS_SIZE = os.getenv("MASXAI_JOB_OUT_TMPFS_SIZE", "32m")
+
+# --- repo-build target (customer gives a git repo instead of a live URL) ---
+# The customer's repo is UNTRUSTED code. We clone it, build its single
+# Dockerfile, and run it as the audit target on an --internal (zero-egress)
+# network -- the agent reaches it on that network, so even a malicious repo
+# cannot phone home. Every step is time-, size-, and resource-capped, and the
+# whole thing (clone dir, image, container, network) is torn down afterwards.
+REPO_CLONE_TIMEOUT_S = 180                       # git clone wall-clock cap (bigger repos need longer)
+REPO_BUILD_TIMEOUT_S = 240                       # docker build cap. Kept tight on purpose: a
+                                                 # slow/heavy build (multi-language, Rust/Go compile)
+                                                 # shouldn't block the audit for 15 min -- it fails
+                                                 # fast and we fall back to the static scan, which is
+                                                 # the reliable breadth anyway. Simple apps still build.
+REPO_HEALTH_TIMEOUT_S = 90                       # wait for the app to start listening
+REPO_MAX_CLONE_BYTES = 600 * 1024 * 1024         # reject an oversized checkout (600 MiB)
+REPO_MAX_IMAGE_BYTES = 4 * 1024 * 1024 * 1024    # reject an oversized built image (4 GiB)
+REPO_DEFAULT_PORT = 8000                         # assumed app port when none declared/EXPOSEd
+# The build is heavier than the run (compilers, deps); the run is capped like any
+# other untrusted target.
+REPO_BUILD_MEMORY = "2g"
+REPO_BUILD_CPUS = "2.0"
+REPO_RUN_MEMORY = "1g"
+REPO_RUN_MEMORY_SWAP = "1g"                      # == memory: swap disabled
+REPO_RUN_CPUS = "1.0"
+REPO_RUN_PIDS_LIMIT = 256
+# Allowed git URL schemes. file:// and git:// (cleartext, often unauthenticated,
+# can target localhost) are refused -- https/ssh only.
+REPO_ALLOWED_SCHEMES = ("https", "ssh")
+REPO_IMAGE_PREFIX = "secval-repo-"
+REPO_NETWORK_PREFIX = "secval-repo-net-"
+REPO_TARGET_NAME_PREFIX = "secval-repo-tgt-"
+REPO_PROBE_NAME_PREFIX = "secval-repo-probe-"
+REPO_CONFIRMER_NAME_PREFIX = "secval-repo-cfm-"
+# A small trusted image used for the health probe and the in-network confirmer
+# (stdlib Python only -- no third-party deps).
+REPO_UTIL_IMAGE = os.getenv("MASXAI_REPO_UTIL_IMAGE", "python:3.12-alpine")
+REPO_LABEL = "secqurityvali-repo=1"              # every repo-build artifact carries this

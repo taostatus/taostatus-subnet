@@ -63,6 +63,43 @@ _CANDIDATE_ENDPOINTS = (
     "/api/catalog",
 )
 
+# --- randomized, discoverable endpoint paths (Phase 1: real discovery) --
+# The old behaviour picked the vulnerable endpoint from the small fixed list
+# above, which an agent could simply hardcode -- "discovery" was just trying ten
+# known names. Phase 1 generates HIGH-ENTROPY paths per run (not in any fixed
+# list), so an agent cannot know them ahead of time. The target publishes a
+# standard discovery surface (index + /openapi.json) listing all of them, so a
+# genuine crawler finds the real attack surface the way it must on a real app;
+# a hardcoded-list agent now finds nothing. The randomness defeats memorisation;
+# the published surface keeps it fair.
+_PATH_PREFIXES = (
+    "api", "api/v1", "api/v2", "app", "service", "svc", "data", "core",
+    "internal", "web", "backend", "rest",
+)
+_RESOURCE_NOUNS = (
+    "inventory", "catalog", "orders", "report", "account", "record", "entry",
+    "lookup", "search", "items", "profile", "ledger", "listing", "detail",
+    "summary", "export", "query", "dataset", "resource", "node",
+)
+
+
+def _random_endpoints(rng: secrets.SystemRandom, n: int) -> list[str]:
+    """`n` unique, realistic-but-unguessable endpoint paths, e.g.
+    `/api/v2/inventory_a7f3`. The hex suffix makes the path high-entropy (not in
+    any list an agent could ship), while the words keep it looking like a real
+    route rather than an obviously-planted `/vulnerable`."""
+    seen: set[str] = set()
+    out: list[str] = []
+    while len(out) < n:
+        prefix = rng.choice(_PATH_PREFIXES)
+        noun = rng.choice(_RESOURCE_NOUNS)
+        path = f"/{prefix}/{noun}_{secrets.token_hex(2)}"
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
 INJECTION_TYPE = "sql_injection"
 
 # The broad vulnerability CLASS this challenge belongs to. The validator tracks
@@ -85,6 +122,73 @@ SQLI_VARIANTS = (
     "boolean",          # boolean-blind,   string context   (name = '...')
     "boolean_numeric",  # boolean-blind,   numeric context  (id = ...)
 )
+
+# --- command injection (cmdi) category ---------------------------------
+# A second vulnerability class. The canary lives in a file on the target; the
+# only way to read it is to execute a command through the injection, so a correct
+# canary proves real command execution (see targets/cmdi_v1/app.py).
+CATEGORY_CMDI = "cmdi"
+CMDI_INJECTION_TYPE = "command_injection"
+
+# Tool-like endpoints; exactly one is the vulnerable one per run, the rest decoys.
+CMDI_CANDIDATE_ENDPOINTS = (
+    "/api/ping", "/api/dns", "/api/trace", "/api/resolve", "/api/whois",
+    "/api/netcheck", "/api/lookup", "/api/diag", "/api/tools", "/api/status",
+)
+CMDI_PARAMS = ("host", "target", "ip", "addr", "q", "name")
+
+# Techniques within command injection, randomized per run:
+#   basic    -- raw concatenation; output returned (`; cat /flag`)
+#   filtered -- `;`/`&` stripped, so evade with `|`, `$(...)`, backticks, newline
+#   blind    -- no output; exfiltrate via a time-based oracle, char by char
+CMDI_VARIANTS = ("basic", "filtered", "blind")
+# Blind is time-based and therefore slow (a run can take a minute+), so it is a
+# MINORITY of runs -- enough to reward agents that can do it, not so many that
+# every round drags. Weights are relative.
+CMDI_VARIANT_WEIGHTS = (4, 4, 2)   # ~40% basic, ~40% filtered, ~20% blind
+
+# --- path traversal / local file inclusion (lfi) category --------------
+# The canary lives in a file OUTSIDE the served directory; the only way to read
+# it is to traverse out through the vulnerable file-read endpoint.
+CATEGORY_LFI = "lfi"
+LFI_INJECTION_TYPE = "path_traversal"
+LFI_CANDIDATE_ENDPOINTS = (
+    "/api/download", "/api/view", "/api/file", "/api/read", "/api/doc",
+    "/api/attachment", "/api/export", "/api/media", "/api/content", "/api/fetch",
+)
+LFI_PARAMS = ("file", "path", "name", "doc", "f", "filename")
+# basic -- raw `../../flag`; filtered -- `../` stripped (nest: `....//`);
+# encoded -- literal `../` blocked but double-encoding (`%252e%252e%252f`) slips.
+LFI_VARIANTS = ("basic", "filtered", "encoded")
+
+
+# --- broken access control / IDOR (idor) category ----------------------
+# Two authenticated users (Alice, Bob). One resource endpoint is missing its
+# ownership check, so Alice can read Bob's resource by id. The canary lives in
+# Bob's resource on that endpoint -- reading it proves the access-control bypass.
+# No injection; the exploit is identity + another user's id.
+CATEGORY_IDOR = "idor"
+IDOR_ENDPOINT_POOL = (
+    "/api/notes", "/api/orders", "/api/profile", "/api/invoices",
+    "/api/messages", "/api/documents", "/api/tickets", "/api/files",
+    "/api/accounts", "/api/records",
+)
+IDOR_VARIANTS = ("basic",)          # sequential-id IDOR (more variants later)
+
+
+# --- server-side request forgery (ssrf) category -----------------------
+# A url-fetch endpoint with no SSRF protection: pointing it at an internal host
+# (loopback / cloud metadata) returns that host's content, which holds the canary.
+# Reaching the canary proves the forged server-side request. Decoys validate the
+# url and block internal hosts.
+CATEGORY_SSRF = "ssrf"
+SSRF_ENDPOINT_POOL = (
+    "/api/fetch", "/api/preview", "/api/webhook", "/api/import",
+    "/api/thumbnail", "/api/proxy", "/api/screenshot", "/api/oembed",
+    "/api/resolve", "/api/callback",
+)
+SSRF_PARAMS = ("url", "target", "uri", "link", "callback", "src")
+SSRF_VARIANTS = ("basic",)          # raw internal host (bypass variants later)
 
 
 def _suffix() -> str:
@@ -138,25 +242,45 @@ class Challenge:
     # out; reporting it is still a false positive.
     error_trap_endpoint: str = ""
 
+    # IDOR-only (broken access control): two Bearer sessions and the resource ids
+    # whose content holds the canary (Bob's) and a benign one (Alice's). Empty /
+    # zero for every other category, so this is backward compatible.
+    alice_token: str = ""
+    bob_token: str = ""
+    alice_id: str = ""
+    bob_id: str = ""
+    bob_resource_id: int = 0
+    alice_resource_id: int = 0
+
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def generate_challenge(*, rng: secrets.SystemRandom | None = None) -> Challenge:
-    """Build a fresh challenge. Cryptographically random by default.
+def generate_challenge(*, category: str = CATEGORY_SQLI,
+                       rng: secrets.SystemRandom | None = None) -> Challenge:
+    """Build a fresh challenge for `category`. Cryptographically random by default.
 
     `rng` exists only so a test can pin the randomness and assert on the
     result; production always uses the system CSPRNG.
     """
     rng = rng or secrets.SystemRandom()
 
+    if category == CATEGORY_CMDI:
+        return _generate_cmdi(rng)
+    if category == CATEGORY_LFI:
+        return _generate_lfi(rng)
+    if category == CATEGORY_IDOR:
+        return _generate_idor(rng)
+    if category == CATEGORY_SSRF:
+        return _generate_ssrf(rng)
+
     canary = secrets.token_hex(CANARY_BYTES)
 
     secret_table = f"{rng.choice(_SECRET_HOLDERS)}_{_suffix()}"
     secret_column = f"{rng.choice(_COLUMN_NOUNS)}_{_suffix()}"
 
-    endpoints = list(_CANDIDATE_ENDPOINTS)
-    rng.shuffle(endpoints)
+    # High-entropy paths the agent must DISCOVER (not a fixed list it can ship).
+    endpoints = _random_endpoints(rng, 7)
     vulnerable_endpoint = endpoints[0]
     safe_endpoints = tuple(endpoints[1:])
     # The error trap is one of the decoys, chosen at random each run.
@@ -174,4 +298,103 @@ def generate_challenge(*, rng: secrets.SystemRandom | None = None) -> Challenge:
         safe_endpoints=safe_endpoints,
         error_trap_endpoint=error_trap_endpoint,
         variant=variant,
+    )
+
+
+def _generate_cmdi(rng: secrets.SystemRandom) -> Challenge:
+    """A command-injection challenge. The canary lives in a file on the target
+    (not the DB), so `secret_table`/`secret_column` are unused here."""
+    canary = secrets.token_hex(CANARY_BYTES)
+    endpoints = list(CMDI_CANDIDATE_ENDPOINTS)
+    rng.shuffle(endpoints)
+    vulnerable_endpoint = endpoints[0]
+    safe_endpoints = tuple(endpoints[1:])
+    error_trap_endpoint = rng.choice(safe_endpoints) if safe_endpoints else ""
+    return Challenge(
+        canary=canary,
+        secret_table="",
+        secret_column="",
+        vulnerable_endpoint=vulnerable_endpoint,
+        vulnerable_parameter=rng.choice(CMDI_PARAMS),
+        injection_type=CMDI_INJECTION_TYPE,
+        category=CATEGORY_CMDI,
+        variant=rng.choices(CMDI_VARIANTS, weights=CMDI_VARIANT_WEIGHTS)[0],
+        safe_endpoints=safe_endpoints,
+        error_trap_endpoint=error_trap_endpoint,
+    )
+
+
+def _generate_lfi(rng: secrets.SystemRandom) -> Challenge:
+    """A path-traversal / LFI challenge. The canary is a file outside base_dir;
+    `secret_table`/`secret_column` are unused here."""
+    canary = secrets.token_hex(CANARY_BYTES)
+    endpoints = list(LFI_CANDIDATE_ENDPOINTS)
+    rng.shuffle(endpoints)
+    vulnerable_endpoint = endpoints[0]
+    safe_endpoints = tuple(endpoints[1:])
+    error_trap_endpoint = rng.choice(safe_endpoints) if safe_endpoints else ""
+    return Challenge(
+        canary=canary,
+        secret_table="",
+        secret_column="",
+        vulnerable_endpoint=vulnerable_endpoint,
+        vulnerable_parameter=rng.choice(LFI_PARAMS),
+        injection_type=LFI_INJECTION_TYPE,
+        category=CATEGORY_LFI,
+        variant=rng.choice(LFI_VARIANTS),
+        safe_endpoints=safe_endpoints,
+        error_trap_endpoint=error_trap_endpoint,
+    )
+
+
+def _generate_idor(rng: secrets.SystemRandom) -> Challenge:
+    """A broken-access-control / IDOR challenge. The canary lives in Bob's resource
+    on the one endpoint missing its ownership check. Tokens, user ids and resource
+    ids are all per-run random; `secret_table`/`secret_column` are unused here."""
+    canary = secrets.token_hex(CANARY_BYTES)
+    endpoints = list(rng.sample(IDOR_ENDPOINT_POOL, 6))
+    vulnerable_endpoint = endpoints[0]
+    safe_endpoints = tuple(endpoints[1:])
+    # distinct resource ids (Bob's holds the canary; Alice's is benign) and
+    # distinct user ids; sequential-ish range so the agent can enumerate.
+    alice_rid, bob_rid = rng.sample(range(2, 40), 2)
+    alice_uid, bob_uid = rng.sample(range(1000, 9999), 2)
+    return Challenge(
+        canary=canary,
+        secret_table="",
+        secret_column="",
+        vulnerable_endpoint=vulnerable_endpoint,
+        vulnerable_parameter="id",
+        injection_type="",
+        category=CATEGORY_IDOR,
+        variant=rng.choice(IDOR_VARIANTS),
+        safe_endpoints=safe_endpoints,
+        error_trap_endpoint="",
+        alice_token=secrets.token_hex(16),
+        bob_token=secrets.token_hex(16),
+        alice_id=str(alice_uid),
+        bob_id=str(bob_uid),
+        alice_resource_id=alice_rid,
+        bob_resource_id=bob_rid,
+    )
+
+
+def _generate_ssrf(rng: secrets.SystemRandom) -> Challenge:
+    """An SSRF challenge. The canary sits behind an internal host the vulnerable
+    url-fetch endpoint will reach; `secret_table`/`secret_column` are unused."""
+    canary = secrets.token_hex(CANARY_BYTES)
+    endpoints = list(rng.sample(SSRF_ENDPOINT_POOL, 6))
+    vulnerable_endpoint = endpoints[0]
+    safe_endpoints = tuple(endpoints[1:])
+    return Challenge(
+        canary=canary,
+        secret_table="",
+        secret_column="",
+        vulnerable_endpoint=vulnerable_endpoint,
+        vulnerable_parameter=rng.choice(SSRF_PARAMS),
+        injection_type="ssrf",
+        category=CATEGORY_SSRF,
+        variant=rng.choice(SSRF_VARIANTS),
+        safe_endpoints=safe_endpoints,
+        error_trap_endpoint="",
     )

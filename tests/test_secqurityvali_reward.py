@@ -94,3 +94,33 @@ def test_job_malformed_findings_scores_zero():
 
 def test_job_orchestration_error_is_not_scored():
     assert reward_for_job(_job(error="docker exploded", safe=True, task_score=1.0)) is None
+
+
+# --- efficiency fold (capability x efficiency) --------------------------
+import types as _t  # noqa: E402
+
+from secqurityVali.reward import _efficiency_factor  # noqa: E402
+
+
+def _ejob(score, requests, *, safe=True, error=None):
+    return _t.SimpleNamespace(task=_t.SimpleNamespace(score=score), safe=safe,
+                              error=error, request_count=requests)
+
+
+def test_efficiency_rewards_surgical_over_bruteforce():
+    lean = reward_for_job(_ejob(1.0, 50))      # well under target
+    brute = reward_for_job(_ejob(1.0, 4000))   # well over target
+    assert lean == 1.0 and brute < lean        # same capability, surgical wins
+    assert 0.6 <= brute <= 0.75                 # scaled toward the floor, not zero
+
+
+def test_efficiency_does_not_rescue_a_failed_run():
+    assert reward_for_job(_ejob(0.0, 50)) == 0.0          # no capability -> 0 regardless
+    assert reward_for_job(_ejob(1.0, 50, safe=False)) == 0.0   # safety veto still wins
+    assert reward_for_job(_ejob(1.0, 50, error="docker")) is None
+
+
+def test_efficiency_factor_bounds():
+    assert _efficiency_factor(0) == 1.0                   # no requests -> no penalty
+    assert _efficiency_factor(1) == 1.0                   # <= target -> full
+    assert abs(_efficiency_factor(10**9) - 0.6) < 0.01                 # heavy waste -> floor

@@ -121,6 +121,7 @@ celerybeat.pid
 
 # Environments
 .env
+*.env
 .venv
 env/
 venv/
@@ -168,10 +169,26 @@ testing/
 validator_state.json
 scripts/mock_validator_state.json
 
+# security validator SECRETS + runtime state -- NEVER commit. The keypair's
+# private half decrypts every miner's agent, so leaking it compromises the whole
+# track; the rest is local runtime state.
+security_validator_key.json
+security_category_scores.json
+security_marketplace_listed.json
+
 # secqurityVali - local submission database
 secqurityVali.db
 secqurityVali.db-wal
 secqurityVali.db-shm
+
+# marketplace backend lives in its OWN repo (taostatus/marketplace-server).
+# The validator's client stays here (masxai/marketplace_client.py); the backend
+# folder is ignored so this repo never tracks it.
+marketplace.db
+marketplace_backend/
+# marketplace frontend lives in its OWN repo (taostatus/marketplace-client);
+# cloned here for local work, never tracked by this repo.
+marketplace_frontend/
 
 # Private: reference/red-team solvers (kept local, not published so miners cannot copy)
 secqurityVali/agents/

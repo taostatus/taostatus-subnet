@@ -129,15 +129,20 @@ def build_agent_payload(
     )
     record = {
         "agent_id": str(agent_id),
+        # The deployed marketplace backend keys an agent by its miner hotkey, so
+        # it reads `agent_digest` (the hotkey) + `uid` + `categories`. These names
+        # differ from this module's internal kwargs on purpose -- align the OUTPUT
+        # with marketplace-server's live API, not the validator's call site.
+        "agent_digest": str(miner_hotkey),
         "miner_hotkey": str(miner_hotkey),
-        "miner_uid": int(miner_uid),
+        "uid": int(miner_uid),
         "netuid": int(netuid),
         "mechid": int(mechid),
         "validator_hotkey": str(validator_hotkey),
         "name": _display(getattr(job, "agent_name", "")),
         "version": _display(getattr(job, "agent_version", "")),
         "overall_score": round(float(overall_score), 4),
-        "category_scores": {
+        "categories": {
             str(cat): round(float(score), 4)
             for cat, score in (category_scores or {}).items()
             if score is not None
@@ -146,7 +151,10 @@ def build_agent_payload(
             "run_id": str(getattr(job, "run_id", "")),
             "category": str(getattr(job, "category", "") or ""),
             "variant": str(getattr(job, "variant", "") or ""),
-            "score": round(float(getattr(task, "score", 0.0) or 0.0), 4) if task else 0.0,
+            # The backend's RunIn schema + runs table use `task_score` (not
+            # `score`); sending `score` left the per-run column NULL -> "-" in the
+            # UI. Align the key so each run's score shows.
+            "task_score": round(float(getattr(task, "score", 0.0) or 0.0), 4) if task else 0.0,
             "safe": bool(getattr(job, "safe", False)),
             "accepted": bool(getattr(job, "accepted", False)),
             "requests": int(getattr(job, "request_count", 0) or 0),
@@ -164,6 +172,11 @@ def assert_publishable(payload: Any, _path: str = "") -> None:
     if isinstance(payload, dict):
         for key, value in payload.items():
             lowered = str(key).lower()
+            # `agent_digest` carries the miner HOTKEY (public, on-chain), not an
+            # image/layer digest -- the backend keys agents by it. Allow it past
+            # the forbidden-fragment guard that would otherwise catch 'digest'.
+            if lowered == "agent_digest":
+                continue
             for fragment in FORBIDDEN_KEY_FRAGMENTS:
                 if fragment in lowered:
                     raise ValueError(
@@ -247,6 +260,42 @@ class MarketplaceClient:
         except Exception as e:  # noqa: BLE001 -- must never break a caller
             bt.logging.warning(f"marketplace: push failed: {e}")
         return False
+
+    async def get_confirmed_usage(self, since: Optional[str] = None) -> list[dict[str, Any]]:
+        """GET per-agent confirmed-audit usage. Returns [] on ANY error -- a poll
+        must never break the validator's weight-setting loop. The token is never
+        logged. `since` is an ISO-8601 cutoff the backend windows by."""
+        headers = {"Authorization": f"Bearer {self._token}"}
+        params = {"since": since} if since else None
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.base_url, timeout=self.timeout, transport=self._transport
+            ) as client:
+                for attempt in range(1, self.max_retries + 1):
+                    try:
+                        resp = await client.get(
+                            C.MARKETPLACE_USAGE_PATH, headers=headers, params=params
+                        )
+                    except httpx.RequestError as e:
+                        if attempt >= self.max_retries:
+                            bt.logging.warning(f"marketplace: usage poll network error: {e!r}")
+                            return []
+                        await _backoff(attempt)
+                        continue
+                    if 200 <= resp.status_code < 300:
+                        data = resp.json()
+                        return data if isinstance(data, list) else []
+                    if resp.status_code == 429 or resp.status_code >= 500:
+                        if attempt < self.max_retries:
+                            await _backoff(attempt, resp)
+                            continue
+                    bt.logging.warning(
+                        f"marketplace: usage poll HTTP {resp.status_code}: {resp.text[:200]}"
+                    )
+                    return []
+        except Exception as e:  # noqa: BLE001 -- must never break a caller
+            bt.logging.warning(f"marketplace: usage poll failed: {e}")
+        return []
 
 
 async def _backoff(attempt: int, response: Optional[httpx.Response] = None) -> None:

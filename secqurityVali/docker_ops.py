@@ -115,6 +115,28 @@ def excerpt(text: str | None, limit: int = 2000) -> str:
     return text if len(text) <= limit else text[:limit] + "... [truncated]"
 
 
+# Our own images live under this namespace. A SUBMITTED archive must never carry
+# such a tag: `docker load` applies the archive's RepoTags to the local store, so
+# a miner could tag its image `secqurityvali-target-sqli:v1`, and the load would
+# reassign that tag to the miner's image. The next job would then run the MINER'S
+# image as the "target" -- which simply echoes the env-injected canary, earning a
+# full score with no real capability. Rejected before LOAD so the daemon never
+# applies the tag.
+RESERVED_TAG_MARKERS = ("secqurityvali",)
+
+
+def assert_no_reserved_tags(repo_tags) -> None:
+    """Reject an archive whose RepoTags would overwrite one of our images."""
+    for tag in repo_tags or []:
+        low = str(tag).lower()
+        if any(marker in low for marker in RESERVED_TAG_MARKERS):
+            raise StageFailure(
+                RejectReason.RESERVED_TAG,
+                f"archive carries a reserved tag {tag!r}; docker load would "
+                f"overwrite one of our images",
+            )
+
+
 def assert_safe_image_ref(ref: str) -> str:
     """Refuse any reference we would not want to hand back to the CLI.
 
@@ -142,6 +164,34 @@ def docker_available(*, runner: DockerRunner | None = None) -> bool:
     except StageFailure:
         return False
     return result.returncode == 0
+
+
+def runtime_available(runtime: str, *, runner: DockerRunner | None = None) -> bool:
+    """Is `runtime` a container runtime the daemon has registered? Used to refuse
+    running untrusted miner agents unless the gVisor runtime is really present --
+    a missing runtime would otherwise let Docker fall back to the default (runc)
+    with no real isolation. Returns False on any uncertainty (fail-closed)."""
+    if not runtime:
+        return False
+    try:
+        result = run_docker(
+            ["info", "--format", "{{json .Runtimes}}"],
+            runner=runner,
+            timeout=C.DOCKER_CLI_TIMEOUT_S,
+            timeout_reason=RejectReason.DOCKER_UNAVAILABLE,
+        )
+    except StageFailure:
+        return False
+    if result.returncode != 0:
+        return False
+    out = (result.stdout or "").strip()
+    try:
+        runtimes = json.loads(out) if out else {}
+    except (ValueError, TypeError):
+        # Fall back to a substring check only if the JSON is unparseable, so a
+        # format quirk does not wrongly disable a correctly-configured host.
+        return f'"{runtime}"' in out
+    return runtime in (runtimes or {})
 
 
 def load_image(path: Path | str, *, runner: DockerRunner | None = None) -> str:

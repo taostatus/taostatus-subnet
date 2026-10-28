@@ -24,7 +24,7 @@ import json
 import sys
 from pathlib import Path
 
-# Allow running this file directly from a checkout, not just as a module.
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from secqurityVali import constants as C  # noqa: E402

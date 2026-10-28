@@ -31,9 +31,9 @@ import urllib.parse
 import urllib.request
 
 from secqurityVali import constants as C
-from secqurityVali.eval.challenge import Challenge
+from secqurityVali.eval.challenge import CATEGORY_IDOR, Challenge
 from secqurityVali.eval.findings import ReproStep
-from secqurityVali.targets.sqli_v1.provision import TARGET_IMAGE, TARGET_PORT, docker_env_args
+from secqurityVali.targets.registry import provisioner_for
 
 
 def fresh_canary_challenge(challenge: Challenge) -> Challenge:
@@ -48,10 +48,16 @@ def execute_reproduction(
     expected_canary: str,
     *,
     timeout: float = 5.0,
+    auth_header: tuple[str, str] | None = None,
 ) -> bool:
     """Run the agent's reproduction requests against base_url and report whether
-    the expected (fresh) canary appears in any response. Pure HTTP; runs no
-    agent code."""
+    the expected (fresh) canary appears in any response. Pure HTTP; runs no agent
+    code.
+
+    `auth_header` (name, value) is added to every request. For an authenticated
+    category (IDOR) the validator supplies it ITSELF from the challenge (the
+    session is the validator's, never the agent's), so the replay can reach the
+    behind-login surface without trusting anything the agent recorded."""
     if not steps or not expected_canary:
         return False
     base_url = base_url.rstrip("/")
@@ -61,10 +67,12 @@ def execute_reproduction(
         try:
             if step.method == "POST":
                 req = urllib.request.Request(url, data=query.encode(), method="POST")
-                body = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
             else:
                 full = f"{url}?{query}" if query else url
-                body = urllib.request.urlopen(full, timeout=timeout).read().decode("utf-8", "replace")
+                req = urllib.request.Request(full, method="GET")
+            if auth_header:
+                req.add_header(auth_header[0], auth_header[1])
+            body = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
         except Exception:
             continue
         if expected_canary in body:
@@ -92,20 +100,37 @@ def run_replay(
         return False
 
     replay_challenge = fresh_canary_challenge(challenge)
+    prov = provisioner_for(replay_challenge.category)
     name = "secval-replay-" + secrets.token_hex(6)
-    port = host_port or _free_port()
+    network = "secval-replaynet-" + secrets.token_hex(6)
 
     try:
+        # The replay target runs the agent's RECORDED (attacker-controlled) payload.
+        # For command injection that payload is a shell command, so the target must
+        # have NO route out: it runs on an --internal network with no egress, and
+        # the validator (on the host) reaches it by container IP -- a malicious
+        # recorded command therefore cannot phone home or attack anything. (SQLi
+        # payloads can't egress either way, but this holds for every category.)
+        net = subprocess.run(["docker", "network", "create", "--internal", network],
+                             capture_output=True, text=True, timeout=C.DOCKER_CLI_TIMEOUT_S)
+        if net.returncode != 0:
+            return False
         run = subprocess.run(
-            ["docker", "run", "-d", "--name", name,
-             "-p", f"127.0.0.1:{port}:{TARGET_PORT}",
+            ["docker", "run", "-d", "--name", name, "--network", network,
              "--runtime", C.JOB_TARGET_RUNTIME,
-             *docker_env_args(replay_challenge), TARGET_IMAGE],
+             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+             "--pids-limit", str(C.DRY_RUN_PIDS_LIMIT),
+             "--memory", C.DRY_RUN_MEMORY, "--memory-swap", C.DRY_RUN_MEMORY_SWAP,
+             "--cpus", str(C.DRY_RUN_CPUS),
+             *prov.docker_env_args(replay_challenge), prov.TARGET_IMAGE],
             capture_output=True, text=True, timeout=C.DOCKER_CLI_TIMEOUT_S,
         )
         if run.returncode != 0:
             return False
-        base = f"http://127.0.0.1:{port}"
+        ip = _container_ip(name, network)
+        if not ip:
+            return False
+        base = f"http://{ip}:{prov.TARGET_PORT}"
         # Poll until the target actually answers, rather than guessing with a
         # fixed sleep -- a blind re-extraction fires hundreds of requests, and
         # if the first ones hit a not-yet-ready target the extraction comes back
@@ -128,12 +153,28 @@ def run_replay(
             )
             return extracted == replay_challenge.canary
 
-        return execute_reproduction(base, steps, replay_challenge.canary)
+        # IDOR: the validator replays with ITS OWN session (Alice's token from the
+        # fresh challenge), so the behind-login request reaches the resource. The
+        # fresh canary only appears if the broken access control is really there.
+        auth = None
+        if replay_challenge.category == CATEGORY_IDOR and replay_challenge.alice_token:
+            auth = ("Authorization", f"Bearer {replay_challenge.alice_token}")
+        return execute_reproduction(base, steps, replay_challenge.canary, auth_header=auth)
     except Exception:
         return False
     finally:
         subprocess.run(["docker", "rm", "--force", "--volumes", name],
                        capture_output=True, timeout=C.DOCKER_CLI_TIMEOUT_S)
+        subprocess.run(["docker", "network", "rm", network],
+                       capture_output=True, timeout=C.DOCKER_CLI_TIMEOUT_S)
+
+
+def _container_ip(name: str, network: str) -> str:
+    """The replay target's IP on its private network, for the host to reach it."""
+    fmt = '{{(index .NetworkSettings.Networks "' + network + '").IPAddress}}'
+    res = subprocess.run(["docker", "inspect", "-f", fmt, name],
+                         capture_output=True, text=True, timeout=C.DOCKER_CLI_TIMEOUT_S)
+    return (res.stdout or "").strip()
 
 
 def _wait_ready(base_url: str, *, attempts: int = 30, delay: float = 0.5) -> bool:

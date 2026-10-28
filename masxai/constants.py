@@ -94,6 +94,20 @@ DISCORD_WEBHOOK_URL_ENV = "MASXAI_DISCORD_WEBHOOK_URL"
 DISCORD_TIMEOUT_ENV = "MASXAI_DISCORD_TIMEOUT"
 DISCORD_TIMEOUT = 5.0                  # short on purpose: never hold up a round
 
+# A SEPARATE webhook for the security (mech 1) validator's per-round eval feed,
+# so it posts to its own private "Vali LOGS" channel without mixing into the
+# LLM-key channel above. Unset is the kill switch, exactly like the one above.
+# Only on-chain-public eval metadata is sent (uid, hotkey, category, pass/fail,
+# task score, safe flag) -- never a canary, a secret, or a miner's IP.
+SECURITY_DISCORD_WEBHOOK_URL_ENV = "MASXAI_SECURITY_DISCORD_WEBHOOK_URL"
+
+# A THIRD webhook for the per-miner detailed evaluation feed ("Testing Logs"
+# channel) -- one embed per agent test, with the task breakdown and a generic
+# failure hint so miners can debug why they passed or failed. Same safety rules:
+# never a canary, never that run's vulnerable endpoint/parameter (the answer),
+# never raw agent output or a miner IP. Unset is the kill switch.
+SECURITY_TESTLOG_DISCORD_WEBHOOK_URL_ENV = "MASXAI_SECURITY_TESTLOG_DISCORD_WEBHOOK_URL"
+
 LLM_KEY_BASE_URL_ENV = "MASXAI_LLM_KEY_BASE_URL"
 LLM_KEY_VALIDATOR_TOKEN_ENV = "MASXAI_LLM_KEY_VALIDATOR_TOKEN"
 LLM_KEY_TIMEOUT_ENV = "MASXAI_LLM_KEY_TIMEOUT"
@@ -213,6 +227,11 @@ LLM_KEY_MODEL_TIER_DEFAULT_WEIGHT = 0.5   # unlisted-but-allowed provider/model
 # security round (has_agent=False), never crashes the axon.
 SECURITY_AGENT_ENABLED_ENV = "MASXAI_SECURITY_AGENT_ENABLED"
 SECURITY_AGENT_IMAGE_ENV = "MASXAI_SECURITY_AGENT_IMAGE"
+# Python-script model: a path to the miner's single agent.py. When set (and
+# enabled), the miner submits that script instead of a docker image -- the
+# validator runs it in the fixed base-image sandbox. Takes precedence over the
+# image when both are configured; empty => the image path is used as before.
+SECURITY_AGENT_SCRIPT_ENV = "MASXAI_SECURITY_AGENT_SCRIPT"
 
 # Dendrite timeout when the validator asks a miner for its image reference.
 # The payload is tiny (one string), so this is short.
@@ -233,6 +252,36 @@ SECURITY_ROUND_BUDGET_SECONDS = 240
 SECURITY_DB_PATH_ENV = "MASXAI_SECURITY_DB_PATH"
 SECURITY_DB_PATH = "secqurityVali.db"
 
+# --- marketplace handoff (catalog backend) -----------------------------
+# After scoring, the validator pushes each agent's METADATA + SCORES (never the
+# image/code) to the marketplace backend, which the frontend reads. Both unset
+# => the push is a no-op, so the validator runs fine without a backend.
+MARKETPLACE_URL_ENV = "MASXAI_MARKETPLACE_URL"       # e.g. http://host:8099
+MARKETPLACE_TOKEN_ENV = "MASXAI_MARKETPLACE_TOKEN"   # bearer for the internal API
+MARKETPLACE_TIMEOUT_ENV = "MASXAI_MARKETPLACE_TIMEOUT"
+MARKETPLACE_TIMEOUT = 5.0                             # short: never hold up a round
+# Only an agent whose cross-category aggregate reaches this is listed "active" in
+# the marketplace; below it it is marked "stale" (hidden from the active catalog).
+# So only genuinely capable, broad agents show up as sellable -- a weak, one-trick,
+# or decayed agent never appears. With N active categories a one-trick agent caps
+# at 1/N, so 0.8 effectively requires solving (nearly) every category well.
+MARKETPLACE_MIN_SCORE_ENV = "MASXAI_MARKETPLACE_MIN_SCORE"
+MARKETPLACE_MIN_SCORE = float(os.getenv(MARKETPLACE_MIN_SCORE_ENV, "0.8"))
+
+# --- admission reward: capability x efficiency -------------------------
+# The benchmark reward is no longer capability alone: a correct run is scaled by
+# how EFFICIENT it was (how few requests it took to solve). This breaks the tie
+# between agents that all solve the task -- a surgical agent beats a brute-forcer.
+# Efficiency uses request_count (the agent's own behaviour, roughly deterministic
+# and EMA-smoothed across runs) NOT wall-clock time (which varies per validator
+# and would break consensus). Floor keeps a correct-but-wasteful run worth
+# something; target is ~a competent agent's request budget (env-tunable, to be
+# calibrated on live data).
+SECURITY_EFFICIENCY_TARGET_REQUESTS_ENV = "MASXAI_SECURITY_EFFICIENCY_TARGET_REQUESTS"
+SECURITY_EFFICIENCY_TARGET_REQUESTS = int(os.getenv(SECURITY_EFFICIENCY_TARGET_REQUESTS_ENV, "1000"))
+SECURITY_EFFICIENCY_FLOOR_ENV = "MASXAI_SECURITY_EFFICIENCY_FLOOR"
+SECURITY_EFFICIENCY_FLOOR = float(os.getenv(SECURITY_EFFICIENCY_FLOOR_ENV, "0.6"))
+
 # --- security-track agent encryption (v2 transport) --------------------
 # The validator's SealedBox keypair. The private half is persisted here so a
 # restart can still decrypt blobs miners encrypted for the previous ask; the
@@ -247,7 +296,29 @@ SECURITY_VALIDATOR_KEY_FILE = "security_validator_key.json"
 # failed category holds the mean down -- breadth is what earns. Add a category
 # here when a new target type (XSS, SSRF, ...) is introduced. Today: SQLi only,
 # so the aggregate equals the SQLi score until more are added.
-SECURITY_ACTIVE_CATEGORIES = ("sqli",)
+SECURITY_ACTIVE_CATEGORIES = ("sqli", "cmdi", "lfi", "idor", "ssrf")
+
+# --- security-track EMISSION from confirmed customer-audit USAGE ---------
+# When ON, the security validator sets weights from each miner's CONFIRMED real
+# audits (GET /api/internal/usage) instead of the synthetic benchmark -- so
+# emission pays for delivered, replay-confirmed value, not for passing the
+# admission test (which stays as a capability GATE). OFF by default: the
+# benchmark remains the weight signal and this cannot change mainnet weights
+# until deliberately enabled. Independent of BURN_PERCENTAGE -- with the flag ON
+# but burn still 1.0, scores come from usage yet nothing is paid (safe to test).
+SECURITY_EMISSION_FROM_USAGE_ENV = "MASXAI_SECURITY_EMISSION_FROM_USAGE"
+SECURITY_EMISSION_FROM_USAGE = os.getenv(
+    SECURITY_EMISSION_FROM_USAGE_ENV, "false"
+).strip().lower() in ("1", "true", "yes", "on")
+# Confirmed audits (within the window) for full volume credit; fewer scale down.
+SECURITY_USAGE_TARGET_AUDITS_ENV = "MASXAI_SECURITY_USAGE_TARGET_AUDITS"
+SECURITY_USAGE_TARGET_AUDITS = int(os.getenv(SECURITY_USAGE_TARGET_AUDITS_ENV, "10"))
+# Only confirmed audits newer than this window count, so an old win can't pay
+# forever (mirrors the benchmark's freshness decay). Default 7 days.
+SECURITY_USAGE_WINDOW_SECONDS_ENV = "MASXAI_SECURITY_USAGE_WINDOW_SECONDS"
+SECURITY_USAGE_WINDOW_SECONDS = int(
+    os.getenv(SECURITY_USAGE_WINDOW_SECONDS_ENV, str(7 * 24 * 3600))
+)
 
 # Where the per-miner, per-category EMA matrix is persisted (see
 # secqurityVali/category_scores.py), and the EMA weight on each new observation.
@@ -262,7 +333,13 @@ SECURITY_CATEGORY_EMA_ALPHA = 0.5
 # fall to 0 -- so a one-time solve cannot pay forever. Rounds re-evaluate every
 # answering miner (~every submission interval), so this is several rounds long.
 SECURITY_CATEGORY_FRESHNESS_SECONDS_ENV = "MASXAI_SECURITY_CATEGORY_FRESHNESS_SECONDS"
-SECURITY_CATEGORY_FRESHNESS_SECONDS = 1800   # 30 minutes
+SECURITY_CATEGORY_FRESHNESS_SECONDS = 7200   # 2 hours
+# With several categories drawn at RANDOM per evaluation, a single agent is only
+# re-scored on one category at a time, so the window must be long enough that a
+# regularly-evaluated agent keeps EVERY category cell fresh at once (otherwise its
+# cross-category aggregate flaps as one cell ages out). 30 min was too short for 3
+# categories -- even a perfect all-rounder dipped to (1+1+0)/3 = 0.667. 2h covers
+# cycling all categories; a genuinely idle agent still decays to 0.
 
 # Bound on the encrypted blob the validator will download from a miner. A blob
 # is a docker-save tarball plus SealedBox overhead; larger than the image cap is
@@ -290,19 +367,21 @@ SECURITY_BLOB_PORT = 8912
 MARKETPLACE_BASE_URL_ENV = "MASXAI_MARKETPLACE_BASE_URL"
 MARKETPLACE_TOKEN_ENV = "MASXAI_MARKETPLACE_TOKEN"
 MARKETPLACE_AGENTS_PATH = "/api/internal/agents"      # POST, bearer token, upsert by agent id
+MARKETPLACE_USAGE_PATH = "/api/internal/usage"        # GET, bearer token, per-hotkey confirmed-audit usage
 MARKETPLACE_TIMEOUT_ENV = "MASXAI_MARKETPLACE_TIMEOUT_SECONDS"
 MARKETPLACE_TIMEOUT = 10.0                             # short: a push must never hold up a round
 MARKETPLACE_MAX_RETRIES = 3                            # on 429 / 5xx / network error
 
 # An agent ENTERS the marketplace when its miner's cross-category aggregate --
-# the same freshness-filtered mean that feeds weights -- reaches this score.
-# The aggregate is an EMA, so after any imperfect run it approaches 1.0 but
-# never lands on it exactly; the tolerance lets a miner that has recovered with
-# a run of perfect evaluations count as 1.0 instead of being locked out.
+# the same freshness-filtered mean that feeds weights -- reaches MARKETPLACE_MIN_SCORE
+# (defined once above, default 0.8). The aggregate is an EMA, so it approaches a
+# target but never lands on it exactly; the tolerance below lets a miner that has
+# effectively reached the bar count, instead of being locked out by a rounding gap.
 # Once listed, every later evaluation of that agent is pushed too, so the
 # marketplace shows its real trajectory rather than freezing at the entry score.
-MARKETPLACE_MIN_SCORE_ENV = "MASXAI_MARKETPLACE_MIN_SCORE"
-MARKETPLACE_MIN_SCORE = 1.0
+# NOTE: MARKETPLACE_MIN_SCORE is NOT redefined here -- a duplicate "= 1.0" used to
+# live here and silently overrode the 0.8 default above, making admission require
+# a perfect 1.0 in EVERY category. Removed so the single 0.8 definition applies.
 MARKETPLACE_SCORE_TOLERANCE_ENV = "MASXAI_MARKETPLACE_SCORE_TOLERANCE"
 MARKETPLACE_SCORE_TOLERANCE = 1e-3
 
