@@ -91,10 +91,20 @@ def test_gate_is_the_aggregate_at_the_entry_score():
 
 
 def test_gate_tolerates_the_ema_asymptote():
-    # an EMA never lands exactly on 1.0 after an imperfect run; 0.9995 counts
-    assert mc.should_publish(aggregate=0.9995, agent_id="a", listed=set()) is True
-    assert mc.should_publish(aggregate=0.998, agent_id="a", listed=set()) is False
-    assert mc.should_publish(aggregate=0.998, agent_id="a", listed=set(), tolerance=0.01) is True
+    # An EMA never lands exactly on the entry score after an imperfect run, so the
+    # gate allows a hair below the bar (within tolerance). Derive the boundary
+    # from the live constants (entry score + tolerance) so this can't go stale
+    # when they are tuned (e.g. the entry bar moved 1.0 -> 0.8).
+    bar = C.MARKETPLACE_MIN_SCORE
+    tol = C.MARKETPLACE_SCORE_TOLERANCE
+    # exactly at the bar, and a hair below within tolerance -> publishes
+    assert mc.should_publish(aggregate=bar, agent_id="a", listed=set()) is True
+    assert mc.should_publish(aggregate=bar - tol / 2, agent_id="a", listed=set()) is True
+    # clearly beyond the tolerance band below the bar -> does not publish
+    assert mc.should_publish(aggregate=bar - 10 * tol, agent_id="a", listed=set()) is False
+    # a large enough explicit tolerance lets that same score through
+    assert mc.should_publish(aggregate=bar - 10 * tol, agent_id="a", listed=set(),
+                             tolerance=11 * tol) is True
 
 
 def test_listed_agent_passes_the_gate_at_any_score():

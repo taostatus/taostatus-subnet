@@ -81,8 +81,10 @@ def test_report_to_result_has_backend_fields():
                     findings=[{"type": "sqli"}])
     body = r.to_result()
     assert set(body) == {"status", "confirmed", "clean", "safe", "score", "duration_ms",
-                         "request_count", "error_count", "false_positives", "findings", "error"}
+                         "request_count", "error_count", "false_positives", "findings",
+                         "recording", "error"}
     assert body["status"] == "completed" and body["findings"] == [{"type": "sqli"}]
+    assert body["recording"] is None   # unset -> omitted/None, not fabricated
 
 
 def test_failed_report_is_zero_and_unsafe():
