@@ -43,6 +43,9 @@ def make_validator(responses, reward_by_ref):
     # keypair state the ask carries; a real validator sets these in __init__.
     v._pubkey_b64 = "test-pubkey-b64"
     v._pubkey_id = "testpubid"
+    # sandbox-runtime gate (__init__ sets this from _check_sandbox_runtime); the
+    # tests assume a healthy sandbox so agents are actually executed and scored.
+    v._sandbox_ok = True
     # per-category capability matrix (single active category here, so the
     # aggregate equals the run's raw score -- first observation seeds the cell).
     v._active_categories = ("sqli",)
@@ -132,14 +135,14 @@ def test_encrypted_blob_path_is_scored():
     v = make_validator(responses, {})
 
     called = {}
-    async def fake_blob(blob_url, cipher_sha, miner_id):
-        called["args"] = (blob_url, cipher_sha, miner_id)
+    async def fake_blob(blob_url, cipher_sha, miner_id, kind=""):
+        called["args"] = (blob_url, cipher_sha, miner_id, kind)
         return sv.EvalOutcome(0.8, "faked-blob", "sqli")
     v._evaluate_blob = fake_blob
 
     asyncio.run(v.security_round())
 
-    assert called["args"] == ("http://miner-1/agent.enc", "sha", "miner-1")
+    assert called["args"] == ("http://miner-1/agent.enc", "sha", "miner-1", "")
     assert dict(zip(v.captured[1], v.captured[0])) == {1: 0.8}
 
 
