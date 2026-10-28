@@ -34,8 +34,6 @@ import json
 import os
 import tempfile
 import time
-import urllib.error
-import urllib.request
 import uuid
 
 import bittensor as bt
@@ -51,37 +49,13 @@ from masxai.protocol import SecurityAgentSynapse
 from secqurityVali import constants as SC
 from secqurityVali import docker_ops
 from secqurityVali.script_intake import validate_agent_script
-from secqurityVali.target_guard import TargetRejected, validate_target
+from secqurityVali.structure import check_structure
+from secqurityVali.target_guard import TargetRejected, safe_download
 
 
 class AgentUnavailable(Exception):
     """Miner's agent could not be obtained (offline, opted out, bad/unsafe blob,
     decrypt/load/parse failure). The audit fails closed."""
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(
-            req.full_url, code, f"redirect to {newurl!r} refused", headers, fp
-        )
-
-
-def _download_blob(url: str) -> bytes:
-    max_bytes = int(getattr(C, "SECURITY_BLOB_MAX_BYTES", 2 * 1024 ** 3))
-    timeout = int(getattr(C, "SECURITY_BLOB_DOWNLOAD_TIMEOUT_S", 120))
-    req = urllib.request.Request(url, method="GET")
-    opener = urllib.request.build_opener(_NoRedirect)
-    with opener.open(req, timeout=timeout) as resp:
-        chunks, total = [], 0
-        while True:
-            chunk = resp.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > max_bytes:
-                raise ValueError(f"blob exceeds {max_bytes} bytes")
-            chunks.append(chunk)
-    return b"".join(chunks)
 
 
 def _image_present(ref: str) -> bool:
@@ -222,13 +196,16 @@ class MinerAgentFetcher:
             if ckind != "script" and _image_present(runnable):
                 return runnable
 
+        # SSRF-safe fetch: validate + PIN the host, then dial the pinned IP and
+        # never re-resolve (closes DNS-rebind between the check and the download).
         try:
-            validate_target(blob_url)
+            blob = safe_download(
+                blob_url,
+                max_bytes=C.SECURITY_BLOB_MAX_BYTES,
+                timeout=C.SECURITY_BLOB_DOWNLOAD_TIMEOUT_S,
+            )
         except TargetRejected as exc:
             raise AgentUnavailable(f"unsafe blob_url: {exc}") from exc
-
-        try:
-            blob = _download_blob(blob_url)
         except Exception as exc:
             raise AgentUnavailable(f"blob download failed: {type(exc).__name__}") from exc
         if sha and hashlib.sha256(blob).hexdigest() != sha:
@@ -250,15 +227,39 @@ class MinerAgentFetcher:
             self._cache[hotkey] = (sha or "", "script", path)
             return path
 
-        # image model: the decrypted bytes are a docker-save tarball
+        # image model: the decrypted bytes are a docker-save tarball. Vet it the
+        # same way the validator's blob path does (pipeline.check_and_record):
+        # `docker load` applies the archive's RepoTags to the shared image store,
+        # so a reserved tag (e.g. a benchmark target) would silently overwrite
+        # one of our images (target poisoning). Reject reserved tags BEFORE the
+        # load, and enforce the size/arch/layer caps after. Fail closed.
         fd, tar_path = tempfile.mkstemp(prefix="secaudit-agent-", suffix=".tar")
+        image_ref = None
         try:
             with os.fdopen(fd, "wb") as fh:
                 fh.write(plain)
             try:
+                structure = check_structure(tar_path)
+                docker_ops.assert_no_reserved_tags(structure.repo_tags)
+            except Exception as exc:
+                raise AgentUnavailable(
+                    f"image rejected before load: {type(exc).__name__}") from exc
+            try:
                 image_ref = docker_ops.load_image(tar_path)
             except Exception as exc:
                 raise AgentUnavailable(f"image load failed: {type(exc).__name__}") from exc
+            # Defence in depth + caps, now that the image is in the store.
+            try:
+                info = docker_ops.inspect_image(image_ref)
+                docker_ops.assert_no_reserved_tags(info.repo_tags)
+                docker_ops.check_image(info)
+            except Exception as exc:
+                try:
+                    docker_ops.remove_image(image_ref)
+                except Exception:  # noqa: BLE001 - best-effort rollback
+                    pass
+                raise AgentUnavailable(
+                    f"image rejected after load: {type(exc).__name__}") from exc
         finally:
             try:
                 os.remove(tar_path)
