@@ -71,10 +71,42 @@ def main() -> int:
         # may run against a real target.
         return _agent_status(base_url, agent_id) == "active"
 
-    def resolve_agent(agent_id: str) -> str:
-        # Python-script model (new miner flow): run the miner agent.py directly.
-        # MASXAI_AUDIT_AGENT_SCRIPT points at the script the miner serves; a
-        # production build re-fetches+decrypts the specific miner agent per run.
+    # Per-miner agent: fetch, decrypt and run EACH miner's OWN agent (script or
+    # image) so a customer's run -- and the emission behind it -- reflects that
+    # miner's real capability, not a shared reference. Flag-gated; falls back to
+    # the dev script / shared image when off or if init fails.
+    per_miner = str(os.getenv("MASXAI_AUDIT_PER_MINER_AGENT", "")).strip().lower() in {"1", "true", "yes", "on"}
+    fetcher = None
+    if per_miner:
+        try:
+            from neurons.miner_agent_fetch import MinerAgentFetcher
+            fetcher = MinerAgentFetcher(
+                netuid=int(os.getenv("MASXAI_NETUID", "104")),
+                network=os.getenv("MASXAI_SUBTENSOR_NETWORK", "finney"),
+                wallet_name=os.getenv("MASXAI_AUDIT_WALLET_NAME", "masxai-vali-ck"),
+                wallet_hotkey=os.getenv("MASXAI_AUDIT_WALLET_HOTKEY", "masxai-vali-hk"),
+                key_path=os.getenv("MASXAI_AUDIT_WORKER_KEY", "/root/.masxai_audit_worker_key.json"),
+            )
+            print("audit-worker: per-miner agent fetching ENABLED")
+        except Exception as exc:  # noqa: BLE001 - never block startup on fetch init
+            print(f"audit-worker: per-miner init failed ({type(exc).__name__}: {exc}); using fallback")
+            fetcher = None
+
+    def resolve_agent(agent_id: str):
+        # Per-miner: run the miner's OWN agent (a script .py path or an image ref);
+        # fail CLOSED (None) if it cannot be obtained -- the customer gets a
+        # `failed` run, never a shared substitute. A returned path ending in ".py"
+        # makes process_audit_job take the Python-script run path.
+        if fetcher is not None:
+            from neurons.miner_agent_fetch import AgentUnavailable
+            try:
+                runnable = fetcher.fetch(agent_id)
+                print(f"audit-worker: miner {agent_id[:10]} agent -> {runnable}")
+                return runnable
+            except AgentUnavailable as exc:
+                print(f"audit-worker: agent {agent_id[:10]} unavailable: {exc}")
+                return None
+        # Fallback (dev / testnet): one shared agent.py if set, else the shared image.
         script = (os.getenv("MASXAI_AUDIT_AGENT_SCRIPT") or "").strip()
         if script and os.path.exists(script):
             return script
