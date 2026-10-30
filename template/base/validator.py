@@ -500,8 +500,19 @@ class BaseValidatorNeuron(BaseNeuron):
         # Copies state of metagraph before syncing.
         previous_metagraph = copy.deepcopy(self.metagraph)
 
-        # Sync the metagraph.
-        self.metagraph.sync(subtensor=self.subtensor)
+        # Full re-fetch for THIS mechanism. metagraph.sync() does not refresh the
+        # per-mechanism serving/axon set, so a miner that began serving AFTER the
+        # validator booted stayed invisible until a manual restart. Re-fetching the
+        # metagraph with the SAME call startup uses (same mechid) picks up
+        # new/returning miners on the normal resync cycle. Falls back to the old
+        # partial sync if this subtensor build lacks the mechid kwarg.
+        mechid = int(getattr(self, "mechid", 0) or 0)
+        try:
+            self.metagraph = self.subtensor.metagraph(
+                self.config.netuid, mechid=mechid
+            )
+        except TypeError:
+            self.metagraph.sync(subtensor=self.subtensor)
 
         # Check if the metagraph axon info has changed.
         if previous_metagraph.axons == self.metagraph.axons:
