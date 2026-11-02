@@ -204,12 +204,23 @@ def _reproduction_for(findings: list[Finding]) -> list[dict]:
         if method not in ("GET", "POST"):
             method = "GET"
         sp = urlsplit(f.endpoint or "")
+        path = sp.path or f.endpoint or "/"
         query = dict(parse_qsl(sp.query))
-        query[f.parameter] = f.payload
+        # IDOR's object id is a PATH segment (GET /api/notes/<id>), not a query
+        # parameter -- so a numeric id goes on the path. This lets an agent report
+        # the BASE endpoint (which the located check compares against) while replay
+        # still reaches the object. Backward-compatible: a finding that already
+        # carries the id in its path is left untouched (no double-append).
+        rid = (f.payload or "").strip()
+        if (f.category or "").lower() == "idor" and rid.isdigit():
+            if not path.rstrip("/").endswith("/" + rid):
+                path = path.rstrip("/") + "/" + rid
+        else:
+            query[f.parameter] = f.payload
         steps.append({
             "finding_index": i,
             "method": method,
-            "path": sp.path or f.endpoint or "/",
+            "path": path,
             "query": query,
         })
     return steps
