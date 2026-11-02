@@ -283,6 +283,12 @@ def main() -> int:
             llm_api_key=os.getenv("LLM_API_KEY", ""),
             llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
             timeout_s=budget,
+            # The 300 default is tighter than the efficiency target (1000 reqs):
+            # boolean-blind sqli legitimately needs ~360 agent requests to extract
+            # the secret table+column names and the 32-char canary, so 300 truncated
+            # it and scored 0. 600 fits with margin while agent+replay stays under
+            # the 1000-request efficiency ceiling (so efficiency stays 1.0).
+            max_http_requests=int(os.getenv("MASXAI_SECURITY_MAX_HTTP_REQUESTS", "600")),
             use_browser=_env_flag("USE_BROWSER"),
             login_email=os.getenv("LOGIN_EMAIL") or None,
             login_password=os.getenv("LOGIN_PASSWORD") or None,
