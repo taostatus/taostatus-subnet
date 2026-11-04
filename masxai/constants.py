@@ -320,6 +320,31 @@ SECURITY_USAGE_WINDOW_SECONDS = int(
     os.getenv(SECURITY_USAGE_WINDOW_SECONDS_ENV, str(7 * 24 * 3600))
 )
 
+# --- security-track BLENDED weight: benchmark base + confirmed-audit bonus ----
+# A middle ground between the pure benchmark (capability only) and pure usage
+# (delivered value only): weight = (1 - w) * benchmark + w * confirmed-audit
+# usage, where w = SECURITY_AUDIT_BONUS_WEIGHT. So a benchmark-perfect miner with
+# no real audits tops out at (1 - w) (e.g. 0.95), and confirmed, replay-confirmed
+# customer audits add the remaining w up to a full 1.0. The bonus is purely
+# ADDITIVE and capped at w -- it can never pull a miner below its benchmark share,
+# and the (1 - w) scaling hits every miner equally, so the relative split among
+# miners WITHOUT audits is unchanged; only miners with confirmed audits lift.
+# OFF by default and independent of BURN_PERCENTAGE, exactly like the usage flag
+# above, so this cannot move mainnet weights until deliberately enabled (and can
+# be validated with burn still 1.0 before any payout shifts). Mutually preferred
+# over SECURITY_EMISSION_FROM_USAGE when both are set (blend wins).
+SECURITY_SCORE_BLEND_USAGE_ENV = "MASXAI_SECURITY_SCORE_BLEND_USAGE"
+SECURITY_SCORE_BLEND_USAGE = os.getenv(
+    SECURITY_SCORE_BLEND_USAGE_ENV, "false"
+).strip().lower() in ("1", "true", "yes", "on")
+# The audit bonus weight w: the share of a miner's final score that confirmed
+# real audits can contribute. 0.05 -> benchmark caps at 0.95, audits add up to
+# 0.05. Clamped to [0, 1] at read; values outside that are nonsensical.
+SECURITY_AUDIT_BONUS_WEIGHT_ENV = "MASXAI_SECURITY_AUDIT_BONUS_WEIGHT"
+SECURITY_AUDIT_BONUS_WEIGHT = max(
+    0.0, min(1.0, float(os.getenv(SECURITY_AUDIT_BONUS_WEIGHT_ENV, "0.05")))
+)
+
 # Where the per-miner, per-category EMA matrix is persisted (see
 # secqurityVali/category_scores.py), and the EMA weight on each new observation.
 SECURITY_CATEGORY_SCORES_FILE_ENV = "MASXAI_SECURITY_CATEGORY_SCORES_FILE"

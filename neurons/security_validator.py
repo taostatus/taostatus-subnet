@@ -175,6 +175,20 @@ class SecurityValidator(BaseValidatorNeuron):
         self._usage_target_audits = int(getattr(C, "SECURITY_USAGE_TARGET_AUDITS", 10))
         self._usage_window_s = int(getattr(C, "SECURITY_USAGE_WINDOW_SECONDS", 7 * 24 * 3600))
 
+        # BLENDED scoring: benchmark base + confirmed-audit bonus. When ON, weights
+        # are (1 - w) * benchmark + w * confirmed-audit usage, so a benchmark-perfect
+        # miner caps at (1 - w) and real replay-confirmed audits add the rest up to
+        # 1.0. Additive and capped at w -> never pulls a miner below its benchmark
+        # share. Needs the marketplace client to poll usage; with no client it falls
+        # back to the benchmark. Takes precedence over _emission_from_usage when both
+        # are set. OFF by default -> mainnet weights unchanged until enabled.
+        self._blend_usage = bool(
+            getattr(C, "SECURITY_SCORE_BLEND_USAGE", False)
+        ) and self._marketplace is not None
+        self._audit_bonus_weight = max(
+            0.0, min(1.0, float(getattr(C, "SECURITY_AUDIT_BONUS_WEIGHT", 0.05)))
+        )
+
         if not docker_available():
             bt.logging.warning(
                 "security-validator: docker daemon is not reachable -- rounds will "
@@ -624,7 +638,9 @@ class SecurityValidator(BaseValidatorNeuron):
         # score instead from each miner's CONFIRMED real audits, so emission pays
         # for delivered, replay-confirmed value rather than for passing the
         # admission test. Off by default -> mainnet weights are unchanged.
-        if getattr(self, "_emission_from_usage", False):
+        if getattr(self, "_blend_usage", False):
+            score_map = await self._recompute_scores_blended(now)
+        elif getattr(self, "_emission_from_usage", False):
             score_map = await self._recompute_scores_from_usage(now)
         else:
             score_map = self._recompute_all_scores(now)
@@ -754,13 +770,13 @@ class SecurityValidator(BaseValidatorNeuron):
             )
         return out
 
-    async def _recompute_scores_from_usage(self, now: float) -> dict[int, float]:
-        """{uid: score} from each miner's CONFIRMED real-audit usage, polled from
-        the backend -- the one shared source every validator reads, so their
-        weight decisions converge (consensus-safe). score = usage_score(count,
-        avg_score): volume x quality, fail-closed, windowed so an old win cannot
-        pay forever. A poll failure returns {} (no weight change this round)
-        rather than paying or zeroing blindly."""
+    async def _usage_score_map(self, now: float) -> dict[int, float]:
+        """{uid: usage_score} from each miner's CONFIRMED real-audit usage, polled
+        from the backend -- the one shared source every validator reads, so their
+        weight decisions converge (consensus-safe). usage_score = volume x quality,
+        fail-closed, windowed so an old win cannot pay forever. A missing client or
+        a poll failure returns {} (no usage signal this round); callers decide what
+        that means for weights. Shared by the usage-only and blended score paths."""
         client = getattr(self, "_marketplace", None)
         if client is None:
             return {}
@@ -784,8 +800,40 @@ class SecurityValidator(BaseValidatorNeuron):
                 (row or {}).get("avg_score"),
                 target_audits=self._usage_target_audits,
             )
+        return out
+
+    async def _recompute_scores_from_usage(self, now: float) -> dict[int, float]:
+        """{uid: score} straight from confirmed real-audit usage -- emission pays
+        only for delivered, replay-confirmed value. A poll failure returns {} (no
+        weight change this round) rather than paying or zeroing blindly."""
+        out = await self._usage_score_map(now)
         bt.logging.info(
             f"security-validator: scored {len(out)} miner(s) from confirmed-audit usage"
+        )
+        return out
+
+    async def _recompute_scores_blended(self, now: float) -> dict[int, float]:
+        """{uid: score} = (1 - w) * benchmark + w * confirmed-audit usage, over the
+        UNION of miners with benchmark history and miners with confirmed audits.
+
+        The audit term is purely additive and capped at w, so it can never pull a
+        miner below its benchmark share, and the (1 - w) scaling is applied to every
+        miner equally -- the relative split among miners WITHOUT audits is unchanged;
+        only miners with confirmed audits lift. A usage poll failure (or a miner with
+        no audit row) simply contributes a 0 bonus: that miner keeps its benchmark
+        base for the round, never more -- fail-safe, so a backend blip can only
+        under-pay the bonus, never over-pay it."""
+        w = float(getattr(self, "_audit_bonus_weight", 0.05))
+        bench = self._recompute_all_scores(now)      # {uid: benchmark aggregate}
+        usage = await self._usage_score_map(now)     # {uid: usage_score}, {} on failure
+        out: dict[int, float] = {}
+        for uid in set(bench) | set(usage):
+            base = float(bench.get(uid, 0.0))
+            bonus = float(usage.get(uid, 0.0))
+            out[uid] = (1.0 - w) * base + w * bonus
+        bt.logging.info(
+            f"security-validator: blended {len(out)} miner(s) "
+            f"(benchmark base + {w:.3f} audit bonus; {len(usage)} with usage)"
         )
         return out
 
