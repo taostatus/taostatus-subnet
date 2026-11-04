@@ -345,6 +345,22 @@ SECURITY_AUDIT_BONUS_WEIGHT = max(
     0.0, min(1.0, float(os.getenv(SECURITY_AUDIT_BONUS_WEIGHT_ENV, "0.05")))
 )
 
+# --- security-track marketplace DISPLAY score: benchmark + audit bonus --------
+# DISPLAY ONLY. Blends the confirmed-audit bonus into the overall_score shown on
+# the marketplace agent CARD:
+#     overall_score = (1 - w) * benchmark + w * confirmed-audit usage
+# (w = SECURITY_AUDIT_BONUS_WEIGHT), so a benchmark-perfect agent with no real
+# audits reads (1 - w) (e.g. 0.95) and real, replay-confirmed audits lift the card
+# to 1.0. This NEVER touches on-chain emission (self.scores) or the listing gate
+# (should_publish) -- both stay on the plain benchmark aggregate; only the number
+# rendered on the card changes. OFF by default; shares SECURITY_AUDIT_BONUS_WEIGHT
+# with the emission blend above. Needs the marketplace client to have usage to
+# poll; with the flag off the card shows the plain benchmark aggregate as before.
+SECURITY_MARKETPLACE_SCORE_BLEND_ENV = "MASXAI_SECURITY_MARKETPLACE_SCORE_BLEND"
+SECURITY_MARKETPLACE_SCORE_BLEND = os.getenv(
+    SECURITY_MARKETPLACE_SCORE_BLEND_ENV, "false"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # Where the per-miner, per-category EMA matrix is persisted (see
 # secqurityVali/category_scores.py), and the EMA weight on each new observation.
 SECURITY_CATEGORY_SCORES_FILE_ENV = "MASXAI_SECURITY_CATEGORY_SCORES_FILE"

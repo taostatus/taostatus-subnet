@@ -189,6 +189,16 @@ class SecurityValidator(BaseValidatorNeuron):
             0.0, min(1.0, float(getattr(C, "SECURITY_AUDIT_BONUS_WEIGHT", 0.05)))
         )
 
+        # DISPLAY-ONLY marketplace score blend. When ON, the overall_score shown on
+        # the agent CARD is (1 - w) * benchmark + w * confirmed-audit usage, so a
+        # benchmark-perfect agent with no audits reads (1 - w) and real audits lift
+        # it to 1.0. Never touches on-chain emission (self.scores) or the listing
+        # gate (should_publish) -- only the rendered number. Needs the marketplace
+        # client (nothing to push to otherwise). OFF by default.
+        self._marketplace_score_blend = bool(
+            getattr(C, "SECURITY_MARKETPLACE_SCORE_BLEND", False)
+        ) and self._marketplace is not None
+
         if not docker_available():
             bt.logging.warning(
                 "security-validator: docker daemon is not reachable -- rounds will "
@@ -527,6 +537,13 @@ class SecurityValidator(BaseValidatorNeuron):
         answered = 0
         budget_reached = False
         round_started = time.monotonic()
+        # DISPLAY-only: poll confirmed-audit usage ONCE for this round so each
+        # marketplace push can show benchmark + audit bonus on the card. Never
+        # touches emission. Off (or no usage) -> empty map -> card shows the plain
+        # benchmark aggregate exactly as before.
+        mkt_usage: dict[int, float] = {}
+        if getattr(self, "_marketplace_score_blend", False):
+            mkt_usage = await self._usage_score_map(now)
         for uid, resp in zip(miner_uids, responses):
             # Bound the round: once the budget is spent, defer the rest to the
             # next round rather than letting one round run unbounded. (The round
@@ -616,7 +633,7 @@ class SecurityValidator(BaseValidatorNeuron):
             # send after the loop so a slow backend never eats eval budget.
             self._queue_marketplace_push(
                 pending_pushes, uid=int(uid), hotkey=hotkey, outcome=outcome,
-                aggregate=agg, now=now,
+                aggregate=agg, now=now, usage_map=mkt_usage,
             )
 
         if rewards or skipped:
@@ -683,11 +700,17 @@ class SecurityValidator(BaseValidatorNeuron):
     def _queue_marketplace_push(
         self, pending: list[dict], *, uid: int, hotkey: str,
         outcome: EvalOutcome, aggregate: float, now: float,
+        usage_map: dict[int, float] | None = None,
     ) -> None:
         """Decide whether this evaluation goes to the marketplace and, if so,
-        build its record now while the data is in hand. The gate is the
-        cross-category aggregate -- the very number that feeds weights -- so
-        "score 1" on the marketplace means the same thing as "score 1" on chain.
+        build its record now while the data is in hand. The GATE stays the
+        cross-category benchmark aggregate -- listing is a capability decision.
+
+        The DISPLAYED overall_score, however, is blended with the confirmed-audit
+        bonus when _marketplace_score_blend is on: (1 - w) * benchmark + w * usage,
+        so a benchmark-perfect agent with no real audits reads (1 - w) on the card
+        and real audits lift it to 1.0. This changes only the rendered number --
+        never the listing gate here, nor on-chain emission (self.scores).
         Never raises: a payload problem is logged and that record is dropped.
         """
         client = getattr(self, "_marketplace", None)
@@ -697,7 +720,7 @@ class SecurityValidator(BaseValidatorNeuron):
         if listed is None:
             listed = self._listed_agents = set()
         if not should_publish(
-            aggregate=aggregate,
+            aggregate=aggregate,                      # GATE: benchmark capability only
             agent_id=outcome.agent_id,
             listed=listed,
             min_score=getattr(self, "_marketplace_min_score", C.MARKETPLACE_MIN_SCORE),
@@ -709,6 +732,12 @@ class SecurityValidator(BaseValidatorNeuron):
         # before the push, so a failed push is simply retried by the next
         # evaluation rather than silently un-listing the agent.
         listed.add(outcome.agent_id)
+        # DISPLAY score: blend the confirmed-audit bonus into the card number only.
+        overall = float(aggregate)
+        if getattr(self, "_marketplace_score_blend", False):
+            w = float(getattr(self, "_audit_bonus_weight", 0.05))
+            bonus = float((usage_map or {}).get(int(uid), 0.0))
+            overall = (1.0 - w) * float(aggregate) + w * bonus
         try:
             record = build_agent_payload(
                 agent_id=outcome.agent_id,
@@ -717,7 +746,7 @@ class SecurityValidator(BaseValidatorNeuron):
                 netuid=int(getattr(self.config, "netuid", 0) or 0),
                 mechid=int(getattr(self, "mechid", 0) or 0),
                 validator_hotkey=self.wallet.hotkey.ss58_address,
-                overall_score=aggregate,
+                overall_score=overall,
                 category_scores={
                     cat: score
                     for cat in self._active_categories
