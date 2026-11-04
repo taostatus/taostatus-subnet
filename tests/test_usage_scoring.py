@@ -64,3 +64,16 @@ def test_no_client_returns_empty():
     v = _validator(None, ["HK_A"])
     out = asyncio.run(v._recompute_scores_from_usage(now=1000.0))
     assert out == {}
+
+
+def test_emission_poll_is_windowed_but_display_poll_is_all_time():
+    # Emission (default) applies the configured window -> a `since` cutoff is sent.
+    # The display blend passes window_s=0 -> ALL-TIME, so `since` is None and every
+    # confirmed audit ever counts on the card (does not touch emission's window).
+    rows = [{"agent_digest": "HK_A", "confirmed_count": 7, "avg_score": 0.74}]
+    c = _FakeUsageClient(rows)
+    v = _validator(c, ["HK_A"])
+    asyncio.run(v._usage_score_map(now=1_000_000.0))                 # emission default
+    assert c.since is not None                                       # windowed
+    asyncio.run(v._usage_score_map(now=1_000_000.0, window_s=0))     # display all-time
+    assert c.since is None                                           # no cutoff

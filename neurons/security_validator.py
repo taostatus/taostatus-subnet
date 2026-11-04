@@ -538,12 +538,15 @@ class SecurityValidator(BaseValidatorNeuron):
         budget_reached = False
         round_started = time.monotonic()
         # DISPLAY-only: poll confirmed-audit usage ONCE for this round so each
-        # marketplace push can show benchmark + audit bonus on the card. Never
-        # touches emission. Off (or no usage) -> empty map -> card shows the plain
-        # benchmark aggregate exactly as before.
+        # marketplace push can show benchmark + audit bonus on the card. ALL-TIME
+        # (window_s=0): the card reflects every confirmed audit ever, not the
+        # emission window -- so an agent's proven real-world track record keeps
+        # showing on its card even between recent jobs. Never touches emission
+        # (which keeps its own window). Off (or no usage) -> empty map -> card
+        # shows the plain benchmark aggregate exactly as before.
         mkt_usage: dict[int, float] = {}
         if getattr(self, "_marketplace_score_blend", False):
-            mkt_usage = await self._usage_score_map(now)
+            mkt_usage = await self._usage_score_map(now, window_s=0)
         for uid, resp in zip(miner_uids, responses):
             # Bound the round: once the budget is spent, defer the rest to the
             # next round rather than letting one round run unbounded. (The round
@@ -799,19 +802,29 @@ class SecurityValidator(BaseValidatorNeuron):
             )
         return out
 
-    async def _usage_score_map(self, now: float) -> dict[int, float]:
+    async def _usage_score_map(self, now: float, *, window_s: float | None = None) -> dict[int, float]:
         """{uid: usage_score} from each miner's CONFIRMED real-audit usage, polled
         from the backend -- the one shared source every validator reads, so their
         weight decisions converge (consensus-safe). usage_score = volume x quality,
-        fail-closed, windowed so an old win cannot pay forever. A missing client or
-        a poll failure returns {} (no usage signal this round); callers decide what
-        that means for weights. Shared by the usage-only and blended score paths."""
+        fail-closed. A missing client or a poll failure returns {} (no usage signal
+        this round); callers decide what that means. Shared by the usage-only,
+        blended, and display paths.
+
+        `window_s` selects the lookback: None (default) uses the configured emission
+        window (self._usage_window_s), so an old win cannot pay EMISSION forever;
+        <= 0 means ALL-TIME (no `since` cutoff), used by the marketplace DISPLAY
+        blend so the agent card reflects every confirmed audit ever, not just the
+        recent window. Display-only -- it never touches emission."""
         client = getattr(self, "_marketplace", None)
         if client is None:
             return {}
-        since = datetime.fromtimestamp(
-            max(0.0, now - self._usage_window_s), tz=timezone.utc
-        ).isoformat()
+        if window_s is None:
+            window_s = self._usage_window_s
+        since = None
+        if window_s and window_s > 0:
+            since = datetime.fromtimestamp(
+                max(0.0, now - window_s), tz=timezone.utc
+            ).isoformat()
         try:
             rows = await client.get_confirmed_usage(since=since)
         except Exception as e:  # noqa: BLE001 - a poll must never break the round
