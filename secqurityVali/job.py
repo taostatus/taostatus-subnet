@@ -436,6 +436,19 @@ def run_job(
                 os.unlink(resolv_path)
             except OSError:
                 pass
+            # Remove THIS run's gVisor monitoring (strace) log. _read_behaviour
+            # already consumed it above, and it is keyed by this run's container
+            # id, so nothing ever reads it again. Without this the per-run dirs
+            # pile up unbounded in JOB_MON_LOG_ROOT and eventually fill the disk.
+            # Strictly scoped to this cid (never a broad sweep) and best-effort:
+            # a cleanup failure must never affect the run's result.
+            if agent_cid:
+                try:
+                    import glob as _glob
+                    for _d in _glob.glob(os.path.join(C.JOB_MON_LOG_ROOT, agent_cid + "*")):
+                        shutil.rmtree(_d, ignore_errors=True)
+                except Exception:  # noqa: BLE001 - cleanup is never fatal
+                    pass
 
 
 def _maybe_replay(challenge: Challenge, findings_raw: bytes) -> bool:
